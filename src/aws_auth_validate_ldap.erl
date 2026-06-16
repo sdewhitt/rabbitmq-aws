@@ -283,7 +283,30 @@ check_config_conflicts(_) ->
 %% LDAP execution
 %%--------------------------------------------------------------------
 
-do_ldap_validate(
+%% SECURITY (R6): the resolved bind password is passed to eldap:simple_bind/3
+%% as a direct argument. If anything in the connect/bind/post-bind section
+%% *raises* (rather than returning {error, _}), the exception's stacktrace
+%% would carry the live argument terms -- including this function's Params map,
+%% which holds the plaintext password -- into a Cowboy crash report. To
+%% guarantee the password can never reach a log or crash dump, the entire body
+%% is destructured into a separate worker (do_ldap_bind/1) whose only job is to
+%% return a fixed-category result, and any escaping exception is caught here and
+%% collapsed to the fixed connection_failed category. We deliberately discard
+%% the caught class/reason/stacktrace (binding them to throwaway names that are
+%% never logged or returned) so no fragment of the bind arguments survives.
+%% Note: a raise in a post-bind probe (e.g. eldap:search/2 in object_exists/2)
+%% is therefore reported as connection_failed rather than its more specific
+%% category. This is a deliberate, safe degradation -- those probes already map
+%% their non-{ok,_} returns to false, so only a genuine exception reaches here.
+do_ldap_validate(#{password := _} = Params) ->
+    try
+        do_ldap_bind(Params)
+    catch
+        _Class:_Reason:_Stack ->
+            {error, connection_failed, ?REASON_CONNECTION}
+    end.
+
+do_ldap_bind(
     #{
         servers := Servers,
         port := Port,

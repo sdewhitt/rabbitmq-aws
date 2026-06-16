@@ -121,9 +121,25 @@ with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
             reply_error(503, capacity_exhausted, <<"Service at capacity">>, Req, Context);
         {ok, Ref} ->
             try
+                %% Defense in depth for R6: a backend must always *return* a
+                %% fixed-category result, but if one ever raises, the escaping
+                %% exception would carry BodyMap (and any future secret it
+                %% holds) into a Cowboy crash report. Catch here and collapse to
+                %% a fixed connection_failed response, discarding the
+                %% class/reason/stacktrace so no request term is logged.
                 Result = aws_auth_validate_registry:dispatch(Method, BodyMap),
                 audit(Method, SourceIP, result_category(Result), T0),
                 respond(Result, Req, Context)
+            catch
+                _Class:_Reason:_Stack ->
+                    audit(Method, SourceIP, connection_failed, T0),
+                    reply_error(
+                        400,
+                        connection_failed,
+                        <<"could not connect to LDAP server">>,
+                        Req,
+                        Context
+                    )
             after
                 aws_auth_validate_semaphore:release(Ref)
             end

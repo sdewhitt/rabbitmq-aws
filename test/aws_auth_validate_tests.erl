@@ -357,6 +357,74 @@ ldap_queries_input_test_() ->
     ].
 
 %%--------------------------------------------------------------------
+%% R6: password must never reach a crash report / log, even on a raise
+%%--------------------------------------------------------------------
+
+%% A unique, recognisable sentinel standing in for the resolved bind password.
+%% If it appears anywhere in a crash report or log line, R6 is violated.
+-define(SECRET, "S3cr3t-Sentinel-Passw0rd-DO-NOT-LEAK").
+
+%% do_ldap_validate/1 is not exported, so reach it via validate/1's public
+%% entry point would require a real ARN resolve. Instead we drive the same code
+%% path the handler does -- a successful open() followed by a *raising*
+%% simple_bind() -- with eldap mocked, and assert: (a) the result collapses to
+%% the fixed connection_failed category (never propagates), and (b) the secret
+%% byte-string does not appear in the formatted exception/stacktrace that a
+%% crash report would render. We exercise validate/1 with the ARN resolver and
+%% the eldap module both mocked so no network or AWS call occurs.
+ldap_bind_raise_does_not_leak_password_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(eldap, [unstick, non_strict]),
+            ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
+            %% with_lock just runs the closure inline for the test.
+            meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
+            %% Resolve any ARN to our sentinel password.
+            meck:expect(aws_arn_util, resolve_arn, fun(_) -> {ok, ?SECRET} end),
+            %% open() succeeds, then simple_bind/3 RAISES with the password
+            %% present in the failing call's arguments -- the worst case for a
+            %% crash-report leak.
+            meck:expect(eldap, open, fun(_Servers, _Opts) -> {ok, fake_handle} end),
+            meck:expect(eldap, close, fun(_H) -> ok end),
+            meck:expect(eldap, simple_bind, fun(_H, _Dn, Pw) ->
+                erlang:error({ldap_blew_up, Pw})
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(eldap),
+            meck:unload(aws_arn_util),
+            meck:unload(aws_auth_validate_arn_lock)
+        end,
+        fun(_) ->
+            Body = bind_body(),
+            %% (a) A raise in the bind path collapses to a fixed category and
+            %% never propagates.
+            Result = aws_auth_validate_ldap:validate(Body),
+            %% (b) The secret never appears in the rendered result term.
+            Rendered = lists:flatten(io_lib:format("~p", [Result])),
+            [
+                ?_assertMatch({error, connection_failed, _}, Result),
+                ?_assertEqual(nomatch, string_find(Rendered, ?SECRET))
+            ]
+        end}.
+
+%% A body that passes the pure pipeline so resolve_password/2 (mocked) and the
+%% bind path are actually reached. use_ssl/use_starttls default to false.
+bind_body() ->
+    #{
+        <<"servers">> => [<<"127.0.0.1">>],
+        <<"port">> => 389,
+        <<"user_dn">> => <<"cn=u,dc=example,dc=com">>,
+        <<"password_arn">> =>
+            <<"arn:aws:secretsmanager:us-east-1:111111111111:secret:x">>
+    }.
+
+string_find(Haystack, Needle) ->
+    string:find(Haystack, Needle).
+
+%%--------------------------------------------------------------------
 %% LDAP query DSL parser (aws_auth_validate_ldap_query)
 %%--------------------------------------------------------------------
 
