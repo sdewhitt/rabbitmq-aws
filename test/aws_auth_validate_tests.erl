@@ -428,6 +428,39 @@ literal_dns_for_test() ->
     ),
     ?assertEqual(["cn=cfg,dc=x"], aws_auth_validate_ldap_query:literal_dns(Q)).
 
+%% Regression tests for collect/2 DN extraction: value operands of
+%% equals/match and bare-string queries must NOT be treated as DNs, while a
+%% literal DN nested in an {attribute, DN, _} operand still is.
+
+literal_dns_equals_placeholder_attribute_test() ->
+    %% The DN slot of the attribute is a placeholder, so no literal DN; the
+    %% value operand "engineering" is a value, never a DN.
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{equals, {attribute, \"${u}\", \"dept\"}, \"engineering\"}">>
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_equals_literal_attribute_test() ->
+    %% A literal DN inside the attribute operand IS extracted; the value
+    %% operand "v" is still ignored.
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{equals, {attribute, \"cn=x,dc=y\", \"dept\"}, \"v\"}">>
+    ),
+    ?assertEqual(["cn=x,dc=y"], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_match_value_operands_test() ->
+    %% Both operands of match are values (a string and a regex), never DNs.
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{match, \"${username}\", \"^a.*\"}">>
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_bare_string_query_test() ->
+    %% A top-level bare-string query parses to a character list; it is a
+    %% value, not a DN, so it contributes nothing.
+    {ok, Q} = aws_auth_validate_ldap_query:parse(<<"\"just a string\"">>),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
 %% Parity with rabbit_auth_backend_ldap_util:parse_query/1 (design req R12).
 %% The broker's parser throws via cuttlefish:invalid/2 on rejection; ours
 %% returns {error, _}. Assert both classify each corpus entry the same way.

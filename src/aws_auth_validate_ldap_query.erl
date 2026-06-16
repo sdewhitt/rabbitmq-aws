@@ -132,22 +132,23 @@ collect({equals, A1, A2}, Acc) ->
     collect(A2, collect(A1, Acc));
 collect({match, A1, A2}, Acc) ->
     collect(A2, collect(A1, Acc));
-%% tag_queries: a list of {Tag, SubQuery} pairs.
+%% A list operand is ONLY ever the tag_queries shape: a list of {Tag,
+%% SubQuery} pairs. A bare string (a value/regex operand of equals/match, or
+%% a top-level bare-string query) is also a flat list, but in the broker DSL
+%% it is a literal VALUE, never a DN -- so it must contribute zero DNs. We
+%% therefore recurse only into {_Tag, SubQuery} elements and ignore every
+%% other list element, including bare character lists. Real literal DNs are
+%% collected exclusively by the explicit DN-bearing clauses above (exists,
+%% in_group, in_group_nested, attribute), which match before this clause.
 collect(List, Acc) when is_list(List) ->
-    case is_dn_string(List) of
-        true ->
-            %% A bare DN string used directly (rare, but harmless to check).
-            maybe_dn(List, Acc);
-        false ->
-            lists:foldl(
-                fun
-                    ({_Tag, SubQuery}, A) -> collect(SubQuery, A);
-                    (_Other, A) -> A
-                end,
-                Acc,
-                List
-            )
-    end;
+    lists:foldl(
+        fun
+            ({_Tag, SubQuery}, A) -> collect(SubQuery, A);
+            (_Other, A) -> A
+        end,
+        Acc,
+        List
+    );
 collect(_Other, Acc) ->
     Acc.
 
