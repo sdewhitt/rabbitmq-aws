@@ -152,9 +152,18 @@ init_per_testcase(TC, Config) ->
     %% Mock ARN resolution: real eldap bind, fake secret fetch.
     ok = meck:new(aws_arn_util, [passthrough, no_link]),
     ok = meck:expect(aws_arn_util, resolve_arn, fun mock_resolve_arn/1),
+    %% The backend resolves password_arn through aws_auth_validate_arn_lock,
+    %% a gen_server that aws_sup only starts on a running broker. This suite
+    %% drives validate/1 in-process with no broker, so that server isn't
+    %% registered and the call would fail with {noproc, ...}. Mock with_lock/1
+    %% to run the closure inline (the same serialization-free shortcut the
+    %% R6 unit test uses); the real ARN resolution is already mocked above.
+    ok = meck:new(aws_auth_validate_arn_lock, [passthrough, no_link]),
+    ok = meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
     rabbit_ct_helpers:testcase_started(Config, TC).
 
 end_per_testcase(TC, Config) ->
+    catch meck:unload(aws_auth_validate_arn_lock),
     catch meck:unload(aws_arn_util),
     rabbit_ct_helpers:testcase_finished(Config, TC).
 
