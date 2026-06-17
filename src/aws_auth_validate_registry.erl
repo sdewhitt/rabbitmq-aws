@@ -32,6 +32,8 @@ dispatch(Method, Body) when is_binary(Method), is_map(Body) ->
 -spec lookup_backend(binary()) -> {ok, module()} | {error, unknown_method}.
 lookup_backend(<<"ldap">>) ->
     {ok, aws_auth_validate_ldap};
+lookup_backend(<<"http">>) ->
+    {ok, aws_auth_validate_http};
 lookup_backend(_) ->
     {error, unknown_method}.
 
