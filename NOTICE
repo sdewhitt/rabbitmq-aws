@@ -1,1 +1,14 @@
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This package bundles the aws_lib* modules (aws_lib, aws_lib_config,
+aws_lib_json, aws_lib_ops, aws_lib_sign, aws_lib_uri, aws_lib_xml and the
+aws_lib.hrl header). These are licensed under the BSD 3-Clause License, see
+LICENSE-rabbitmq_aws. They originate from the rabbitmq_aws library bundled in
+the RabbitMQ server source tree
+(https://github.com/rabbitmq/rabbitmq-server/tree/main/deps/rabbitmq_aws),
+which was in turn imported from httpc-aws.
+
+These modules make use of the following third party libraries:
+
+ - httpc-aws - https://github.com/gmr/httpc-aws - BSD 3-Clause License, see LICENSE-httpc_aws
+ - erlcloud - https://github.com/erlcloud/erlcloud - Simplified BSD License, see LICENSE-erlcloud
