@@ -49,16 +49,23 @@ effective_allowed_fields(Module, Method) ->
 
 %%--------------------------------------------------------------------
 
-%% Per-method enable check. Defaults to enabled when no per-method
-%% setting is provided so the operator only has to opt out, not in.
+%% Per-method enable check. Most methods default to enabled when no
+%% per-method setting is provided (operator opts out, not in) -- but a method
+%% in ?OPT_IN_METHODS defaults to DISABLED and must be turned on explicitly.
+%% http is opt-in until its SSRF address policy is implemented and AppSec
+%% reviewed (see aws_auth_validate_http): without this, enabling validation
+%% for ldap would silently bring the http probe live too.
+-define(OPT_IN_METHODS, [<<"http">>]).
+
 -spec is_method_enabled(binary()) -> boolean().
 is_method_enabled(Method) ->
+    Default = not lists:member(Method, ?OPT_IN_METHODS),
     case application:get_env(aws, auth_validation_enabled_methods) of
         {ok, Methods} when is_list(Methods) ->
             case lists:keyfind(Method, 1, Methods) of
                 {_, Bool} when is_boolean(Bool) -> Bool;
-                false -> true
+                false -> Default
             end;
         _ ->
-            true
+            Default
     end.
