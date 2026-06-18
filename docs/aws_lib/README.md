@@ -14,6 +14,10 @@ Note on labels: the `refactor` notes use `labels: [refactor]`, but the `amazon-m
 - [`aws_lib`: Default request timeout (2250ms) is too aggressive for AWS API calls](10-default-request-timeout-too-aggressive.md)
 - [`aws_lib`: gun:await_body timeout crashes aws_lib_config with badmatch](11-gun-await-body-timeout-badmatch.md)
 - [`aws_lib`: Refresh credentials before expiry, not after (add buffer window)](14-refresh-credentials-before-expiry.md)
+- [`aws_lib`: Connection-open failures bypass the retry loop and crash the caller](19-connection-open-failures-bypass-retry.md)
+- [`aws_lib`: maybe_decode_body does not decode application/x-amz-json-1.1 responses](20-decode-amz-json-1-1-content-type.md)
+- [`aws_lib`: XML parser drops attributes and collapses repeated elements](21-xml-parser-drops-attributes-and-repeated-elements.md)
+- [`aws_lib`: parse_uri crashes on a scheme-less or malformed URI](22-parse-uri-crashes-on-scheme-less-uri.md)
 
 ## Enhancements
 
