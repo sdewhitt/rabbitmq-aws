@@ -100,5 +100,301 @@
             ]}
          ]}
         ],
+        [aws_arn_config]},
+
+    {aws_prefer_imdsv2,
+        "aws.prefer_imdsv2 = false",
+        [{rabbitmq_aws, [{aws_prefer_imdsv2, false}]}],
+        [aws_arn_config]},
+
+    {aws_arn_config_assume_role_arn,
+        "aws.arns.assume_role_arn = arn:aws:iam::111122223333:role/my-role",
+        [{aws, [
+            {arn_config, [
+                {assume_role_arn, "arn:aws:iam::111122223333:role/my-role"}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_rabbit_certfile,
+        "aws.arns.ssl_options.certfile = arn:aws:s3:::private-ca-42/certfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_rabbit,
+                    "arn:aws:s3:::private-ca-42/certfile.pem",
+                    "aws.arns.ssl_options.certfile",
+                    ["aws.arns.ssl_options.certfile", ssl_options, certfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_rabbit_keyfile,
+        "aws.arns.ssl_options.keyfile = arn:aws:s3:::private-ca-42/keyfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_rabbit,
+                    "arn:aws:s3:::private-ca-42/keyfile.pem",
+                    "aws.arns.ssl_options.keyfile",
+                    ["aws.arns.ssl_options.keyfile", ssl_options, keyfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_amqp_client_certfile,
+        "aws.arns.amqp_client.ssl_options.certfile = arn:aws:s3:::private-ca-42/certfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_amqp_client,
+                    "arn:aws:s3:::private-ca-42/certfile.pem",
+                    "aws.arns.amqp_client.ssl_options.certfile",
+                    ["aws.arns.amqp_client.ssl_options.certfile", ssl_options, certfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_amqp_client_keyfile,
+        "aws.arns.amqp_client.ssl_options.keyfile = arn:aws:s3:::private-ca-42/keyfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_amqp_client,
+                    "arn:aws:s3:::private-ca-42/keyfile.pem",
+                    "aws.arns.amqp_client.ssl_options.keyfile",
+                    ["aws.arns.amqp_client.ssl_options.keyfile", ssl_options, keyfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_amqp10_client_certfile,
+        "aws.arns.amqp10_client.ssl_options.certfile = arn:aws:s3:::private-ca-42/certfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_amqp10_client,
+                    "arn:aws:s3:::private-ca-42/certfile.pem",
+                    "aws.arns.amqp10_client.ssl_options.certfile",
+                    ["aws.arns.amqp10_client.ssl_options.certfile", ssl_options, certfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_amqp10_client_keyfile,
+        "aws.arns.amqp10_client.ssl_options.keyfile = arn:aws:s3:::private-ca-42/keyfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_amqp10_client,
+                    "arn:aws:s3:::private-ca-42/keyfile.pem",
+                    "aws.arns.amqp10_client.ssl_options.keyfile",
+                    ["aws.arns.amqp10_client.ssl_options.keyfile", ssl_options, keyfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_management_cacertfile,
+        "aws.arns.management.ssl.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_management,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.management.ssl.cacertfile",
+                    ["aws.arns.management.ssl.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_management_certfile,
+        "aws.arns.management.ssl.certfile = arn:aws:s3:::private-ca-42/certfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_management,
+                    "arn:aws:s3:::private-ca-42/certfile.pem",
+                    "aws.arns.management.ssl.certfile",
+                    ["aws.arns.management.ssl.certfile", ssl_options, certfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_management_keyfile,
+        "aws.arns.management.ssl.keyfile = arn:aws:s3:::private-ca-42/keyfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_management,
+                    "arn:aws:s3:::private-ca-42/keyfile.pem",
+                    "aws.arns.management.ssl.keyfile",
+                    ["aws.arns.management.ssl.keyfile", ssl_options, keyfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_management_oauth_client_secret,
+        "aws.arns.management.oauth_client_secret = arn:aws:secretsmanager:us-east-1:111122223333:secret:my-secret",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_management,
+                    "arn:aws:secretsmanager:us-east-1:111122223333:secret:my-secret",
+                    "aws.arns.management.oauth_client_secret",
+                    ["aws.arns.management.oauth_client_secret", oauth_client_secret]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_auth_http_cacertfile,
+        "aws.arns.auth_http.ssl_options.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_http,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.auth_http.ssl_options.cacertfile",
+                    ["aws.arns.auth_http.ssl_options.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_auth_http_certfile,
+        "aws.arns.auth_http.ssl_options.certfile = arn:aws:s3:::private-ca-42/certfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_http,
+                    "arn:aws:s3:::private-ca-42/certfile.pem",
+                    "aws.arns.auth_http.ssl_options.certfile",
+                    ["aws.arns.auth_http.ssl_options.certfile", ssl_options, certfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_auth_http_keyfile,
+        "aws.arns.auth_http.ssl_options.keyfile = arn:aws:s3:::private-ca-42/keyfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_http,
+                    "arn:aws:s3:::private-ca-42/keyfile.pem",
+                    "aws.arns.auth_http.ssl_options.keyfile",
+                    ["aws.arns.auth_http.ssl_options.keyfile", ssl_options, keyfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_ldap_certfile,
+        "aws.arns.auth_ldap.ssl_options.certfile = arn:aws:s3:::private-ca-42/certfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_ldap,
+                    "arn:aws:s3:::private-ca-42/certfile.pem",
+                    "aws.arns.auth_ldap.ssl_options.certfile",
+                    ["aws.arns.auth_ldap.ssl_options.certfile", ssl_options, certfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_ldap_keyfile,
+        "aws.arns.auth_ldap.ssl_options.keyfile = arn:aws:s3:::private-ca-42/keyfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_ldap,
+                    "arn:aws:s3:::private-ca-42/keyfile.pem",
+                    "aws.arns.auth_ldap.ssl_options.keyfile",
+                    ["aws.arns.auth_ldap.ssl_options.keyfile", ssl_options, keyfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_ldap_dn_lookup_bind_password,
+        "aws.arns.auth_ldap.dn_lookup_bind.password = arn:aws:secretsmanager:us-east-1:111122223333:secret:dn-pw",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_ldap,
+                    "arn:aws:secretsmanager:us-east-1:111122223333:secret:dn-pw",
+                    "aws.arns.auth_ldap.dn_lookup_bind.password",
+                    ["aws.arns.auth_ldap.dn_lookup_bind.password", dn_lookup_bind, password]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_ldap_other_bind_password,
+        "aws.arns.auth_ldap.other_bind.password = arn:aws:secretsmanager:us-east-1:111122223333:secret:other-pw",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_ldap,
+                    "arn:aws:secretsmanager:us-east-1:111122223333:secret:other-pw",
+                    "aws.arns.auth_ldap.other_bind.password",
+                    ["aws.arns.auth_ldap.other_bind.password", other_bind, password]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_oauth2_named_provider_cacertfile,
+        "aws.arns.auth_oauth2.oauth_providers.keycloak.https.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_oauth2, undefined,
+                    "aws.arns.auth_oauth2.oauth_providers.https.cacertfile",
+                    ["aws.arns.auth_oauth2.oauth_providers.https.cacertfile",
+                     providers_https_cacertfile,
+                     #{<<"keycloak">> => <<"arn:aws:s3:::private-ca-42/cacertfile.pem">>}]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_sts_custom_headers,
+        "aws.sts.custom_headers.X-Amz-Algorithm = AWS4-HMAC-SHA256",
+        [{aws, [
+            {sts, [
+                {custom_headers, #{"X-Amz-Algorithm" => "AWS4-HMAC-SHA256"}}
+            ]}
+         ]}
+        ],
         [aws_arn_config]}
 ].
