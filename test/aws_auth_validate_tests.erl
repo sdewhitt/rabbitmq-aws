@@ -237,6 +237,27 @@ ldap_input_validation_test_() ->
         )
     ].
 
+%% build_ssl_opts/1 must translate validated ssl_options values to their ssl
+%% atoms WITHOUT binary_to_existing_atom, which would raise badarg for the
+%% verify_*/tls* atoms when ssl is not yet loaded (build_ssl_opts runs while
+%% assembling eldap:open options, before ssl is guaranteed up). Pin that the
+%% explicit mappings produce the right atoms.
+ldap_build_ssl_opts_translates_verify_and_versions_test() ->
+    Opts = aws_auth_validate_ldap:build_ssl_opts(#{
+        <<"verify">> => <<"verify_peer">>,
+        <<"versions">> => [<<"tlsv1.3">>, <<"tlsv1.2">>],
+        <<"depth">> => 3
+    }),
+    ?assertEqual(verify_peer, proplists:get_value(verify, Opts)),
+    ?assertEqual(['tlsv1.3', 'tlsv1.2'], proplists:get_value(versions, Opts)),
+    ?assertEqual(3, proplists:get_value(depth, Opts)).
+
+%% An explicit verify_none from the caller must be preserved (opt-out), never
+%% silently upgraded by the verify default.
+ldap_build_ssl_opts_keeps_explicit_verify_none_test() ->
+    Opts = aws_auth_validate_ldap:build_ssl_opts(#{<<"verify">> => <<"verify_none">>}),
+    ?assertEqual(verify_none, proplists:get_value(verify, Opts)).
+
 ldap_config_conflict_test() ->
     Body = base_body(#{<<"use_ssl">> => true, <<"use_starttls">> => true}),
     ?assertMatch({error, config_conflict, _}, aws_auth_validate_ldap:validate(Body)).
