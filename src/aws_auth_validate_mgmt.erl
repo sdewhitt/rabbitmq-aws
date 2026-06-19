@@ -292,7 +292,7 @@ feature_enabled() ->
 
 max_body_size() ->
     case application:get_env(aws, auth_validation_max_body_size) of
-        {ok, N} when is_integer(N), N > 0 -> N;
+        {ok, N} when is_integer(N), N > 0, N =< 10_000_000 -> N;
         _ -> ?DEFAULT_MAX_BODY_SIZE
     end.
 

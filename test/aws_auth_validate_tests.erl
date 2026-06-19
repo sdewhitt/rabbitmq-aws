@@ -176,6 +176,35 @@ ldap_allowed_fields_test() ->
         ]
     ].
 
+%%--------------------------------------------------------------------
+%% Server address validation (SSRF prevention)
+%%--------------------------------------------------------------------
+
+server_blocks_loopback_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("127.0.0.1")).
+
+server_blocks_link_local_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("169.254.169.254")).
+
+server_blocks_rfc1918_10_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("10.0.0.1")).
+
+server_blocks_rfc1918_172_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("172.16.0.1")).
+
+server_blocks_rfc1918_192_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("192.168.1.1")).
+
+server_blocks_zero_network_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("0.0.0.0")).
+
+server_rejects_unresolvable_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")).
+
+ldap_validate_rejects_private_server_test() ->
+    Body = base_body(#{<<"servers">> => [<<"169.254.169.254">>]}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(Body)).
+
 %% These all fail in the pure (network-free) validation pipeline, before any
 %% password ARN resolution or outbound connection is attempted.
 ldap_input_validation_test_() ->
@@ -372,7 +401,7 @@ ldap_bind_raise_does_not_leak_password_test_() ->
 %% bind path are actually reached. use_ssl/use_starttls default to false.
 bind_body() ->
     #{
-        <<"servers">> => [<<"127.0.0.1">>],
+        <<"servers">> => [<<"8.8.8.8">>],
         <<"port">> => 389,
         <<"user_dn">> => <<"cn=u,dc=example,dc=com">>,
         <<"password_arn">> =>
@@ -545,10 +574,11 @@ wait_until_zero(N) ->
 
 %% A minimally-valid body for the pure validation pipeline. Note: the tests
 %% that use this assert failures triggered *before* password_arn resolution,
-%% so the ARN here is never resolved (no AWS call is made).
+%% so the ARN here is never resolved (no AWS call is made). Uses a public IP
+%% to pass server-address validation (SSRF filter blocks private ranges).
 base_body(Overrides) when is_map(Overrides) ->
     Base = #{
-        <<"servers">> => [<<"127.0.0.1">>],
+        <<"servers">> => [<<"8.8.8.8">>],
         <<"port">> => 389,
         <<"user_dn">> => <<"cn=u">>,
         <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111111111111:secret:x">>

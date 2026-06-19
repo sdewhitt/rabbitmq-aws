@@ -47,7 +47,7 @@
 -ifdef(TEST).
 %% Exposed for unit tests: build_ssl_opts/1 translates validated ssl_options
 %% to the eldap proplist and is otherwise internal.
--export([build_ssl_opts/1]).
+-export([build_ssl_opts/1, is_allowed_server/1]).
 -endif.
 
 -include_lib("eldap/include/eldap.hrl").
@@ -90,6 +90,7 @@
 ]).
 
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
+-define(REASON_BLOCKED_SERVER, <<"one or more server addresses resolve to a blocked network range">>).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
 -define(REASON_BAD_PASSWORD_ARN, <<"password_arn must be a non-empty string">>).
@@ -193,8 +194,14 @@ parse_servers(Body, Acc) ->
     case maps:get(<<"servers">>, Body, undefined) of
         Servers when is_list(Servers), Servers =/= [] ->
             case lists:all(fun is_nonempty_binary/1, Servers) of
-                true -> {ok, Acc#{servers => [binary_to_list(S) || S <- Servers]}};
-                false -> {error, input_invalid, ?REASON_BAD_SERVERS}
+                true ->
+                    ServerStrs = [binary_to_list(S) || S <- Servers],
+                    case lists:all(fun is_allowed_server/1, ServerStrs) of
+                        true -> {ok, Acc#{servers => ServerStrs}};
+                        false -> {error, input_invalid, ?REASON_BLOCKED_SERVER}
+                    end;
+                false ->
+                    {error, input_invalid, ?REASON_BAD_SERVERS}
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_SERVERS}
@@ -365,6 +372,41 @@ parse_query_map([{Name, Value} | Rest], Acc, Parsed) ->
     end.
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
+
+%% Server address validation: resolve the hostname and reject addresses in
+%% private, loopback, link-local, or metadata IP ranges. This prevents SSRF
+%% via the validation endpoint while still allowing legitimate LDAP servers.
+%% Bypassed when auth_validation_allow_private_networks is true (for testing
+%% against local slapd instances).
+is_allowed_server(Server) ->
+    case application:get_env(aws, auth_validation_allow_private_networks, false) of
+        true -> true;
+        _ -> check_server_ip(Server)
+    end.
+
+check_server_ip(Server) ->
+    case inet:getaddr(Server, inet) of
+        {ok, IP} -> not is_private_ip(IP);
+        {error, _} ->
+            %% Also try IPv6
+            case inet:getaddr(Server, inet6) of
+                {ok, IP6} -> not is_private_ip6(IP6);
+                {error, _} -> false
+            end
+    end.
+
+%% Block RFC 1918, loopback, link-local, and cloud metadata ranges.
+is_private_ip({127, _, _, _}) -> true;
+is_private_ip({10, _, _, _}) -> true;
+is_private_ip({172, B, _, _}) when B >= 16, B =< 31 -> true;
+is_private_ip({192, 168, _, _}) -> true;
+is_private_ip({169, 254, _, _}) -> true;
+is_private_ip({0, _, _, _}) -> true;
+is_private_ip(_) -> false.
+
+is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_private_ip6({16#fe80, _, _, _, _, _, _, _}) -> true;
+is_private_ip6(_) -> false.
 
 %%--------------------------------------------------------------------
 %% Config conflict
@@ -651,6 +693,6 @@ resolve_arn(Arn) when is_binary(Arn) ->
 
 connection_timeout_ms() ->
     case application:get_env(aws, auth_validation_connection_timeout_ms) of
-        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        {ok, Ms} when is_integer(Ms), Ms > 0, Ms =< 60_000 -> Ms;
         _ -> ?DEFAULT_TIMEOUT_MS
     end.
