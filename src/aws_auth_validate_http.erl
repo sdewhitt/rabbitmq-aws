@@ -69,8 +69,16 @@
 %% `server_name_indication' atom it maps to -- the probe translates sni ->
 %% server_name_indication when it builds the httpc ssl options. cacertfile_arn
 %% mirrors the tutorial's aws.arns.auth_http.ssl_options.cacertfile ARN line.
+%% certfile_arn / keyfile_arn carry the CLIENT certificate + private key for
+%% mutual TLS (the broker's auth_http.ssl_options.certfile / .keyfile). The
+%% cert is typically an S3-hosted PEM; the key a Secrets Manager PEM. Both are
+%% resolved like cacertfile_arn and decoded into in-memory ssl {cert,_}/{key,_}
+%% options so an mTLS auth server (which the RabbitMqHttpSampleStack requires)
+%% can be validated.
 -define(SSL_OPTION_KEYS, [
     <<"cacertfile_arn">>,
+    <<"certfile_arn">>,
+    <<"keyfile_arn">>,
     <<"verify">>,
     <<"depth">>,
     <<"versions">>,
@@ -93,13 +101,21 @@
 -define(REASON_BAD_SSL_OPTIONS, <<"ssl_options must be an object">>).
 -define(REASON_UNKNOWN_SSL_OPTION, <<
     "ssl_options contains an unknown key; allowed keys are cacertfile_arn, "
-    "verify, depth, versions, sni"
+    "certfile_arn, keyfile_arn, verify, depth, versions, sni"
 >>).
 -define(REASON_BAD_SSL_VERIFY, <<"ssl_options.verify must be verify_peer or verify_none">>).
 -define(REASON_BAD_SSL_DEPTH, <<"ssl_options.depth must be a non-negative integer">>).
 -define(REASON_BAD_SSL_VERSIONS, <<"ssl_options.versions must be a list of known TLS versions">>).
 -define(REASON_BAD_SSL_SNI, <<"ssl_options.sni must be a string">>).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
+-define(REASON_BAD_SSL_CERT_ARN, <<"ssl_options.certfile_arn must be a non-empty string">>).
+-define(REASON_BAD_SSL_KEY_ARN, <<"ssl_options.keyfile_arn must be a non-empty string">>).
+-define(REASON_CLIENT_CERT_INCOMPLETE,
+    <<"ssl_options.certfile_arn and keyfile_arn must be supplied together">>
+).
+-define(REASON_NO_TRUST_ANCHOR,
+    <<"verify_peer requested but no CA trust anchor is available; supply cacertfile_arn">>
+).
 -define(REASON_CONNECTION, <<"could not connect to HTTP auth server">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_ENDPOINT, <<"HTTP auth server did not return a usable response">>).
@@ -310,8 +326,18 @@ parse_ssl_options(Body, Acc) ->
             {ok, Acc#{ssl_options => #{}}};
         Map when is_map(Map) ->
             case [K || K <- maps:keys(Map), not lists:member(K, ?SSL_OPTION_KEYS)] of
-                [] -> validate_ssl_values(maps:to_list(Map), Acc, Map);
-                [_ | _] -> {error, input_invalid, ?REASON_UNKNOWN_SSL_OPTION}
+                [_ | _] ->
+                    {error, input_invalid, ?REASON_UNKNOWN_SSL_OPTION};
+                [] ->
+                    %% Client cert + key are an inseparable pair: one without
+                    %% the other cannot build an mTLS identity. Reject in the
+                    %% pure phase before resolving either ARN.
+                    HasCert = maps:is_key(<<"certfile_arn">>, Map),
+                    HasKey = maps:is_key(<<"keyfile_arn">>, Map),
+                    case HasCert =:= HasKey of
+                        false -> {error, input_invalid, ?REASON_CLIENT_CERT_INCOMPLETE};
+                        true -> validate_ssl_values(maps:to_list(Map), Acc, Map)
+                    end
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_SSL_OPTIONS}
@@ -350,6 +376,16 @@ valid_ssl_value(<<"cacertfile_arn">>, V) ->
     case is_nonempty_binary(V) of
         true -> ok;
         false -> {error, input_invalid, ?REASON_BAD_SSL_CACERT_ARN}
+    end;
+valid_ssl_value(<<"certfile_arn">>, V) ->
+    case is_nonempty_binary(V) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_CERT_ARN}
+    end;
+valid_ssl_value(<<"keyfile_arn">>, V) ->
+    case is_nonempty_binary(V) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_KEY_ARN}
     end.
 
 %%--------------------------------------------------------------------
@@ -504,30 +540,99 @@ ip_to_int(Tuple) ->
 %%
 %% The whole probe runs inside a try/catch that collapses any raise to
 %% connection_failed, so a resolved secret can never reach a crash report (R6).
+%%
+%% All probe requests for THIS validation run on a dedicated, ephemeral httpc
+%% profile that is started here and stopped in the `after' clause. This isolates
+%% each validation's TLS sessions/connections: the shared default profile pools
+%% TLS sessions, so a prior request's authenticated (e.g. mTLS) session could be
+%% reused by a later request -- producing a false success for a config that
+%% would not connect on its own (and a leaked connection across requests, an R3
+%% violation). A fresh profile has no sessions to reuse, and stopping it tears
+%% down anything opened, so each validation is hermetic.
 do_http_validate(Params) ->
-    try
-        case build_client_ssl_opts(Params) of
-            {error, _, _} = Err ->
-                Err;
-            {ok, SslOpts} ->
-                probe_paths(maps:get(paths, Params), Params, SslOpts)
-        end
-    catch
-        _Class:_Reason:_Stack ->
-            {error, connection_failed, ?REASON_CONNECTION}
+    Profile = probe_profile_name(),
+    case start_probe_profile(Profile) of
+        false ->
+            %% Could not obtain an isolated profile; fail safe rather than fall
+            %% back to the shared default profile (which would reintroduce the
+            %% session-reuse hazard).
+            {error, connection_failed, ?REASON_CONNECTION};
+        true ->
+            try
+                case build_client_ssl_opts(Params) of
+                    {error, _, _} = Err ->
+                        Err;
+                    {ok, SslOpts} ->
+                        probe_paths(maps:get(paths, Params), Params, SslOpts, Profile)
+                end
+            catch
+                _Class:_Reason:_Stack ->
+                    {error, connection_failed, ?REASON_CONNECTION}
+            after
+                stop_probe_profile(Profile)
+            end
     end.
+
+%% Profile names are drawn from a FIXED pool (?PROFILE_POOL_SIZE atoms, created
+%% once and reused forever) rather than a fresh unique atom per request --
+%% generating a new atom per validation would leak the atom table unboundedly
+%% (atoms are never GC'd) and eventually crash the node. The pool is sized well
+%% above auth_validation_max_concurrent's cap (100), so concurrently-running
+%% validations almost never collide on a slot; the slot is picked from a
+%% per-request ref so two simultaneous calls are very unlikely to share one.
+-define(PROFILE_POOL_SIZE, 128).
+
+probe_profile_name() ->
+    Slot = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+    list_to_atom("aws_auth_validate_http_" ++ integer_to_list(Slot)).
+
+%% Start the ephemeral profile and disable connection/session reuse on it
+%% (no keep-alive, no session cache) so nothing is pooled even within the call.
+%% If the chosen pool slot is already in use by a concurrent validation,
+%% reclaim it (stop+start): the worst case from a rare collision is that the
+%% other validation's probe errors out to a safe connection_failed -- never a
+%% false success or a leaked authenticated session. Returns whether we now own
+%% a started profile so `after' only stops what exists.
+start_probe_profile(Profile) ->
+    case inets:start(httpc, [{profile, Profile}]) of
+        {ok, _Pid} ->
+            set_probe_profile_opts(Profile),
+            true;
+        {error, {already_started, _}} ->
+            _ = inets:stop(httpc, Profile),
+            case inets:start(httpc, [{profile, Profile}]) of
+                {ok, _Pid} ->
+                    set_probe_profile_opts(Profile),
+                    true;
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
+
+set_probe_profile_opts(Profile) ->
+    _ = httpc:set_options(
+        [{max_sessions, 0}, {max_keep_alive_length, 0}, {keep_alive_timeout, 0}],
+        Profile
+    ),
+    ok.
+
+stop_probe_profile(Profile) ->
+    _ = inets:stop(httpc, Profile),
+    ok.
 
 %% Probe each configured path in turn; the first non-ok outcome wins (mirrors
 %% the LDAP backend's check_dns/2 short-circuit).
-probe_paths([], _Params, _SslOpts) ->
+probe_paths([], _Params, _SslOpts, _Profile) ->
     ok;
-probe_paths([{Key, Url} | Rest], Params, SslOpts) ->
-    case probe_one(Key, Url, Params, SslOpts) of
-        ok -> probe_paths(Rest, Params, SslOpts);
+probe_paths([{Key, Url} | Rest], Params, SslOpts, Profile) ->
+    case probe_one(Key, Url, Params, SslOpts, Profile) of
+        ok -> probe_paths(Rest, Params, SslOpts, Profile);
         {error, _, _} = Err -> Err
     end.
 
-probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts) ->
+probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts, Profile) ->
     %% Resolve the host and classify every resolved address against the infra
     %% denylist BEFORE connecting, then connect to the pinned IP so httpc cannot
     %% re-resolve to a different (possibly denied) address (DNS-rebinding /
@@ -548,7 +653,7 @@ probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts) ->
                     %% do not re-vet the Location target).
                     {autoredirect, false}
                 ] ++ ssl_http_opt(Url, Host, SslOpts),
-            case httpc:request(Method, Request, HttpOpts, [{body_format, binary}]) of
+            case httpc:request(Method, Request, HttpOpts, [{body_format, binary}], Profile) of
                 {ok, {{_Vsn, Code, _Phrase}, _Headers, _Body}} ->
                     case lists:member(Code, ?AUTH_RESPONSE_CODES) of
                         true -> ok;
@@ -722,18 +827,26 @@ params_for(<<"topic_path">>) ->
 %% TLS option shaping (ports the LDAP backend's resolution, wrapped for httpc)
 %%--------------------------------------------------------------------
 
-%% Resolve cacertfile_arn (if present) and translate the validated ssl_options
-%% map into an Erlang ssl proplist for httpc. ARN resolution happens here, in
-%% the network phase, after all pure validation has passed (ARN-first
-%% ordering). A resolution failure maps to input_invalid, matching the LDAP
-%% backend.
+%% Resolve the ARN-backed TLS material (CA bundle, and the client cert+key for
+%% mTLS) and translate the validated ssl_options map into an Erlang ssl
+%% proplist for httpc. ARN resolution happens here, in the network phase, after
+%% all pure validation has passed (ARN-first ordering). Any resolution failure
+%% maps to input_invalid, matching the LDAP backend.
 build_client_ssl_opts(#{ssl_options := Map}) ->
     case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined)) of
         {error, _, _} = Err ->
             Err;
         {ok, CacertOpts} ->
-            Opts = CacertOpts ++ translate_ssl_opts(Map),
-            {ok, apply_verify_default(Opts)}
+            case resolve_client_cert(Map) of
+                {error, _, _} = Err ->
+                    Err;
+                {ok, ClientOpts} ->
+                    Opts = CacertOpts ++ ClientOpts ++ translate_ssl_opts(Map),
+                    %% Whether the caller set verify explicitly governs the
+                    %% no-trust-anchor policy (fail vs silent default).
+                    VerifyExplicit = maps:is_key(<<"verify">>, Map),
+                    apply_verify_default(Opts, VerifyExplicit)
+            end
     end.
 
 resolve_cacerts(undefined) ->
@@ -749,11 +862,66 @@ resolve_cacerts(Arn) when is_binary(Arn) ->
             {error, input_invalid, ?REASON_ARN_RESOLVE}
     end.
 
+%% Resolve the client certificate + private key for mutual TLS. parse_ssl_options
+%% already guaranteed both are present or both absent, so here we either resolve
+%% the pair or return no client-auth options.
+resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}) when
+    is_binary(CertArn), is_binary(KeyArn)
+->
+    case resolve_arn(CertArn) of
+        {ok, CertPem} ->
+            case decode_client_cert(CertPem) of
+                {error, _, _} = Err ->
+                    Err;
+                {ok, CertOpt} ->
+                    case resolve_arn(KeyArn) of
+                        {ok, KeyPem} ->
+                            case decode_client_key(KeyPem) of
+                                {error, _, _} = Err -> Err;
+                                {ok, KeyOpt} -> {ok, [CertOpt, KeyOpt]}
+                            end;
+                        {error, _} ->
+                            {error, input_invalid, ?REASON_ARN_RESOLVE}
+                    end
+            end;
+        {error, _} ->
+            {error, input_invalid, ?REASON_ARN_RESOLVE}
+    end;
+resolve_client_cert(_Map) ->
+    {ok, []}.
+
+%% Decode a client-certificate PEM into an ssl {cert, DER} option. The first
+%% 'Certificate' entry is the leaf; we pass the raw DER (ssl accepts a single
+%% DER binary or a list). A PEM with no certificate entry is a resolution-shaped
+%% failure (the secret content is wrong), reported as the fixed ARN category so
+%% no PEM content leaks.
+decode_client_cert(Pem) when is_binary(Pem) ->
+    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)] of
+        [] -> {error, input_invalid, ?REASON_ARN_RESOLVE};
+        Ders -> {ok, {cert, Ders}}
+    end.
+
+%% Decode a private-key PEM into an ssl {key, {Asn1Type, DER}} option. Accepts
+%% the common unencrypted key entry types. An encrypted or absent key is a
+%% fixed ARN-category failure (we never prompt for a passphrase or echo detail).
+decode_client_key(Pem) when is_binary(Pem) ->
+    KeyEntries = [
+        {Type, Der}
+     || {Type, Der, not_encrypted} <- public_key:pem_decode(Pem),
+        lists:member(Type, [
+            'PrivateKeyInfo', 'RSAPrivateKey', 'ECPrivateKey', 'DSAPrivateKey'
+        ])
+    ],
+    case KeyEntries of
+        [{Type, Der} | _] -> {ok, {key, {Type, Der}}};
+        [] -> {error, input_invalid, ?REASON_ARN_RESOLVE}
+    end.
+
 %% Translate the non-cacert ssl_options keys. `sni' is the customer-facing
 %% config key; ssl expects `server_name_indication', so translate it here.
 translate_ssl_opts(Map) ->
     Pairs = [
-        {verify, <<"verify">>, fun to_atom/1},
+        {verify, <<"verify">>, fun to_verify/1},
         {depth, <<"depth">>, fun to_integer/1},
         {versions, <<"versions">>, fun to_versions/1},
         {server_name_indication, <<"sni">>, fun to_list/1}
@@ -769,19 +937,60 @@ translate_ssl_opts(Map) ->
         Pairs
     ).
 
-%% Same secure-default policy as the LDAP backend: when the caller omits
-%% `verify', prefer verify_peer -- but only when a trust anchor is available
-%% (caller cacerts or the OS trust store), else leave verify unset (parity with
-%% a broker default of verify_none) rather than forcing a handshake that fails
-%% with unknown_ca on a config the broker would accept.
-apply_verify_default(Opts) ->
-    case lists:keymember(verify, 1, Opts) of
-        true ->
-            Opts;
+%% Ensure verify_peer always has a trust anchor, whether the caller set
+%% verify_peer EXPLICITLY or we are about to default it on. Without this, an
+%% explicit `verify: verify_peer' with no cacertfile_arn produced
+%% [{verify, verify_peer}] with no `cacerts', which OTP ssl rejects as
+%% {options, incompatible, [{verify,verify_peer},{cacerts,undefined}]} -- httpc
+%% surfaces that as a generic failed_connect (no tls_alert), so the probe
+%% mis-reported connection_failed and an explicit verify_peer could never
+%% succeed. Policy:
+%% The no-trust-anchor policy DEPENDS on whether the caller asked for
+%% verify_peer EXPLICITLY:
+%%   * EXPLICIT verify_peer + no cacerts -> attach OS trust store if available;
+%%     if none, FAIL with tls_failed. Silently downgrading an explicit
+%%     verify_peer to verify_none would report a passing handshake that never
+%%     verified the peer -- the exact false-positive this endpoint exists to
+%%     prevent, so we surface it instead.
+%%   * DEFAULTED verify (caller omitted it) -> verify_peer when a trust anchor
+%%     exists, else leave verify unset (broker-parity verify_none); this is a
+%%     host-environment artifact, not a customer config error, so no failure.
+%%   * explicit verify_none -> untouched.
+%% Returns {ok, Opts} | {error, Category, Reason}.
+apply_verify_default(Opts, VerifyExplicit) ->
+    case lists:keyfind(verify, 1, Opts) of
+        {verify, verify_peer} when VerifyExplicit ->
+            case ensure_trust_anchor(Opts) of
+                {ok, _} = Ok -> Ok;
+                none -> {error, tls_failed, ?REASON_NO_TRUST_ANCHOR}
+            end;
+        {verify, verify_peer} ->
+            %% verify_peer that we defaulted on (not caller-supplied): if the
+            %% anchor vanished, fall back rather than fail.
+            case ensure_trust_anchor(Opts) of
+                {ok, Opts1} -> {ok, Opts1};
+                none -> {ok, lists:keyreplace(verify, 1, Opts, {verify, verify_none})}
+            end;
+        {verify, _Other} ->
+            %% explicit verify_none (already validated) -- leave it
+            {ok, Opts};
         false ->
             case trust_source(Opts) of
-                {ok, Opts1} -> [{verify, verify_peer} | Opts1];
-                none -> Opts
+                {ok, Opts1} -> {ok, [{verify, verify_peer} | Opts1]};
+                none -> {ok, Opts}
+            end
+    end.
+
+%% Opts contain {verify, verify_peer}. Return {ok, OptsWithAnchor} when a trust
+%% anchor is present or can be sourced from the OS store, else `none'.
+ensure_trust_anchor(Opts) ->
+    case lists:keymember(cacerts, 1, Opts) of
+        true ->
+            {ok, Opts};
+        false ->
+            case os_cacerts() of
+                [] -> none;
+                Certs -> {ok, [{cacerts, Certs} | Opts]}
             end
     end.
 
@@ -812,13 +1021,22 @@ decode_pem_cacerts(B) when is_binary(B) ->
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.
 
-to_atom(B) when is_binary(B) -> binary_to_existing_atom(B, utf8);
-to_atom(A) when is_atom(A) -> A.
-
 to_integer(I) when is_integer(I) -> I.
 
+%% Explicit value->atom tables (mirrors aws_auth_validate_ldap). Using fixed
+%% clauses rather than binary_to_existing_atom avoids depending on the verify/
+%% version atoms already existing in the table, and is safe because the values
+%% were allowlisted in the pure phase (valid_ssl_value/2).
+to_verify(<<"verify_peer">>) -> verify_peer;
+to_verify(<<"verify_none">>) -> verify_none.
+
 to_versions(L) when is_list(L) ->
-    [to_atom(V) || V <- L].
+    [to_version(V) || V <- L].
+
+to_version(<<"tlsv1.3">>) -> 'tlsv1.3';
+to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
+to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
+to_version(<<"tlsv1">>) -> tlsv1.
 
 %%--------------------------------------------------------------------
 %% Shared helpers (mirror the LDAP backend)
