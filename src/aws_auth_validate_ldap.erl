@@ -44,6 +44,12 @@
 
 -export([method_name/0, validate/1, allowed_fields/0]).
 
+-ifdef(TEST).
+%% Exposed for unit tests: build_ssl_opts/1 translates validated ssl_options
+%% to the eldap proplist and is otherwise internal.
+-export([build_ssl_opts/1, is_allowed_server/1]).
+-endif.
+
 -include_lib("eldap/include/eldap.hrl").
 
 -define(DEFAULT_TIMEOUT_MS, 5_000).
@@ -84,6 +90,7 @@
 ]).
 
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
+-define(REASON_BLOCKED_SERVER, <<"one or more server addresses resolve to a blocked network range">>).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
 -define(REASON_BAD_PASSWORD_ARN, <<"password_arn must be a non-empty string">>).
@@ -187,8 +194,14 @@ parse_servers(Body, Acc) ->
     case maps:get(<<"servers">>, Body, undefined) of
         Servers when is_list(Servers), Servers =/= [] ->
             case lists:all(fun is_nonempty_binary/1, Servers) of
-                true -> {ok, Acc#{servers => [binary_to_list(S) || S <- Servers]}};
-                false -> {error, input_invalid, ?REASON_BAD_SERVERS}
+                true ->
+                    ServerStrs = [binary_to_list(S) || S <- Servers],
+                    case lists:all(fun is_allowed_server/1, ServerStrs) of
+                        true -> {ok, Acc#{servers => ServerStrs}};
+                        false -> {error, input_invalid, ?REASON_BLOCKED_SERVER}
+                    end;
+                false ->
+                    {error, input_invalid, ?REASON_BAD_SERVERS}
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_SERVERS}
@@ -360,6 +373,41 @@ parse_query_map([{Name, Value} | Rest], Acc, Parsed) ->
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
+%% Server address validation: resolve the hostname and reject addresses in
+%% private, loopback, link-local, or metadata IP ranges. This prevents SSRF
+%% via the validation endpoint while still allowing legitimate LDAP servers.
+%% Bypassed when auth_validation_allow_private_networks is true (for testing
+%% against local slapd instances).
+is_allowed_server(Server) ->
+    case application:get_env(aws, auth_validation_allow_private_networks, false) of
+        true -> true;
+        _ -> check_server_ip(Server)
+    end.
+
+check_server_ip(Server) ->
+    case inet:getaddr(Server, inet) of
+        {ok, IP} -> not is_private_ip(IP);
+        {error, _} ->
+            %% Also try IPv6
+            case inet:getaddr(Server, inet6) of
+                {ok, IP6} -> not is_private_ip6(IP6);
+                {error, _} -> false
+            end
+    end.
+
+%% Block RFC 1918, loopback, link-local, and cloud metadata ranges.
+is_private_ip({127, _, _, _}) -> true;
+is_private_ip({10, _, _, _}) -> true;
+is_private_ip({172, B, _, _}) when B >= 16, B =< 31 -> true;
+is_private_ip({192, 168, _, _}) -> true;
+is_private_ip({169, 254, _, _}) -> true;
+is_private_ip({0, _, _, _}) -> true;
+is_private_ip(_) -> false.
+
+is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_private_ip6({16#fe80, _, _, _, _, _, _, _}) -> true;
+is_private_ip6(_) -> false.
+
 %%--------------------------------------------------------------------
 %% Config conflict
 %%--------------------------------------------------------------------
@@ -509,13 +557,25 @@ maybe_start_tls(_Handle, false, _SslOpts, _Timeout) ->
 maybe_start_tls(Handle, true, SslOpts, Timeout) ->
     eldap:start_tls(Handle, build_ssl_opts(SslOpts), Timeout).
 
-%% Translate the JSON ssl_options map into an Erlang ssl options
-%% proplist suitable for eldap. The accepted key surface is validated up
-%% front in parse_ssl_options/2, so any key reaching here is known.
+%% Translate the JSON ssl_options map into an Erlang ssl options proplist
+%% suitable for eldap. Both the key surface AND every value are validated up
+%% front in parse_ssl_options/2 (verify/depth/versions/server_name_indication
+%% domains, cacertfile_arn shape), so a value reaching here is already known
+%% good: the verify/depth/versions/sni translators below are total over the
+%% validated domain and cannot fail on a mis-typed option -- that was already
+%% rejected with input_invalid in the pure phase.
+%%
+%% No `catch' here. The previous `(catch Fun(Value))' swallowed every error,
+%% which the value-validation in parse_ssl_options/2 has now made unnecessary
+%% and which hid bugs (the discouraged `catch' keyword). The cacerts resolver
+%% returns `skip' for PEM with no decodable entries (dropped via add_ssl_opt);
+%% a genuinely malformed CA cert can still raise in public_key, but that is
+%% contained by do_ldap_validate/1's R6 try/catch one level up (-> a fixed
+%% connection_failed, password-safe), not silently dropped here.
 build_ssl_opts(Map) when is_map(Map) ->
     Pairs = [
         {cacerts, <<"cacertfile_arn">>, fun resolve_and_decode_pem_cacerts/1},
-        {verify, <<"verify">>, fun to_atom/1},
+        {verify, <<"verify">>, fun to_verify/1},
         {depth, <<"depth">>, fun to_integer/1},
         {versions, <<"versions">>, fun to_versions/1},
         {server_name_indication, <<"server_name_indication">>, fun to_list/1}
@@ -523,20 +583,20 @@ build_ssl_opts(Map) when is_map(Map) ->
     Translated = lists:foldl(
         fun({SslKey, JsonKey, Fun}, Acc) ->
             case maps:get(JsonKey, Map, undefined) of
-                undefined ->
-                    Acc;
-                Value ->
-                    case (catch Fun(Value)) of
-                        {'EXIT', _} -> Acc;
-                        skip -> Acc;
-                        Translated -> [{SslKey, Translated} | Acc]
-                    end
+                undefined -> Acc;
+                Value -> add_ssl_opt(SslKey, Fun, Value, Acc)
             end
         end,
         [],
         Pairs
     ),
     apply_verify_default(Translated).
+
+add_ssl_opt(SslKey, Fun, Value, Acc) ->
+    case Fun(Value) of
+        skip -> Acc;
+        Translated -> [{SslKey, Translated} | Acc]
+    end.
 
 %% OTP's ssl defaults `verify' to verify_none, which silently accepts any
 %% certificate -- insecure, and a poor thing to validate a config against.
@@ -584,13 +644,28 @@ os_cacerts() ->
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.
 
-to_atom(B) when is_binary(B) -> binary_to_existing_atom(B, utf8);
-to_atom(A) when is_atom(A) -> A.
+%% Map the validated `verify' binary to its ssl atom via an explicit table,
+%% NOT binary_to_existing_atom: those atoms (verify_peer/verify_none) only
+%% exist once the ssl app has been loaded, and build_ssl_opts runs while
+%% assembling eldap:open options -- before ssl is guaranteed loaded -- so
+%% binary_to_existing_atom would raise badarg on a perfectly valid request.
+%% parse_ssl_options/2 has already constrained the value to this domain.
+to_verify(<<"verify_peer">>) -> verify_peer;
+to_verify(<<"verify_none">>) -> verify_none.
 
 to_integer(I) when is_integer(I) -> I.
 
+%% Map each validated TLS version binary to its ssl atom via an explicit
+%% table, for the same reason as to_verify/1 (the version atoms are not
+%% guaranteed to exist when build_ssl_opts runs). parse_ssl_options/2 has
+%% already constrained every element to this domain.
 to_versions(L) when is_list(L) ->
-    [to_atom(V) || V <- L].
+    [to_version(V) || V <- L].
+
+to_version(<<"tlsv1.3">>) -> 'tlsv1.3';
+to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
+to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
+to_version(<<"tlsv1">>) -> tlsv1.
 
 decode_pem_cacerts(B) when is_binary(B) ->
     case public_key:pem_decode(B) of
@@ -618,6 +693,6 @@ resolve_arn(Arn) when is_binary(Arn) ->
 
 connection_timeout_ms() ->
     case application:get_env(aws, auth_validation_connection_timeout_ms) of
-        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        {ok, Ms} when is_integer(Ms), Ms > 0, Ms =< 60_000 -> Ms;
         _ -> ?DEFAULT_TIMEOUT_MS
     end.

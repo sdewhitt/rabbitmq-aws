@@ -146,9 +146,12 @@ end_per_suite(Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config).
 
 init_per_group(_Group, Config) ->
+    %% Allow private/loopback addresses for testing against local slapd.
+    application:set_env(aws, auth_validation_allow_private_networks, true),
     Config.
 
 end_per_group(_Group, Config) ->
+    application:unset_env(aws, auth_validation_allow_private_networks),
     Config.
 
 init_per_testcase(TC, Config) ->

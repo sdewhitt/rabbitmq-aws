@@ -84,37 +84,8 @@ accept_content(Req0, Context) ->
             T0 = erlang:monotonic_time(millisecond),
             SourceIP = peer_ip(Req0),
             Method = cowboy_req:binding(method, Req0),
-            %% The semaphore worker is started by aws_sup only at boot, when
-            %% the feature was already enabled. If the env was flipped to true
-            %% at runtime (no restart), or the supervisor exhausted its restart
-            %% intensity and gave up on the worker, feature_enabled/0 reads true
-            %% but no semaphore process is registered. Acquiring would then
-            %% gen_server:call a non-existent name and exit with noproc -> the
-            %% acquire is outside with_semaphore/6's try, so that surfaces as an
-            %% opaque HTTP 500. Detect the missing worker and return a graceful
-            %% 503 instead: the endpoint is enabled in config but not serviceable
-            %% until the broker is restarted.
-            case workers_ready() of
-                false ->
-                    audit(Method, SourceIP, capacity_exhausted, T0),
-                    reply_error(
-                        503,
-                        capacity_exhausted,
-                        <<"Validation service is not ready; broker restart required">>,
-                        Req0,
-                        Context
-                    );
-                true ->
-                    with_body(T0, SourceIP, Method, Req0, Context)
-            end
+            with_body(T0, SourceIP, Method, Req0, Context)
     end.
-
-%% The endpoint is serviceable only if its semaphore worker is actually
-%% running (see accept_content/2 for why feature_enabled/0 alone is not
-%% enough). Checked via whereis rather than a try around acquire so the
-%% failure is caught before any request body is read.
-workers_ready() ->
-    is_pid(erlang:whereis(aws_auth_validate_semaphore)).
 
 with_body(T0, SourceIP, Method, Req0, Context) ->
     MaxBytes = max_body_size(),
@@ -138,7 +109,23 @@ with_body(T0, SourceIP, Method, Req0, Context) ->
     end.
 
 with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
-    case aws_auth_validate_semaphore:acquire() of
+    %% acquire/0 is a gen_server:call to the semaphore worker. The worker is
+    %% started by aws_sup only at boot when the feature is enabled; if the env
+    %% was flipped to true at runtime (no restart) or the supervisor gave up on
+    %% the worker, the call exits {noproc, _}. Catch exactly that here -- the
+    %% atomic acquire IS the liveness check, so there is no time-of-check vs
+    %% time-of-use window -- and map it to the same graceful 503 as a full
+    %% semaphore. Any other exit propagates (it is a genuine fault).
+    case try_acquire() of
+        not_ready ->
+            audit(Method, SourceIP, capacity_exhausted, T0),
+            reply_error(
+                503,
+                capacity_exhausted,
+                <<"Validation service is not ready; broker restart required">>,
+                Req,
+                Context
+            );
         {error, full} ->
             audit(Method, SourceIP, capacity_exhausted, T0),
             reply_error(503, capacity_exhausted, <<"Service at capacity">>, Req, Context);
@@ -147,25 +134,43 @@ with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
                 %% Defense in depth for R6: a backend must always *return* a
                 %% fixed-category result, but if one ever raises, the escaping
                 %% exception would carry BodyMap (and any future secret it
-                %% holds) into a Cowboy crash report. Catch here and collapse to
-                %% a fixed connection_failed response, discarding the
+                %% holds) into a Cowboy crash report. Catch here, discarding the
                 %% class/reason/stacktrace so no request term is logged.
+                %%
+                %% A raise here is OUR fault, not the caller's: a real
+                %% unreachable server is *returned* as connection_failed by the
+                %% backend (which has its own R6 try/catch), so reaching this
+                %% clause means an unexpected internal error. Report it as a 500
+                %% rather than a 400 connection_failed, which would wrongly tell
+                %% the caller their LDAP server is unreachable.
                 Result = aws_auth_validate_registry:dispatch(Method, BodyMap),
                 audit(Method, SourceIP, result_category(Result), T0),
                 respond(Result, Req, Context)
             catch
                 _Class:_Reason:_Stack ->
-                    audit(Method, SourceIP, connection_failed, T0),
+                    audit(Method, SourceIP, internal_error, T0),
                     reply_error(
-                        400,
-                        connection_failed,
-                        <<"could not connect to LDAP server">>,
+                        500,
+                        internal_error,
+                        <<"Internal error during validation">>,
                         Req,
                         Context
                     )
             after
                 aws_auth_validate_semaphore:release(Ref)
             end
+    end.
+
+%% Acquire a semaphore slot, treating an absent worker as `not_ready' rather
+%% than letting the noproc exit escape. This is the single point of contact
+%% with the worker, so the acquire doubles as the liveness check -- no
+%% separate whereis/check beforehand, hence no TOCTOU window. Only a noproc
+%% (worker not registered / dead) is converted; every other exit propagates.
+try_acquire() ->
+    try
+        aws_auth_validate_semaphore:acquire()
+    catch
+        exit:{noproc, _} -> not_ready
     end.
 
 %%--------------------------------------------------------------------
@@ -287,7 +292,7 @@ feature_enabled() ->
 
 max_body_size() ->
     case application:get_env(aws, auth_validation_max_body_size) of
-        {ok, N} when is_integer(N), N > 0 -> N;
+        {ok, N} when is_integer(N), N > 0, N =< 10_000_000 -> N;
         _ -> ?DEFAULT_MAX_BODY_SIZE
     end.
 
