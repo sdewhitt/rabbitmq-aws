@@ -57,10 +57,15 @@ semaphore_spec() ->
     }.
 
 semaphore_config() ->
-    #{max => get_int_env(auth_validation_max_concurrent, 5)}.
+    #{max => get_int_env(auth_validation_max_concurrent, 5, 100)}.
 
-get_int_env(Key, Default) ->
+get_int_env(Key, Default, MaxBound) ->
     case application:get_env(aws, Key) of
-        {ok, N} when is_integer(N), N > 0 -> N;
+        {ok, N} when is_integer(N), N > 0 ->
+            case MaxBound of
+                infinity -> N;
+                _ when N =< MaxBound -> N;
+                _ -> Default
+            end;
         _ -> Default
     end.
