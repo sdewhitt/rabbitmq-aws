@@ -46,6 +46,20 @@
 %% in-flight resolution. ARN resolution is a bounded HTTP call, so a finite
 %% retry budget is enough; `infinity' could wedge a caller behind a stuck
 %% holder with no escape.
+%%
+%% Wall-clock meaning of 600 (for an operator who sees `arn_lock_aborted' in
+%% the logs): global:trans/4 sleeps a randomized backoff between retries. OTP's
+%% global:random_sleep/1 starts at a fraction of a second and doubles, capping
+%% at a uniform-random 0..8s per retry once it has ramped up (after ~6 tries).
+%% So the steady-state cost is ~4s average / 8s worst case per retry, and 600
+%% retries is an upper bound on the order of ~40 minutes (average) to ~80
+%% minutes (worst case) of queuing before a caller gives up. That is far longer
+%% than any single bounded ARN HTTP resolution, so reaching the abort means the
+%% lock holder is genuinely wedged (e.g. a hung resolution) rather than merely
+%% slow. The endpoint's concurrency semaphore (auth_validation_max_concurrent)
+%% bounds how many callers can queue behind the lock at once. If
+%% `arn_lock_aborted' shows up in practice, treat it as a stuck-holder signal,
+%% not normal contention.
 -define(LOCK_RETRIES, 600).
 
 %% Run Fun serialized against all other with_lock/1 callers on this node.

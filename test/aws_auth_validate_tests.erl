@@ -199,7 +199,9 @@ server_blocks_zero_network_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("0.0.0.0")).
 
 server_rejects_unresolvable_test() ->
-    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")).
+    ?assertEqual(
+        false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
+    ).
 
 ldap_validate_rejects_private_server_test() ->
     Body = base_body(#{<<"servers">> => [<<"169.254.169.254">>]}),
@@ -410,6 +412,91 @@ bind_body() ->
 
 string_find(Haystack, Needle) ->
     string:find(Haystack, Needle).
+
+%%--------------------------------------------------------------------
+%% CA-cert ARN resolution: failures must be reported, never silently
+%% downgrade TLS to verify_none
+%%--------------------------------------------------------------------
+
+%% A failed cacertfile_arn resolution must surface as input_invalid (mirroring
+%% the password-ARN path), NOT silently proceed with no trust anchor (which
+%% would let `verify' default to verify_none and validate a TLS config the
+%% operator believes is certificate-verified). We mock resolve_arn so the
+%% password ARN resolves but the CA-cert ARN does not, and stop before any real
+%% connection by asserting on the input_invalid result the resolve produces.
+cacert_arn_resolution_test_() ->
+    {foreach,
+        fun() ->
+            ok = meck:new(eldap, [unstick, non_strict]),
+            ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
+            meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
+            %% Keep the suite hermetic: the TLS-off case reaches the connect
+            %% path, so stub eldap:open to fail fast instead of dialling out.
+            meck:expect(eldap, open, fun(_Servers, _Opts) -> {error, refused} end),
+            meck:expect(eldap, close, fun(_H) -> ok end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(eldap),
+            meck:unload(aws_auth_validate_arn_lock),
+            meck:unload(aws_arn_util)
+        end,
+        [
+            {"unresolvable CA-cert ARN -> input_invalid (no silent verify_none)", fun() ->
+                %% Password ARN resolves; CA-cert ARN does not.
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> {error, not_found};
+                        false -> {ok, <<"pw">>}
+                    end
+                end),
+                ?assertMatch(
+                    {error, input_invalid, _},
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:nope">>))
+                )
+            end},
+            {"CA-cert ARN resolving to non-PEM data -> input_invalid", fun() ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> {ok, <<"this is not a PEM certificate">>};
+                        false -> {ok, <<"pw">>}
+                    end
+                end),
+                ?assertMatch(
+                    {error, input_invalid, _},
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:garbage">>))
+                )
+            end},
+            {"CA-cert ARN ignored when TLS is off (no resolve, no error)", fun() ->
+                %% With use_ssl/use_starttls both false the CA cert is never
+                %% consumed, so a bogus cacertfile_arn must not trigger a
+                %% resolve or fail the request -- only the password ARN is
+                %% fetched. A resolve of the CA-cert ARN raises so the test
+                %% fails loudly if resolve_cacert/1 runs it; the password ARN
+                %% resolves normally. The bind is then left to fail at connect
+                %% (8.8.8.8:389), which is NOT input_invalid.
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> erlang:error(cacert_resolved_with_tls_off);
+                        false -> {ok, <<"pw">>}
+                    end
+                end),
+                Result = aws_auth_validate_ldap:validate(
+                    (bind_body())#{
+                        <<"ssl_options">> => #{<<"cacertfile_arn">> => <<"arn:aws:cacert:x">>}
+                    }
+                ),
+                ?assertNotMatch({error, input_invalid, _}, Result)
+            end}
+        ]}.
+
+%% A body with TLS enabled and a caller-supplied CA-cert ARN, otherwise valid.
+tls_body(CacertArn) ->
+    (bind_body())#{
+        <<"use_ssl">> => true,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => CacertArn}
+    }.
 
 %%--------------------------------------------------------------------
 %% LDAP query DSL parser (aws_auth_validate_ldap_query)
