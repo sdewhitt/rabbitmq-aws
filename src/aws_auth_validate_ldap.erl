@@ -90,7 +90,9 @@
 ]).
 
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
--define(REASON_BLOCKED_SERVER, <<"one or more server addresses resolve to a blocked network range">>).
+-define(REASON_BLOCKED_SERVER,
+    <<"one or more server addresses resolve to a blocked network range">>
+).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
 -define(REASON_BAD_PASSWORD_ARN, <<"password_arn must be a non-empty string">>).
@@ -386,7 +388,8 @@ is_allowed_server(Server) ->
 
 check_server_ip(Server) ->
     case inet:getaddr(Server, inet) of
-        {ok, IP} -> not is_private_ip(IP);
+        {ok, IP} ->
+            not is_private_ip(IP);
         {error, _} ->
             %% Also try IPv6
             case inet:getaddr(Server, inet6) of
@@ -681,15 +684,21 @@ resolve_and_decode_pem_cacerts(Arn) when is_binary(Arn) ->
 
 %%--------------------------------------------------------------------
 
-%% ARN resolution mutates the shared rabbitmq_aws region/credential
-%% singleton (aws_sms/aws_acm_pca call rabbitmq_aws:set_region/1), so
-%% serialize it across concurrent validation requests to prevent region
-%% clobbering between a set_region and its HTTP call. See
-%% aws_auth_validate_arn_lock.
+%% Each request builds its own aws_state(); region and credentials are
+%% threaded through that value rather than written to a shared singleton, so
+%% concurrent validations can no longer clobber each other's region and no
+%% lock is needed. R6 is preserved -- resolution runs in the caller process and
+%% the resolved secret is neither logged nor returned (only adapted to the
+%% caller's {ok, Binary} contract). R3 is preserved -- this still runs only
+%% after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
+%% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
+%% two callers expect; the threaded state is request-scoped and discarded here.
 resolve_arn(Arn) when is_binary(Arn) ->
-    aws_auth_validate_arn_lock:with_lock(fun() ->
-        aws_arn_util:resolve_arn(binary_to_list(Arn))
-    end).
+    State = aws_lib:new(),
+    case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
+        {ok, Data, _State1} -> {ok, Data};
+        {error, _} = Error -> Error
+    end.
 
 connection_timeout_ms() ->
     case application:get_env(aws, auth_validation_connection_timeout_ms) of

@@ -8,9 +8,13 @@ define PROJECT_ENV
 []
 endef
 
-DEPS = rabbit_common rabbitmq_aws rabbit rabbitmq_management
+DEPS = rabbit_common rabbit rabbitmq_management gun thoas
 TEST_DEPS = meck rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_auth_backend_ldap
 LOCAL_DEPS = crypto inets ssl xmerl public_key eldap
+
+# gun is declared by the umbrella (rabbitmq-components.mk); thoas is not, so
+# pin it here. Used by aws_lib_json for JSON decoding.
+dep_thoas = hex 1.2.1
 
 PLT_APPS = rabbit
 

@@ -19,9 +19,10 @@
 %% The directory is seeded directly over eldap as the rootdn, so the suite
 %% is self-contained and does not depend on the backend dep's seed module.
 %%
-%% password_arn resolution is mocked with meck: aws_arn_util:resolve_arn/1
+%% password_arn resolution is mocked with meck: aws_arn_util:resolve_arn/2
 %% is a separately-tested AWS concern, so here it simply maps a fake ARN to
-%% a known password. The real eldap bind still runs against real slapd.
+%% a known password (threading the passed aws_lib:aws_state() back unchanged).
+%% The real eldap bind still runs against real slapd.
 -module(aws_auth_validate_ldap_SUITE).
 
 -compile(export_all).
@@ -155,33 +156,30 @@ end_per_group(_Group, Config) ->
     Config.
 
 init_per_testcase(TC, Config) ->
-    %% Mock ARN resolution: real eldap bind, fake secret fetch.
+    %% Mock ARN resolution: real eldap bind, fake secret fetch. resolve_arn/2
+    %% now takes the threaded aws_lib:aws_state() and returns it in the success
+    %% 3-tuple; the mock threads the passed State straight back. ARN resolution
+    %% runs inline now (the old aws_auth_validate_arn_lock serialization of the
+    %% rabbitmq_aws region singleton is gone -- there is no shared singleton
+    %% under state threading), so there is nothing else to mock.
     ok = meck:new(aws_arn_util, [passthrough, no_link]),
-    ok = meck:expect(aws_arn_util, resolve_arn, fun mock_resolve_arn/1),
-    %% The backend resolves password_arn through aws_auth_validate_arn_lock,
-    %% a gen_server that aws_sup only starts on a running broker. This suite
-    %% drives validate/1 in-process with no broker, so that server isn't
-    %% registered and the call would fail with {noproc, ...}. Mock with_lock/1
-    %% to run the closure inline (the same serialization-free shortcut the
-    %% R6 unit test uses); the real ARN resolution is already mocked above.
-    ok = meck:new(aws_auth_validate_arn_lock, [passthrough, no_link]),
-    ok = meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun mock_resolve_arn/2),
     rabbit_ct_helpers:testcase_started(Config, TC).
 
 end_per_testcase(TC, Config) ->
-    catch meck:unload(aws_auth_validate_arn_lock),
     catch meck:unload(aws_arn_util),
     rabbit_ct_helpers:testcase_finished(Config, TC).
 
 %% Resolve only the ARNs this suite knows about; everything else fails to
-%% resolve (which the backend maps to input_invalid).
-mock_resolve_arn(Arn) when is_list(Arn) ->
-    mock_resolve_arn(list_to_binary(Arn));
-mock_resolve_arn(?BIND_PW_ARN) ->
-    {ok, list_to_binary(?BIND_PW)};
-mock_resolve_arn(?WRONG_PW_ARN) ->
-    {ok, <<"definitely-wrong">>};
-mock_resolve_arn(_Other) ->
+%% resolve (which the backend maps to input_invalid). The passed
+%% aws_lib:aws_state() is threaded back unchanged in the success 3-tuple.
+mock_resolve_arn(Arn, State) when is_list(Arn) ->
+    mock_resolve_arn(list_to_binary(Arn), State);
+mock_resolve_arn(?BIND_PW_ARN, State) ->
+    {ok, list_to_binary(?BIND_PW), State};
+mock_resolve_arn(?WRONG_PW_ARN, State) ->
+    {ok, <<"definitely-wrong">>, State};
+mock_resolve_arn(_Other, _State) ->
     {error, not_found}.
 
 %%--------------------------------------------------------------------
@@ -283,7 +281,9 @@ parity_with_backend_bind(Config) ->
 
 parity_case(Config, Port, {Dn, Pw, _Expect}) ->
     %% Endpoint path (with the ARN mock returning Pw).
-    ok = meck:expect(aws_arn_util, resolve_arn, fun(_) -> {ok, list_to_binary(Pw)} end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+        {ok, list_to_binary(Pw), State}
+    end),
     Body = (base_body(Config))#{
         <<"user_dn">> => list_to_binary(Dn),
         <<"password_arn">> => ?BIND_PW_ARN

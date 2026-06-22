@@ -1,0 +1,167 @@
+%% ====================================================================
+%% @author Gavin M. Roy <gavinmroy@gmail.com>
+%% @copyright 2016, Gavin M. Roy
+%% Copyright (c) 2007-2025 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%% @headerfile
+%% @private
+%% @doc aws_lib client library constants and records
+%% @end
+%% ====================================================================
+
+-define(MIME_AWS_JSON, "application/x-amz-json-1.0").
+-define(SCHEME, https).
+
+-define(DEFAULT_REGION, "us-east-1").
+-define(DEFAULT_PROFILE, "default").
+
+-define(INSTANCE_AZ, "placement/availability-zone").
+-define(INSTANCE_HOST, "169.254.169.254").
+
+% rabbitmq/rabbitmq-peer-discovery-aws#25
+
+% Note: this timeout must not be greater than the default
+% gen_server:call timeout of 5000ms. INSTANCE_HOST is
+% a pseudo-ip that should have good performance, and the
+% data should be returned quickly. Note that `timeout`,
+% when set, is used as the connect and then request timeout
+% by `httpc`
+-define(DEFAULT_HTTP_TIMEOUT, 2250).
+
+-define(INSTANCE_CREDENTIALS, "iam/security-credentials").
+-define(INSTANCE_METADATA_BASE, "latest/meta-data").
+-define(INSTANCE_ID, "instance-id").
+
+-define(TOKEN_URL, "latest/api/token").
+
+-define(METADATA_TOKEN_TTL_HEADER, "X-aws-ec2-metadata-token-ttl-seconds").
+
+% EC2 Instance Metadata service version 2 (IMDSv2) uses session-oriented authentication.
+% Instance metadata service requests are only needed for loading/refreshing credentials.
+% Long-lived EC2 IMDSv2 tokens are unnecessary. The token only needs to be valid long enough
+% to successfully load/refresh the credentials. 60 seconds is more than enough time to accomplish this.
+-define(METADATA_TOKEN_TTL_SECONDS, 60).
+
+-define(METADATA_TOKEN, "X-aws-ec2-metadata-token").
+
+-define(LINEAR_BACK_OFF_MILLIS, 500).
+-define(MAX_RETRIES, 5).
+
+-define(AWS_CREDENTIALS_TABLE, aws_credentials).
+
+%% TODO LRB
+%% -define(AWS_CONFIG_TABLE, aws_config).
+
+-type access_key() :: nonempty_string().
+-type secret_access_key() :: nonempty_string().
+-type expiration() :: calendar:datetime() | undefined.
+-type security_token() :: nonempty_string() | undefined.
+-type region() :: nonempty_string() | undefined.
+-type path() :: string().
+
+-type attachment_info() :: [{device, string()} | {state, string()}].
+-type volume_info() :: [
+    {volume_id, string()}
+    | {size, string()}
+    | {volume_type, string()}
+    | {state, string()}
+    | {attachment, attachment_info()}
+].
+-type volumes_list() :: [volume_info()].
+
+-type error() :: {error, Reason :: atom()}.
+
+-record(imdsv2token, {
+    token :: security_token() | undefined,
+    expiration :: non_neg_integer() | undefined
+}).
+-type imdsv2token() :: #imdsv2token{}.
+
+-record(aws_credentials, {
+    access_key :: access_key(),
+    secret_key :: secret_access_key(),
+    security_token :: security_token(),
+    expiration :: expiration()
+}).
+-type aws_credentials() :: #aws_credentials{}.
+
+-record(aws_config, {
+    region = undefined :: region(),
+    imdsv2_token = undefined :: imdsv2token() | undefined
+}).
+-type aws_config() :: #aws_config{}.
+
+-record(aws_state, {
+    credentials :: aws_credentials() | undefined,
+    config :: aws_config() | undefined
+}).
+%% Type aws_state() and related result types are defined in aws_lib.erl
+
+-type scheme() :: atom().
+-type username() :: string().
+-type password() :: string().
+-type host() :: string().
+-type tcp_port() :: integer().
+-type query_args() :: [tuple() | string()].
+-type fragment() :: string().
+
+-type userinfo() :: {undefined | username(), undefined | password()}.
+
+-type authority() :: {undefined | userinfo(), host(), undefined | tcp_port()}.
+-record(uri, {
+    scheme :: undefined | scheme(),
+    authority :: authority(),
+    path :: undefined | path(),
+    query :: undefined | query_args(),
+    fragment :: undefined | fragment()
+}).
+
+-type method() :: head | get | put | post | trace | options | delete | patch.
+-type http_version() :: string().
+-type status_code() :: integer().
+-type reason_phrase() :: string().
+-type status_line() :: {http_version(), status_code(), reason_phrase()}.
+-type field() :: string().
+-type value() :: string().
+-type header() :: {Field :: field(), Value :: value()}.
+-type headers() :: [header()].
+-type body() :: iodata().
+
+-type ssl_options() :: [ssl:tls_client_option()].
+
+-type http_option() ::
+    {timeout, timeout()}
+    | {connect_timeout, timeout()}
+    | {ssl, ssl_options()}
+    | {essl, ssl_options()}
+    | {autoredirect, boolean()}
+    | {proxy_auth, {User :: string(), Password :: string()}}
+    | {version, http_version()}
+    | {relaxed, boolean()}
+    | {url_encode, boolean()}.
+-type http_options() :: [http_option()].
+
+-record(request, {
+    access_key :: access_key(),
+    secret_access_key :: secret_access_key(),
+    security_token :: security_token(),
+    service :: string(),
+    region = "us-east-1" :: string(),
+    method = get :: method(),
+    headers = [] :: headers(),
+    uri :: string(),
+    body = "" :: body()
+}).
+-type request() :: #request{}.
+
+-type httpc_result() ::
+    {ok, {status_line(), headers(), body()}}
+    | {ok, {status_code(), body()}}
+    | {error, term()}.
+
+-type result_ok() :: {ok, {ResponseHeaders :: headers(), Response :: list()}}.
+-type result_error() ::
+    {'error', Message :: reason_phrase(),
+        {ResponseHeaders :: headers(), Response :: list()} | undefined}
+    | {'error', {credentials, Reason :: string()}}
+    | {'error', string()}.
+-type result() :: result_ok() | result_error().
