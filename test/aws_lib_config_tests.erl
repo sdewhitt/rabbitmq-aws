@@ -132,11 +132,11 @@ credentials_test_() ->
             meck:new(gun, []),
             meck:new(aws_lib, [passthrough]),
             reset_environment(),
-            application:set_env(aws_lib, aws_prefer_imdsv2, false),
+            application:set_env(aws, aws_prefer_imdsv2, false),
             [gun, aws_lib]
         end,
         fun(Mods) ->
-            application:unset_env(aws_lib, aws_prefer_imdsv2),
+            application:unset_env(aws, aws_prefer_imdsv2),
             meck:unload(Mods)
         end,
         [
@@ -462,11 +462,11 @@ region_test_() ->
             meck:new(gun, []),
             meck:new(aws_lib, [passthrough]),
             reset_environment(),
-            application:set_env(aws_lib, aws_prefer_imdsv2, false),
+            application:set_env(aws, aws_prefer_imdsv2, false),
             [gun, aws_lib]
         end,
         fun(Mods) ->
-            application:unset_env(aws_lib, aws_prefer_imdsv2),
+            application:unset_env(aws, aws_prefer_imdsv2),
             meck:unload(Mods)
         end,
         [
@@ -528,11 +528,11 @@ instance_id_test_() ->
             meck:new(gun, []),
             meck:new(aws_lib, [passthrough]),
             reset_environment(),
-            application:set_env(aws_lib, aws_prefer_imdsv2, false),
+            application:set_env(aws, aws_prefer_imdsv2, false),
             [gun, aws_lib]
         end,
         fun(Mods) ->
-            application:unset_env(aws_lib, aws_prefer_imdsv2),
+            application:unset_env(aws, aws_prefer_imdsv2),
             meck:unload(Mods)
         end,
         [

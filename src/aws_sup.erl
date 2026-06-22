@@ -43,8 +43,9 @@ auth_validation_children() ->
 
 %% The concurrency semaphore bounds simultaneous outbound LDAP connections;
 %% it is the endpoint's primary, topology-independent backpressure. (ARN
-%% resolution is serialized by aws_auth_validate_arn_lock, which is a
-%% global:trans/4 lock and needs no supervised process.)
+%% resolution needs no serialization: each request threads its own
+%% aws_state() through aws_lib, so there is no shared region/credential
+%% singleton to clobber.)
 semaphore_spec() ->
     Config = semaphore_config(),
     #{
@@ -67,5 +68,6 @@ get_int_env(Key, Default, MaxBound) ->
                 _ when N =< MaxBound -> N;
                 _ -> Default
             end;
-        _ -> Default
+        _ ->
+            Default
     end.

@@ -104,7 +104,7 @@
 
     {aws_prefer_imdsv2,
         "aws.prefer_imdsv2 = false",
-        [{rabbitmq_aws, [{aws_prefer_imdsv2, false}]}],
+        [{aws, [{aws_prefer_imdsv2, false}]}],
         [aws_arn_config]},
 
     {aws_arn_config_assume_role_arn,
@@ -396,7 +396,7 @@
             ]}
          ]}
         ],
-        [aws_arn_config]}
+        [aws_arn_config]},
     {aws_auth_validation_enabled,
         "aws.auth_validation.enabled = true",
         [{aws, [{auth_validation_enabled, true}]}],

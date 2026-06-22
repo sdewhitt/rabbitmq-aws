@@ -1007,7 +1007,7 @@ load_imdsv2_token() ->
 %% @doc Return headers used for instance metadata service requests.
 %% @end
 instance_metadata_request_headers(Config) ->
-    case application:get_env(aws_lib, aws_prefer_imdsv2) of
+    case application:get_env(aws, aws_prefer_imdsv2) of
         {ok, false} ->
             {ok, [], Config};
         %% undefined or {ok, true}
