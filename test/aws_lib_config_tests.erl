@@ -411,6 +411,51 @@ ini_format_key_test_() ->
         end}
     ].
 
+ini_split_line_test_() ->
+    [
+        {"simple key=value", fun() ->
+            ?assertEqual(
+                ["region", "us-east-1"], aws_lib_config:ini_split_line(<<"region=us-east-1">>)
+            )
+        end},
+        {"key = value with surrounding spaces stripped at the ends", fun() ->
+            ?assertEqual(
+                ["aws_access_key_id ", " foo1"],
+                aws_lib_config:ini_split_line(<<"aws_access_key_id = foo1">>)
+            )
+        end},
+        {"section/parent line with empty value collapses to [Key]", fun() ->
+            ?assertEqual(["s3 "], aws_lib_config:ini_split_line(<<"s3 =">>))
+        end},
+        {"line with no '=' is a single token", fun() ->
+            ?assertEqual(
+                ["aws_secret_access"], aws_lib_config:ini_split_line(<<"aws_secret_access">>)
+            )
+        end},
+        {"value containing '=' is preserved (only the first '=' splits)", fun() ->
+            ?assertEqual(
+                ["credential_process ", " aws sso ... --account=123 --role=admin"],
+                aws_lib_config:ini_split_line(
+                    <<"credential_process = aws sso ... --account=123 --role=admin">>
+                )
+            )
+        end}
+    ].
+
+ini_parse_line_parts_does_not_crash_on_value_with_equals_test_() ->
+    [
+        {"a credential_process value with '=' parses as a single string value", fun() ->
+            Line = <<"credential_process = ada credentials print --account=591164066752">>,
+            {NewSection, none} = aws_lib_config:ini_parse_line(
+                [], none, Line
+            ),
+            ?assertEqual(
+                "ada credentials print --account=591164066752",
+                proplists:get_value(credential_process, NewSection)
+            )
+        end}
+    ].
+
 maybe_convert_number_test_() ->
     [
         {"when string contains an integer", fun() ->

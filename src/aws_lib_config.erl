@@ -415,10 +415,28 @@ ini_parse_section_name(CurrentSection, Line) ->
     end.
 
 -spec ini_split_line(binary()) -> list().
-%% @doc Split a key value pair delimited by ``=`` to a list of strings.
+%% @doc Split a key value pair on the first ``=`` only, returning ``[Key]`` for a
+%%      section/parent line or ``[Key, Value]`` for a key/value line. Splitting on
+%%      only the first ``=`` keeps any ``=`` in the value intact (e.g. a
+%%      ``credential_process`` command line such as ``aws ... --account=123``),
+%%      which a naive split on every ``=`` would break into 3+ parts and crash
+%%      ini_parse_line_parts/2.
 %% @end
 ini_split_line(Line) ->
-    string:tokens(string:strip(binary_to_list(Line)), "=").
+    Stripped = string:strip(binary_to_list(Line)),
+    case string:str(Stripped, "=") of
+        0 ->
+            [Stripped];
+        Index ->
+            Key = string:substr(Stripped, 1, Index - 1),
+            case string:substr(Stripped, Index + 1) of
+                %% An empty value (e.g. "s3 =") denotes a parent/section line, so
+                %% return [Key] only -- matching the previous string:tokens/2
+                %% behaviour that dropped the trailing empty token.
+                "" -> [Key];
+                Value -> [Key, Value]
+            end
+    end.
 
 -spec instance_availability_zone_url() -> string().
 %% @doc Return the URL for querying the availability zone from the Instance
