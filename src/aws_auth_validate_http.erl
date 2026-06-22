@@ -1044,13 +1044,21 @@ to_version(<<"tlsv1">>) -> tlsv1.
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
-%% ARN resolution mutates the shared rabbitmq_aws region/credential singleton,
-%% so serialize it across concurrent validations.
+%% aws_lib threads AWS state per call instead of mutating a global singleton,
+%% so concurrent validations no longer share mutable region/credential state and
+%% no ARN lock is needed. R6 is preserved -- resolution runs in the caller
+%% process and the resolved secret is neither logged nor returned (only adapted
+%% to the caller's {ok, Binary} contract). R3 is preserved -- this still runs
+%% only after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
+%% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
+%% callers expect; the threaded state is request-scoped and discarded here.
 -spec resolve_arn(binary()) -> {ok, binary()} | {error, term()}.
 resolve_arn(Arn) when is_binary(Arn) ->
-    aws_auth_validate_arn_lock:with_lock(fun() ->
-        aws_arn_util:resolve_arn(binary_to_list(Arn))
-    end).
+    State = aws_lib:new(),
+    case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
+        {ok, Data, _State1} -> {ok, Data};
+        {error, _} = Error -> Error
+    end.
 
 connection_timeout_ms() ->
     case application:get_env(aws, auth_validation_connection_timeout_ms) of
