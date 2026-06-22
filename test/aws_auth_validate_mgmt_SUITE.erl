@@ -102,13 +102,21 @@ init_per_group(feature_enabled, Config) ->
     setup_broker(Config, [
         {auth_validation_enabled, true},
         {auth_validation_max_concurrent, 1},
-        {auth_validation_max_body_size, 1024}
+        {auth_validation_max_body_size, 1024},
+        %% base_body/0 uses a loopback server (127.0.0.1); without this the
+        %% SSRF filter (is_allowed_server/1) rejects it with input_invalid in
+        %% parse_servers BEFORE later pipeline stages run, so cases that assert
+        %% a later outcome (e.g. config_conflict_returns_422) would wrongly see
+        %% a 400. These tests never open a real connection, so allowing private
+        %% ranges here is safe and exercises the intended code path.
+        {auth_validation_allow_private_networks, true}
     ]);
 init_per_group(feature_enabled_custom_tag, Config) ->
     setup_broker(Config, [
         {auth_validation_enabled, true},
         {auth_validation_max_concurrent, 1},
         {auth_validation_max_body_size, 1024},
+        {auth_validation_allow_private_networks, true},
         %% guest has the administrator tag but not monitoring, so the
         %% authorize_tag/3 membership check fails -> 401.
         {auth_validation_required_user_tag, monitoring}
