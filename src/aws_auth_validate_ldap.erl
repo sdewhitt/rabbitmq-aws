@@ -90,7 +90,9 @@
 ]).
 
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
--define(REASON_BLOCKED_SERVER, <<"one or more server addresses resolve to a blocked network range">>).
+-define(REASON_BLOCKED_SERVER,
+    <<"one or more server addresses resolve to a blocked network range">>
+).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
 -define(REASON_BAD_PASSWORD_ARN, <<"password_arn must be a non-empty string">>).
@@ -106,6 +108,10 @@
 -define(REASON_BAD_SSL_VERSIONS, <<"ssl_options.versions must be a list of known TLS versions">>).
 -define(REASON_BAD_SSL_SNI, <<"ssl_options.server_name_indication must be a string">>).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
+-define(REASON_CACERT_ARN_RESOLVE, <<"failed to resolve ssl_options.cacertfile_arn">>).
+-define(REASON_CACERT_PEM_INVALID,
+    <<"ssl_options.cacertfile_arn did not resolve to a valid PEM certificate">>
+).
 -define(REASON_TLS_BOTH, <<"use_ssl and use_starttls are mutually exclusive">>).
 -define(REASON_CONNECTION, <<"could not connect to LDAP server">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
@@ -156,8 +162,13 @@ validate(Body) when is_map(Body) ->
                     Err;
                 ok ->
                     case resolve_password(Body, Params) of
-                        {error, _, _} = Err -> Err;
-                        {ok, Params1} -> do_ldap_validate(Params1)
+                        {error, _, _} = Err ->
+                            Err;
+                        {ok, Params1} ->
+                            case resolve_cacert(Params1) of
+                                {error, _, _} = Err -> Err;
+                                {ok, Params2} -> do_ldap_validate(Params2)
+                            end
                     end
             end
     end.
@@ -237,6 +248,45 @@ resolve_password(Body, Params) ->
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_PASSWORD_ARN}
+    end.
+
+%% Resolve the CA-cert ARN (when ssl_options.cacertfile_arn is set) in the
+%% network phase, alongside the password ARN and after all pure validation.
+%% A resolve OR a PEM-decode failure is reported as input_invalid -- mirroring
+%% resolve_password/2 -- rather than silently leaving the connection without a
+%% trust anchor. The latter would let `verify' fall back to verify_none (see
+%% apply_verify_default/1) and report a TLS config as valid that the operator
+%% believes is certificate-verified -- a silent security degradation. The
+%% decoded certs are stored under the atom `cacerts' key in ssl_options so
+%% build_ssl_opts/1 consumes them directly instead of re-resolving the ARN
+%% (and re-clobbering the region) at connect time.
+%%
+%% Only resolved when TLS is actually in use (use_ssl or use_starttls): the
+%% cert is consumed solely by build_ssl_opts/1, which only runs on the TLS
+%% paths, so fetching it for a plaintext request would be a pointless secret
+%% fetch and could reject an otherwise-valid plaintext config.
+resolve_cacert(#{use_ssl := false, use_starttls := false} = Params) ->
+    {ok, Params};
+resolve_cacert(#{ssl_options := SslOpts} = Params) ->
+    case maps:get(<<"cacertfile_arn">>, SslOpts, undefined) of
+        undefined ->
+            {ok, Params};
+        Arn when is_binary(Arn) ->
+            case resolve_arn(Arn) of
+                {ok, PemData} ->
+                    %% pem_entry_decode/1 can raise on a malformed entry; an
+                    %% empty/undecodable PEM returns `skip'. Both mean the ARN
+                    %% does not hold a usable CA cert -- report input_invalid
+                    %% rather than degrading the trust anchor.
+                    try decode_pem_cacerts(PemData) of
+                        skip -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID};
+                        Certs -> {ok, Params#{ssl_options => SslOpts#{cacerts => Certs}}}
+                    catch
+                        _:_ -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID}
+                    end;
+                {error, _} ->
+                    {error, input_invalid, ?REASON_CACERT_ARN_RESOLVE}
+            end
     end.
 
 parse_use_ssl(Body, Acc) ->
@@ -378,6 +428,18 @@ is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 %% via the validation endpoint while still allowing legitimate LDAP servers.
 %% Bypassed when auth_validation_allow_private_networks is true (for testing
 %% against local slapd instances).
+%%
+%% KNOWN LIMITATION (DNS-rebinding TOCTOU): this check resolves Server and
+%% inspects the resulting IP, but eldap:open/2 is later handed the original
+%% hostname STRING and re-resolves it independently. An attacker who controls
+%% DNS for the hostname could answer with a public IP here and a blocked
+%% (private/metadata) IP at connect time, bypassing the filter. The window is
+%% small and exploitation requires control of the hostname's DNS. Closing it
+%% fully would mean resolving once and passing the vetted IP literal to
+%% eldap:open (which weakens TLS hostname verification / SNI) or pinning DNS
+%% across both calls; both are larger changes deferred as a follow-up. The
+%% admin-only gating and disabled-by-default posture keep the residual risk
+%% low. See gap_analysis.md.
 is_allowed_server(Server) ->
     case application:get_env(aws, auth_validation_allow_private_networks, false) of
         true -> true;
@@ -386,7 +448,8 @@ is_allowed_server(Server) ->
 
 check_server_ip(Server) ->
     case inet:getaddr(Server, inet) of
-        {ok, IP} -> not is_private_ip(IP);
+        {ok, IP} ->
+            not is_private_ip(IP);
         {error, _} ->
             %% Also try IPv6
             case inet:getaddr(Server, inet6) of
@@ -567,14 +630,17 @@ maybe_start_tls(Handle, true, SslOpts, Timeout) ->
 %%
 %% No `catch' here. The previous `(catch Fun(Value))' swallowed every error,
 %% which the value-validation in parse_ssl_options/2 has now made unnecessary
-%% and which hid bugs (the discouraged `catch' keyword). The cacerts resolver
-%% returns `skip' for PEM with no decodable entries (dropped via add_ssl_opt);
-%% a genuinely malformed CA cert can still raise in public_key, but that is
-%% contained by do_ldap_validate/1's R6 try/catch one level up (-> a fixed
-%% connection_failed, password-safe), not silently dropped here.
+%% and which hid bugs (the discouraged `catch' keyword).
+%%
+%% The CA cert is no longer resolved here: resolve_cacert/1 fetches and decodes
+%% cacertfile_arn during the network phase and stores the decoded certs under
+%% the atom `cacerts' key, so a resolve/decode failure is reported loud as
+%% input_invalid (never a silent verify_none downgrade) and the ARN is resolved
+%% exactly once. By the time we reach here the certs are already in hand; the
+%% `cacerts' pair below just threads them through unchanged.
 build_ssl_opts(Map) when is_map(Map) ->
     Pairs = [
-        {cacerts, <<"cacertfile_arn">>, fun resolve_and_decode_pem_cacerts/1},
+        {cacerts, cacerts, fun(Certs) -> Certs end},
         {verify, <<"verify">>, fun to_verify/1},
         {depth, <<"depth">>, fun to_integer/1},
         {versions, <<"versions">>, fun to_versions/1},
@@ -667,16 +733,13 @@ to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
 to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
 to_version(<<"tlsv1">>) -> tlsv1.
 
+%% Decode PEM data into the decoded cert terms eldap expects under `cacerts'.
+%% Returns `skip' when the data holds no decodable PEM entries (so resolve_cacert/1
+%% can reject it as input_invalid rather than proceeding with an empty trust set).
 decode_pem_cacerts(B) when is_binary(B) ->
     case public_key:pem_decode(B) of
         [] -> skip;
         Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
-    end.
-
-resolve_and_decode_pem_cacerts(Arn) when is_binary(Arn) ->
-    case resolve_arn(Arn) of
-        {ok, PemData} -> decode_pem_cacerts(PemData);
-        {error, _} -> skip
     end.
 
 %%--------------------------------------------------------------------

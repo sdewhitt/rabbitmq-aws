@@ -35,11 +35,15 @@
     custom_tag_options_preflight_allowed/1,
     options_returns_allowed_methods/1,
     get_returns_405/1,
-    password_not_in_response/1
+    password_not_in_response/1,
+    success_returns_204/1
 ]).
 
 %% Invoked on the broker node via rpc to hold a semaphore slot.
 -export([hold_slot/1]).
+
+%% Invoked on the broker node via rpc to stub/unstub the registry dispatch.
+-export([mock_dispatch_ok/0, unmock_dispatch/0]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -71,7 +75,8 @@ groups() ->
             method_disabled_returns_404,
             options_returns_allowed_methods,
             get_returns_405,
-            password_not_in_response
+            password_not_in_response,
+            success_returns_204
         ]},
         %% A non-administrator required_user_tag exercises the authorize_tag/3
         %% branch: a user lacking the tag gets 401, while an OPTIONS preflight
@@ -124,12 +129,25 @@ init_per_testcase(method_disabled_returns_404 = TC, Config) ->
         [aws, auth_validation_enabled_methods, [{<<"ldap">>, false}]]
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
+init_per_testcase(success_returns_204 = TC, Config) ->
+    %% This suite has no live LDAP server, so make the backend dispatch return
+    %% the success result (`ok') directly. meck runs ON THE BROKER NODE so the
+    %% handler's call to aws_auth_validate_registry:dispatch/2 sees the stub.
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, mock_dispatch_ok, []
+    ),
+    rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC).
 
 end_per_testcase(method_disabled_returns_404 = TC, Config) ->
     rabbit_ct_broker_helpers:rpc(
         Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
+    ),
+    rabbit_ct_helpers:testcase_finished(Config, TC);
+end_per_testcase(success_returns_204 = TC, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, unmock_dispatch, []
     ),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(TC, Config) ->
@@ -285,19 +303,51 @@ password_not_in_response(Config) ->
     {ok, {{_, _Code, _}, _, ResBody}} = put_request(Config, ?API, Body),
     ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Password)).
 
+%% A successful validation (backend returns `ok') must surface as a 204 with an
+%% empty body. The other cases only exercise the error responses; the 204 path
+%% (respond(ok, ...)) was otherwise reached only via direct validate/1 calls in
+%% the LDAP integration suite, never through the HTTP handler. The backend is
+%% stubbed (see init_per_testcase) because this suite has no live LDAP server.
+success_returns_204(Config) ->
+    Body = base_body(),
+    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?API, Body),
+    ?assertEqual(204, Code),
+    ?assertEqual(<<>>, iolist_to_binary(ResBody)).
+
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+%% Run ON THE BROKER NODE (invoked via rpc). Stub the registry dispatch so it
+%% returns the success result without touching a real LDAP server. meck is
+%% loaded onto the broker node by setup_meck/1 during setup_broker/2.
+mock_dispatch_ok() ->
+    ok = meck:new(aws_auth_validate_registry, [passthrough, no_link]),
+    ok = meck:expect(aws_auth_validate_registry, dispatch, fun(_Method, _Body) -> ok end),
+    ok.
+
+unmock_dispatch() ->
+    catch meck:unload(aws_auth_validate_registry),
+    ok.
 
 setup_broker(Config0, ExtraEnv) ->
     Config1 = rabbit_ct_helpers:set_config(Config0, [
         {rmq_nodename_suffix, ?MODULE}
     ]),
     Config2 = rabbit_ct_helpers:merge_app_env(Config1, {aws, ExtraEnv}),
-    rabbit_ct_helpers:run_setup_steps(
+    Config3 = rabbit_ct_helpers:run_setup_steps(
         Config2,
         rabbit_ct_broker_helpers:setup_steps()
-    ).
+    ),
+    case Config3 of
+        {skip, _} = Skip ->
+            Skip;
+        _ ->
+            %% Load meck onto the broker node so success_returns_204 can stub
+            %% the registry dispatch there.
+            ok = rabbit_ct_broker_helpers:setup_meck(Config3),
+            Config3
+    end.
 
 %% Runs ON THE BROKER NODE (invoked via rpc with Module=?MODULE). Spawns a
 %% persistent process that acquires the only semaphore slot and blocks until
