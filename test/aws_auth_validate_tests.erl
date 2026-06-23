@@ -162,6 +162,18 @@ server_blocks_rfc1918_192_test() ->
 server_blocks_zero_network_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("0.0.0.0")).
 
+%% 100.64.0.0/10 (RFC 6598) carrier-grade NAT shared address space.
+server_blocks_cgnat_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.64.0.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.100.50.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.127.255.255")).
+
+%% Boundary: 100.63.x and 100.128.x are public space and must stay allowed, so
+%% the /10 mask (second octet 64..127) is not widened to the whole 100/8.
+server_allows_cgnat_boundaries_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("100.63.255.255")),
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("100.128.0.0")).
+
 server_blocks_ipv6_loopback_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::1")).
 
@@ -205,6 +217,10 @@ peer_allowed_rebound_to_imds_blocked_test() ->
 
 peer_allowed_private_v4_blocked_test() ->
     ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({ok, {{10, 0, 0, 5}, 389}})).
+
+%% A peer that rebound into CGNAT (RFC 6598) must be caught on the live socket.
+peer_allowed_rebound_to_cgnat_blocked_test() ->
+    ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({ok, {{100, 64, 0, 1}, 389}})).
 
 peer_allowed_public_v6_ok_test() ->
     ?assertEqual(
