@@ -162,10 +162,65 @@ server_blocks_rfc1918_192_test() ->
 server_blocks_zero_network_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("0.0.0.0")).
 
+server_blocks_ipv6_loopback_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::1")).
+
+%% fc00::/7 (ULA). fd00:ec2::254 is the IPv6 IMDS address -- the SSRF filter
+%% must block it just like the v4 169.254.169.254.
+server_blocks_ipv6_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("fd00:ec2::254")).
+
+server_blocks_ipv6_ula_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("fc00::1")).
+
+%% fe80::/10 spans fe80..febf, not just the fe80 word.
+server_blocks_ipv6_link_local_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("fe80::1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("febf::1")).
+
+%% An IPv4-mapped v6 address embedding IMDS must not bypass the v4 ranges.
+server_blocks_ipv4_mapped_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::ffff:169.254.169.254")).
+
 server_rejects_unresolvable_test() ->
     ?assertEqual(
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
     ).
+
+%%--------------------------------------------------------------------
+%% Post-connect peer re-check (DNS-rebinding TOCTOU defence)
+%%--------------------------------------------------------------------
+
+%% peer_allowed/1 takes a peername/1 result ({ok, {IP, Port}}) and is the
+%% second SSRF gate: it runs on the live socket's peer, so even if the
+%% pre-connect is_allowed_server/1 was passed a public IP, a peer that rebound
+%% to a blocked range is caught here.
+peer_allowed_public_v4_ok_test() ->
+    ?assertEqual(ok, aws_auth_validate_ldap:peer_allowed({ok, {{8, 8, 8, 8}, 636}})).
+
+peer_allowed_rebound_to_imds_blocked_test() ->
+    ?assertEqual(
+        blocked, aws_auth_validate_ldap:peer_allowed({ok, {{169, 254, 169, 254}, 80}})
+    ).
+
+peer_allowed_private_v4_blocked_test() ->
+    ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({ok, {{10, 0, 0, 5}, 389}})).
+
+peer_allowed_public_v6_ok_test() ->
+    ?assertEqual(
+        ok, aws_auth_validate_ldap:peer_allowed({ok, {{16#2606, 16#4700, 0, 0, 0, 0, 0, 1}, 636}})
+    ).
+
+%% fd00:ec2::254 (IPv6 IMDS) reached as the live peer must be blocked.
+peer_allowed_rebound_to_v6_imds_blocked_test() ->
+    ?assertEqual(
+        blocked,
+        aws_auth_validate_ldap:peer_allowed({ok, {{16#fd00, 16#0ec2, 0, 0, 0, 0, 0, 16#254}, 636}})
+    ).
+
+%% Fail closed: an undeterminable peer (peername error) is treated as blocked.
+peer_allowed_error_blocked_test() ->
+    ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({error, einval})).
 
 ldap_validate_rejects_private_server_test() ->
     Body = base_body(#{<<"servers">> => [<<"169.254.169.254">>]}),
@@ -373,6 +428,88 @@ bind_body() ->
 
 string_find(Haystack, Needle) ->
     string:find(Haystack, Needle).
+
+%%--------------------------------------------------------------------
+%% CA-cert ARN resolution: failures must be reported, never silently
+%% downgrade TLS to verify_none
+%%--------------------------------------------------------------------
+
+%% A failed cacertfile_arn resolution must surface as input_invalid (mirroring
+%% the password-ARN path), NOT silently proceed with no trust anchor (which
+%% would let `verify' default to verify_none and validate a TLS config the
+%% operator believes is certificate-verified). We mock resolve_arn so the
+%% password ARN resolves but the CA-cert ARN does not, and stop before any real
+%% connection by asserting on the input_invalid result the resolve produces.
+cacert_arn_resolution_test_() ->
+    {foreach,
+        fun() ->
+            ok = meck:new(eldap, [unstick, non_strict]),
+            ok = meck:new(aws_arn_util, [passthrough]),
+            %% Keep the suite hermetic: the TLS-off case reaches the connect
+            %% path, so stub eldap:open to fail fast instead of dialling out.
+            meck:expect(eldap, open, fun(_Servers, _Opts) -> {error, refused} end),
+            meck:expect(eldap, close, fun(_H) -> ok end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(eldap),
+            meck:unload(aws_arn_util)
+        end,
+        [
+            {"unresolvable CA-cert ARN -> input_invalid (no silent verify_none)", fun() ->
+                %% Password ARN resolves; CA-cert ARN does not.
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> {error, not_found};
+                        false -> {ok, <<"pw">>, State}
+                    end
+                end),
+                ?assertMatch(
+                    {error, input_invalid, _},
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:nope">>))
+                )
+            end},
+            {"CA-cert ARN resolving to non-PEM data -> input_invalid", fun() ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> {ok, <<"this is not a PEM certificate">>, State};
+                        false -> {ok, <<"pw">>, State}
+                    end
+                end),
+                ?assertMatch(
+                    {error, input_invalid, _},
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:garbage">>))
+                )
+            end},
+            {"CA-cert ARN ignored when TLS is off (no resolve, no error)", fun() ->
+                %% With use_ssl/use_starttls both false the CA cert is never
+                %% consumed, so a bogus cacertfile_arn must not trigger a
+                %% resolve or fail the request -- only the password ARN is
+                %% fetched. A resolve of the CA-cert ARN raises so the test
+                %% fails loudly if resolve_cacert/1 runs it; the password ARN
+                %% resolves normally. The bind is then left to fail at connect
+                %% (8.8.8.8:389), which is NOT input_invalid.
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> erlang:error(cacert_resolved_with_tls_off);
+                        false -> {ok, <<"pw">>, State}
+                    end
+                end),
+                Result = aws_auth_validate_ldap:validate(
+                    (bind_body())#{
+                        <<"ssl_options">> => #{<<"cacertfile_arn">> => <<"arn:aws:cacert:x">>}
+                    }
+                ),
+                ?assertNotMatch({error, input_invalid, _}, Result)
+            end}
+        ]}.
+
+%% A body with TLS enabled and a caller-supplied CA-cert ARN, otherwise valid.
+tls_body(CacertArn) ->
+    (bind_body())#{
+        <<"use_ssl">> => true,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => CacertArn}
+    }.
 
 %%--------------------------------------------------------------------
 %% LDAP query DSL parser (aws_auth_validate_ldap_query)
