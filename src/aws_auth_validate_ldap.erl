@@ -458,12 +458,16 @@ check_server_ip(Server) ->
             end
     end.
 
-%% Block RFC 1918, loopback, link-local, and cloud metadata ranges.
+%% Block RFC 1918, loopback, link-local, CGNAT, and cloud metadata ranges.
+%%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space (second
+%%   octet 64..127); it can route to provider/internal infrastructure, so it is
+%%   denied alongside the RFC 1918 ranges.
 is_private_ip({127, _, _, _}) -> true;
 is_private_ip({10, _, _, _}) -> true;
 is_private_ip({172, B, _, _}) when B >= 16, B =< 31 -> true;
 is_private_ip({192, 168, _, _}) -> true;
 is_private_ip({169, 254, _, _}) -> true;
+is_private_ip({100, B, _, _}) when B >= 64, B =< 127 -> true;
 is_private_ip({0, _, _, _}) -> true;
 is_private_ip(_) -> false.
 
