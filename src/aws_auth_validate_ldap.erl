@@ -467,9 +467,27 @@ is_private_ip({169, 254, _, _}) -> true;
 is_private_ip({0, _, _, _}) -> true;
 is_private_ip(_) -> false.
 
+%% Block the IPv6 ranges that correspond to the v4 blocks above, so the filter
+%% cannot be bypassed by handing the endpoint a v6 (or v6-encoded) address.
+%%   ::1            loopback
+%%   ::             unspecified
+%%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
+%%                  address fd00:ec2::254 -- the whole point of this block.
+%%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
+%% IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses embed
+%% a v4 address in the low 32 bits; re-check those against the v4 ranges so e.g.
+%% ::ffff:169.254.169.254 cannot reach IMDS.
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
-is_private_ip6({16#fe80, _, _, _, _, _, _, _}) -> true;
+is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
+is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
+is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
+is_private_ip6({0, 0, 0, 0, 0, 16#ffff, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
+is_private_ip6({0, 0, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6(_) -> false.
+
+%% Split the low 32 bits of a v4-mapped/compatible v6 address into a v4 tuple.
+v6_words_to_v4(W7, W8) ->
+    {W7 bsr 8, W7 band 16#ff, W8 bsr 8, W8 band 16#ff}.
 
 %%--------------------------------------------------------------------
 %% Config conflict
