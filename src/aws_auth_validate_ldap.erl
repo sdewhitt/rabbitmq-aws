@@ -46,8 +46,9 @@
 
 -ifdef(TEST).
 %% Exposed for unit tests: build_ssl_opts/1 translates validated ssl_options
-%% to the eldap proplist and is otherwise internal.
--export([build_ssl_opts/1, is_allowed_server/1]).
+%% to the eldap proplist; peer_allowed/1 is the post-connect SSRF re-check on a
+%% peername result. Both are otherwise internal.
+-export([build_ssl_opts/1, is_allowed_server/1, peer_allowed/1]).
 -endif.
 
 -include_lib("eldap/include/eldap.hrl").
@@ -429,17 +430,16 @@ is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 %% Bypassed when auth_validation_allow_private_networks is true (for testing
 %% against local slapd instances).
 %%
-%% KNOWN LIMITATION (DNS-rebinding TOCTOU): this check resolves Server and
-%% inspects the resulting IP, but eldap:open/2 is later handed the original
-%% hostname STRING and re-resolves it independently. An attacker who controls
-%% DNS for the hostname could answer with a public IP here and a blocked
-%% (private/metadata) IP at connect time, bypassing the filter. The window is
-%% small and exploitation requires control of the hostname's DNS. Closing it
-%% fully would mean resolving once and passing the vetted IP literal to
-%% eldap:open (which weakens TLS hostname verification / SNI) or pinning DNS
-%% across both calls; both are larger changes deferred as a follow-up. The
-%% admin-only gating and disabled-by-default posture keep the residual risk
-%% low. See gap_analysis.md.
+%% This is the FIRST of two SSRF checks (defence in depth). It resolves Server
+%% and rejects a blocked IP before any connection is attempted, so a malformed
+%% or obviously-internal target never opens a socket. On its own it is subject
+%% to a DNS-rebinding TOCTOU -- eldap:open/2 re-resolves the hostname, so the
+%% peer it connects to could differ from the IP vetted here. That window is
+%% closed by the SECOND check, verify_connected_peer/1, which re-validates the
+%% actual connected socket's peer (see do_ldap_bind/1). We keep this pre-connect
+%% check too: it rejects bad input cheaply (no socket, clearer input_invalid
+%% category) and avoids dialing out for the common case. Both checks are
+%% bypassed under auth_validation_allow_private_networks for local-slapd tests.
 is_allowed_server(Server) ->
     case application:get_env(aws, auth_validation_allow_private_networks, false) of
         true -> true;
@@ -543,19 +543,65 @@ do_ldap_bind(
             {error, connection_failed, ?REASON_CONNECTION};
         {ok, Handle} ->
             try
-                case maybe_start_tls(Handle, UseStartTls, SslOpts, Timeout) of
-                    {error, _Reason} ->
-                        {error, tls_failed, ?REASON_TLS_HANDSHAKE};
+                %% SSRF (R4): close the DNS-rebinding window. parse_servers/2's
+                %% is_allowed_server/1 vetted a resolved IP, but eldap re-resolved
+                %% the hostname for this connection, so the peer we are actually
+                %% attached to may differ (DNS rebinding). Re-check the *real*
+                %% connected peer -- the exact socket every later operation
+                %% (start_tls, bind, search) runs over -- before sending anything.
+                %% A blocked peer collapses to connection_failed (indistinguishable
+                %% from an unreachable host, so it leaks no recon signal).
+                case verify_connected_peer(Handle) of
+                    blocked ->
+                        {error, connection_failed, ?REASON_CONNECTION};
                     ok ->
-                        case eldap:simple_bind(Handle, UserDn, Password) of
-                            ok -> post_bind_checks(Handle, Params);
-                            {error, _Reason} -> {error, auth_failed, ?REASON_AUTH}
+                        case maybe_start_tls(Handle, UseStartTls, SslOpts, Timeout) of
+                            {error, _Reason} ->
+                                {error, tls_failed, ?REASON_TLS_HANDSHAKE};
+                            ok ->
+                                case eldap:simple_bind(Handle, UserDn, Password) of
+                                    ok -> post_bind_checks(Handle, Params);
+                                    {error, _Reason} -> {error, auth_failed, ?REASON_AUTH}
+                                end
                         end
                 end
             after
                 catch eldap:close(Handle)
             end
     end.
+
+%% Re-validate the IP eldap actually connected to, closing the DNS-rebinding
+%% TOCTOU between is_allowed_server/1 (pre-connect, on a resolved IP) and this
+%% live socket. Reads the peer from the open handle rather than re-resolving the
+%% hostname, so what we check is exactly what we will talk to. Bypassed under
+%% auth_validation_allow_private_networks (local-slapd testing), matching
+%% is_allowed_server/1. Fails closed: if the peer cannot be determined, treat it
+%% as blocked.
+verify_connected_peer(Handle) ->
+    case application:get_env(aws, auth_validation_allow_private_networks, false) of
+        true -> ok;
+        _ -> check_peer_ip(Handle)
+    end.
+
+check_peer_ip(Handle) ->
+    case eldap:info(Handle) of
+        #{socket := Sock, socket_type := ssl} -> peer_allowed(ssl:peername(Sock));
+        #{socket := Sock, socket_type := tcp} -> peer_allowed(inet:peername(Sock));
+        _ -> blocked
+    end.
+
+peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 4 ->
+    case is_private_ip(IP) of
+        true -> blocked;
+        false -> ok
+    end;
+peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 8 ->
+    case is_private_ip6(IP) of
+        true -> blocked;
+        false -> ok
+    end;
+peer_allowed(_) ->
+    blocked.
 
 %% After a successful bind, run the optional DN-lookup and authorization
 %% checks in sequence on the same bound handle. The first failure wins; if

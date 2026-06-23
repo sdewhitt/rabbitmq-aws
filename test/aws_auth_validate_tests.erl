@@ -223,6 +223,41 @@ server_rejects_unresolvable_test() ->
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
     ).
 
+%%--------------------------------------------------------------------
+%% Post-connect peer re-check (DNS-rebinding TOCTOU defence)
+%%--------------------------------------------------------------------
+
+%% peer_allowed/1 takes a peername/1 result ({ok, {IP, Port}}) and is the
+%% second SSRF gate: it runs on the live socket's peer, so even if the
+%% pre-connect is_allowed_server/1 was passed a public IP, a peer that rebound
+%% to a blocked range is caught here.
+peer_allowed_public_v4_ok_test() ->
+    ?assertEqual(ok, aws_auth_validate_ldap:peer_allowed({ok, {{8, 8, 8, 8}, 636}})).
+
+peer_allowed_rebound_to_imds_blocked_test() ->
+    ?assertEqual(
+        blocked, aws_auth_validate_ldap:peer_allowed({ok, {{169, 254, 169, 254}, 80}})
+    ).
+
+peer_allowed_private_v4_blocked_test() ->
+    ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({ok, {{10, 0, 0, 5}, 389}})).
+
+peer_allowed_public_v6_ok_test() ->
+    ?assertEqual(
+        ok, aws_auth_validate_ldap:peer_allowed({ok, {{16#2606, 16#4700, 0, 0, 0, 0, 0, 1}, 636}})
+    ).
+
+%% fd00:ec2::254 (IPv6 IMDS) reached as the live peer must be blocked.
+peer_allowed_rebound_to_v6_imds_blocked_test() ->
+    ?assertEqual(
+        blocked,
+        aws_auth_validate_ldap:peer_allowed({ok, {{16#fd00, 16#0ec2, 0, 0, 0, 0, 0, 16#254}, 636}})
+    ).
+
+%% Fail closed: an undeterminable peer (peername error) is treated as blocked.
+peer_allowed_error_blocked_test() ->
+    ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({error, einval})).
+
 ldap_validate_rejects_private_server_test() ->
     Body = base_body(#{<<"servers">> => [<<"169.254.169.254">>]}),
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(Body)).
