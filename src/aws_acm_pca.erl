@@ -5,14 +5,12 @@
 
 -module(aws_acm_pca).
 
--export([fetch_certificate/2]).
+-export([fetch_certificate/3]).
 
-% TODO: remove after we fix the rabbitmq_aws:api_post_request's return type
--dialyzer({no_match, make_request/2}).
-
--spec fetch_certificate(string(), string()) -> {ok, binary()} | {error, term()}.
-fetch_certificate(CaArn, Region) ->
-    rabbitmq_aws:set_region(Region),
+-spec fetch_certificate(string(), string(), aws_lib:aws_state()) ->
+    {ok, binary(), aws_lib:aws_state()} | {error, term()}.
+fetch_certificate(CaArn, Region, State) ->
+    {ok, State1} = aws_lib:set_region(Region, State),
     RequestBody = rabbit_json:encode(#{
         <<"CertificateAuthorityArn">> => rabbit_data_coercion:to_utf8_binary(CaArn)
     }),
@@ -20,14 +18,14 @@ fetch_certificate(CaArn, Region) ->
         {"X-Amz-Target", "ACMPrivateCA.GetCertificateAuthorityCertificate"},
         {"Content-Type", "application/x-amz-json-1.1"}
     ],
-    make_request(RequestBody, Headers).
+    make_request(RequestBody, Headers, State1).
 
-make_request(RequestBody, Headers) ->
-    case rabbitmq_aws:api_post_request("acm-pca", "/", RequestBody, Headers) of
-        {ok, ResponseBody} ->
+make_request(RequestBody, Headers, State) ->
+    case aws_lib:api_post_request("acm-pca", "/", RequestBody, Headers, State) of
+        {ok, ResponseBody, State1} ->
             case rabbit_json:decode(ResponseBody) of
                 #{<<"Certificate">> := Certificate} ->
-                    {ok, Certificate};
+                    {ok, Certificate, State1};
                 _ ->
                     {error, no_certificate}
             end;
