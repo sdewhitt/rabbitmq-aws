@@ -198,6 +198,26 @@ server_blocks_rfc1918_192_test() ->
 server_blocks_zero_network_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("0.0.0.0")).
 
+server_blocks_ipv6_loopback_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::1")).
+
+%% fc00::/7 (ULA). fd00:ec2::254 is the IPv6 IMDS address -- the SSRF filter
+%% must block it just like the v4 169.254.169.254.
+server_blocks_ipv6_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("fd00:ec2::254")).
+
+server_blocks_ipv6_ula_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("fc00::1")).
+
+%% fe80::/10 spans fe80..febf, not just the fe80 word.
+server_blocks_ipv6_link_local_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("fe80::1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("febf::1")).
+
+%% An IPv4-mapped v6 address embedding IMDS must not bypass the v4 ranges.
+server_blocks_ipv4_mapped_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::ffff:169.254.169.254")).
+
 server_rejects_unresolvable_test() ->
     ?assertEqual(
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
