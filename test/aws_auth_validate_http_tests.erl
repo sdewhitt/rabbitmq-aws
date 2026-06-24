@@ -437,13 +437,22 @@ http_arn_resolved_after_pure_pass_test_() ->
         fun() ->
             ok = meck:new(aws_arn_util, [passthrough]),
             ok = meck:new(httpc, [unstick, passthrough]),
+            ok = meck:new(inets, [unstick, passthrough]),
             meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
+            %% Let the ephemeral probe profile start/stop so execution reaches
+            %% build_client_ssl_opts (which resolves the ARN) -- otherwise an
+            %% inets:start failure in the bare eunit node short-circuits to
+            %% connection_failed before any resolve.
+            meck:expect(inets, start, fun(httpc, _) -> {ok, self()} end),
+            meck:expect(inets, stop, fun(httpc, _) -> ok end),
+            meck:expect(httpc, set_options, fun(_, _) -> ok end),
             meck:expect(httpc, request, fun(_M, _R, _H, _O, _P) ->
                 {error, {failed_connect, []}}
             end),
             ok
         end,
         fun(_) ->
+            meck:unload(inets),
             meck:unload(httpc),
             meck:unload(aws_arn_util)
         end,
