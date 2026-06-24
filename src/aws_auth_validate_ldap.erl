@@ -46,8 +46,9 @@
 
 -ifdef(TEST).
 %% Exposed for unit tests: build_ssl_opts/1 translates validated ssl_options
-%% to the eldap proplist and is otherwise internal.
--export([build_ssl_opts/1, is_allowed_server/1]).
+%% to the eldap proplist; peer_allowed/1 is the post-connect SSRF re-check on a
+%% peername result. Both are otherwise internal.
+-export([build_ssl_opts/1, is_allowed_server/1, peer_allowed/1]).
 -endif.
 
 -include_lib("eldap/include/eldap.hrl").
@@ -90,7 +91,9 @@
 ]).
 
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
--define(REASON_BLOCKED_SERVER, <<"one or more server addresses resolve to a blocked network range">>).
+-define(REASON_BLOCKED_SERVER,
+    <<"one or more server addresses resolve to a blocked network range">>
+).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
 -define(REASON_BAD_PASSWORD_ARN, <<"password_arn must be a non-empty string">>).
@@ -106,6 +109,10 @@
 -define(REASON_BAD_SSL_VERSIONS, <<"ssl_options.versions must be a list of known TLS versions">>).
 -define(REASON_BAD_SSL_SNI, <<"ssl_options.server_name_indication must be a string">>).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
+-define(REASON_CACERT_ARN_RESOLVE, <<"failed to resolve ssl_options.cacertfile_arn">>).
+-define(REASON_CACERT_PEM_INVALID,
+    <<"ssl_options.cacertfile_arn did not resolve to a valid PEM certificate">>
+).
 -define(REASON_TLS_BOTH, <<"use_ssl and use_starttls are mutually exclusive">>).
 -define(REASON_CONNECTION, <<"could not connect to LDAP server">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
@@ -156,8 +163,13 @@ validate(Body) when is_map(Body) ->
                     Err;
                 ok ->
                     case resolve_password(Body, Params) of
-                        {error, _, _} = Err -> Err;
-                        {ok, Params1} -> do_ldap_validate(Params1)
+                        {error, _, _} = Err ->
+                            Err;
+                        {ok, Params1} ->
+                            case resolve_cacert(Params1) of
+                                {error, _, _} = Err -> Err;
+                                {ok, Params2} -> do_ldap_validate(Params2)
+                            end
                     end
             end
     end.
@@ -237,6 +249,45 @@ resolve_password(Body, Params) ->
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_PASSWORD_ARN}
+    end.
+
+%% Resolve the CA-cert ARN (when ssl_options.cacertfile_arn is set) in the
+%% network phase, alongside the password ARN and after all pure validation.
+%% A resolve OR a PEM-decode failure is reported as input_invalid -- mirroring
+%% resolve_password/2 -- rather than silently leaving the connection without a
+%% trust anchor. The latter would let `verify' fall back to verify_none (see
+%% apply_verify_default/1) and report a TLS config as valid that the operator
+%% believes is certificate-verified -- a silent security degradation. The
+%% decoded certs are stored under the atom `cacerts' key in ssl_options so
+%% build_ssl_opts/1 consumes them directly instead of re-resolving the ARN
+%% (and re-clobbering the region) at connect time.
+%%
+%% Only resolved when TLS is actually in use (use_ssl or use_starttls): the
+%% cert is consumed solely by build_ssl_opts/1, which only runs on the TLS
+%% paths, so fetching it for a plaintext request would be a pointless secret
+%% fetch and could reject an otherwise-valid plaintext config.
+resolve_cacert(#{use_ssl := false, use_starttls := false} = Params) ->
+    {ok, Params};
+resolve_cacert(#{ssl_options := SslOpts} = Params) ->
+    case maps:get(<<"cacertfile_arn">>, SslOpts, undefined) of
+        undefined ->
+            {ok, Params};
+        Arn when is_binary(Arn) ->
+            case resolve_arn(Arn) of
+                {ok, PemData} ->
+                    %% pem_entry_decode/1 can raise on a malformed entry; an
+                    %% empty/undecodable PEM returns `skip'. Both mean the ARN
+                    %% does not hold a usable CA cert -- report input_invalid
+                    %% rather than degrading the trust anchor.
+                    try decode_pem_cacerts(PemData) of
+                        skip -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID};
+                        Certs -> {ok, Params#{ssl_options => SslOpts#{cacerts => Certs}}}
+                    catch
+                        _:_ -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID}
+                    end;
+                {error, _} ->
+                    {error, input_invalid, ?REASON_CACERT_ARN_RESOLVE}
+            end
     end.
 
 parse_use_ssl(Body, Acc) ->
@@ -378,6 +429,17 @@ is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 %% via the validation endpoint while still allowing legitimate LDAP servers.
 %% Bypassed when auth_validation_allow_private_networks is true (for testing
 %% against local slapd instances).
+%%
+%% This is the FIRST of two SSRF checks (defence in depth). It resolves Server
+%% and rejects a blocked IP before any connection is attempted, so a malformed
+%% or obviously-internal target never opens a socket. On its own it is subject
+%% to a DNS-rebinding TOCTOU -- eldap:open/2 re-resolves the hostname, so the
+%% peer it connects to could differ from the IP vetted here. That window is
+%% closed by the SECOND check, verify_connected_peer/1, which re-validates the
+%% actual connected socket's peer (see do_ldap_bind/1). We keep this pre-connect
+%% check too: it rejects bad input cheaply (no socket, clearer input_invalid
+%% category) and avoids dialing out for the common case. Both checks are
+%% bypassed under auth_validation_allow_private_networks for local-slapd tests.
 is_allowed_server(Server) ->
     case application:get_env(aws, auth_validation_allow_private_networks, false) of
         true -> true;
@@ -386,7 +448,8 @@ is_allowed_server(Server) ->
 
 check_server_ip(Server) ->
     case inet:getaddr(Server, inet) of
-        {ok, IP} -> not is_private_ip(IP);
+        {ok, IP} ->
+            not is_private_ip(IP);
         {error, _} ->
             %% Also try IPv6
             case inet:getaddr(Server, inet6) of
@@ -395,18 +458,40 @@ check_server_ip(Server) ->
             end
     end.
 
-%% Block RFC 1918, loopback, link-local, and cloud metadata ranges.
+%% Block RFC 1918, loopback, link-local, CGNAT, and cloud metadata ranges.
+%%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space (second
+%%   octet 64..127); it can route to provider/internal infrastructure, so it is
+%%   denied alongside the RFC 1918 ranges.
 is_private_ip({127, _, _, _}) -> true;
 is_private_ip({10, _, _, _}) -> true;
 is_private_ip({172, B, _, _}) when B >= 16, B =< 31 -> true;
 is_private_ip({192, 168, _, _}) -> true;
 is_private_ip({169, 254, _, _}) -> true;
+is_private_ip({100, B, _, _}) when B >= 64, B =< 127 -> true;
 is_private_ip({0, _, _, _}) -> true;
 is_private_ip(_) -> false.
 
+%% Block the IPv6 ranges that correspond to the v4 blocks above, so the filter
+%% cannot be bypassed by handing the endpoint a v6 (or v6-encoded) address.
+%%   ::1            loopback
+%%   ::             unspecified
+%%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
+%%                  address fd00:ec2::254 -- the whole point of this block.
+%%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
+%% IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses embed
+%% a v4 address in the low 32 bits; re-check those against the v4 ranges so e.g.
+%% ::ffff:169.254.169.254 cannot reach IMDS.
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
-is_private_ip6({16#fe80, _, _, _, _, _, _, _}) -> true;
+is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
+is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
+is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
+is_private_ip6({0, 0, 0, 0, 0, 16#ffff, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
+is_private_ip6({0, 0, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6(_) -> false.
+
+%% Split the low 32 bits of a v4-mapped/compatible v6 address into a v4 tuple.
+v6_words_to_v4(W7, W8) ->
+    {W7 bsr 8, W7 band 16#ff, W8 bsr 8, W8 band 16#ff}.
 
 %%--------------------------------------------------------------------
 %% Config conflict
@@ -462,19 +547,65 @@ do_ldap_bind(
             {error, connection_failed, ?REASON_CONNECTION};
         {ok, Handle} ->
             try
-                case maybe_start_tls(Handle, UseStartTls, SslOpts, Timeout) of
-                    {error, _Reason} ->
-                        {error, tls_failed, ?REASON_TLS_HANDSHAKE};
+                %% SSRF (R4): close the DNS-rebinding window. parse_servers/2's
+                %% is_allowed_server/1 vetted a resolved IP, but eldap re-resolved
+                %% the hostname for this connection, so the peer we are actually
+                %% attached to may differ (DNS rebinding). Re-check the *real*
+                %% connected peer -- the exact socket every later operation
+                %% (start_tls, bind, search) runs over -- before sending anything.
+                %% A blocked peer collapses to connection_failed (indistinguishable
+                %% from an unreachable host, so it leaks no recon signal).
+                case verify_connected_peer(Handle) of
+                    blocked ->
+                        {error, connection_failed, ?REASON_CONNECTION};
                     ok ->
-                        case eldap:simple_bind(Handle, UserDn, Password) of
-                            ok -> post_bind_checks(Handle, Params);
-                            {error, _Reason} -> {error, auth_failed, ?REASON_AUTH}
+                        case maybe_start_tls(Handle, UseStartTls, SslOpts, Timeout) of
+                            {error, _Reason} ->
+                                {error, tls_failed, ?REASON_TLS_HANDSHAKE};
+                            ok ->
+                                case eldap:simple_bind(Handle, UserDn, Password) of
+                                    ok -> post_bind_checks(Handle, Params);
+                                    {error, _Reason} -> {error, auth_failed, ?REASON_AUTH}
+                                end
                         end
                 end
             after
                 catch eldap:close(Handle)
             end
     end.
+
+%% Re-validate the IP eldap actually connected to, closing the DNS-rebinding
+%% TOCTOU between is_allowed_server/1 (pre-connect, on a resolved IP) and this
+%% live socket. Reads the peer from the open handle rather than re-resolving the
+%% hostname, so what we check is exactly what we will talk to. Bypassed under
+%% auth_validation_allow_private_networks (local-slapd testing), matching
+%% is_allowed_server/1. Fails closed: if the peer cannot be determined, treat it
+%% as blocked.
+verify_connected_peer(Handle) ->
+    case application:get_env(aws, auth_validation_allow_private_networks, false) of
+        true -> ok;
+        _ -> check_peer_ip(Handle)
+    end.
+
+check_peer_ip(Handle) ->
+    case eldap:info(Handle) of
+        #{socket := Sock, socket_type := ssl} -> peer_allowed(ssl:peername(Sock));
+        #{socket := Sock, socket_type := tcp} -> peer_allowed(inet:peername(Sock));
+        _ -> blocked
+    end.
+
+peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 4 ->
+    case is_private_ip(IP) of
+        true -> blocked;
+        false -> ok
+    end;
+peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 8 ->
+    case is_private_ip6(IP) of
+        true -> blocked;
+        false -> ok
+    end;
+peer_allowed(_) ->
+    blocked.
 
 %% After a successful bind, run the optional DN-lookup and authorization
 %% checks in sequence on the same bound handle. The first failure wins; if
@@ -567,14 +698,17 @@ maybe_start_tls(Handle, true, SslOpts, Timeout) ->
 %%
 %% No `catch' here. The previous `(catch Fun(Value))' swallowed every error,
 %% which the value-validation in parse_ssl_options/2 has now made unnecessary
-%% and which hid bugs (the discouraged `catch' keyword). The cacerts resolver
-%% returns `skip' for PEM with no decodable entries (dropped via add_ssl_opt);
-%% a genuinely malformed CA cert can still raise in public_key, but that is
-%% contained by do_ldap_validate/1's R6 try/catch one level up (-> a fixed
-%% connection_failed, password-safe), not silently dropped here.
+%% and which hid bugs (the discouraged `catch' keyword).
+%%
+%% The CA cert is no longer resolved here: resolve_cacert/1 fetches and decodes
+%% cacertfile_arn during the network phase and stores the decoded certs under
+%% the atom `cacerts' key, so a resolve/decode failure is reported loud as
+%% input_invalid (never a silent verify_none downgrade) and the ARN is resolved
+%% exactly once. By the time we reach here the certs are already in hand; the
+%% `cacerts' pair below just threads them through unchanged.
 build_ssl_opts(Map) when is_map(Map) ->
     Pairs = [
-        {cacerts, <<"cacertfile_arn">>, fun resolve_and_decode_pem_cacerts/1},
+        {cacerts, cacerts, fun(Certs) -> Certs end},
         {verify, <<"verify">>, fun to_verify/1},
         {depth, <<"depth">>, fun to_integer/1},
         {versions, <<"versions">>, fun to_versions/1},
@@ -667,16 +801,13 @@ to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
 to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
 to_version(<<"tlsv1">>) -> tlsv1.
 
+%% Decode PEM data into the decoded cert terms eldap expects under `cacerts'.
+%% Returns `skip' when the data holds no decodable PEM entries (so resolve_cacert/1
+%% can reject it as input_invalid rather than proceeding with an empty trust set).
 decode_pem_cacerts(B) when is_binary(B) ->
     case public_key:pem_decode(B) of
         [] -> skip;
         Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
-    end.
-
-resolve_and_decode_pem_cacerts(Arn) when is_binary(Arn) ->
-    case resolve_arn(Arn) of
-        {ok, PemData} -> decode_pem_cacerts(PemData);
-        {error, _} -> skip
     end.
 
 %%--------------------------------------------------------------------

@@ -67,5 +67,6 @@ get_int_env(Key, Default, MaxBound) ->
                 _ when N =< MaxBound -> N;
                 _ -> Default
             end;
-        _ -> Default
+        _ ->
+            Default
     end.
