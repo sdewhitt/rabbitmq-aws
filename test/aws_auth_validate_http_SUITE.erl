@@ -58,7 +58,12 @@ init_per_suite(Config0) ->
     %% init_per_testcase's testcase_started/2 sends to (see the LDAP suite's
     %% note: without it every case auto-skips and `make ct' exits non-zero).
     Config = rabbit_ct_helpers:run_setup_steps(Config0),
-    {ok, _} = application:ensure_all_started(inets),
+    %% Track whether WE start the inets application so end_per_suite can leave
+    %% the node as it found it. CT runs all suites in one node: if we leave
+    %% inets running, a later suite that does `ok = inets:start()' (e.g.
+    %% aws_auth_validate_mgmt_SUITE) hits {error,{already_started,inets}} and
+    %% fails its init_per_suite. ensure_all_started returns the apps IT started.
+    {ok, StartedInets} = application:ensure_all_started(inets),
     {ok, _} = application:ensure_all_started(ssl),
     PrivDir = ?config(priv_dir, Config),
     %% Start the plaintext stub: /ok200, /ok201, /denied404, /error500.
@@ -69,13 +74,20 @@ init_per_suite(Config0) ->
         {http_stub_pid, HttpPid},
         {http_port, HttpPort},
         {https_stub_pid, HttpsPid},
-        {https_port, HttpsPort}
+        {https_port, HttpsPort},
+        {started_inets, lists:member(inets, StartedInets)}
         | Config
     ].
 
 end_per_suite(Config) ->
     catch inets:stop(httpd, ?config(http_stub_pid, Config)),
     catch inets:stop(httpd, ?config(https_stub_pid, Config)),
+    %% Only stop the inets application if this suite started it, so we leave
+    %% the CT node exactly as we found it for later suites.
+    case ?config(started_inets, Config) of
+        true -> application:stop(inets);
+        _ -> ok
+    end,
     rabbit_ct_helpers:run_teardown_steps(Config).
 
 init_per_group(_Group, Config) ->
