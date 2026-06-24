@@ -42,6 +42,27 @@
 
 -export([method_name/0, validate/1, allowed_fields/0]).
 
+-ifdef(TEST).
+%% Exposed for unit tests: the SSRF address policy (classify_ip/1 and the
+%% CIDR primitives), the URL parser, the per-URL pure guard, the network-phase
+%% resolve+pin, the TLS-option builder, and the httpc error classifier. All are
+%% otherwise internal. Mirrors aws_auth_validate_ldap's TEST export block.
+-export([
+    parse_url/1,
+    parse_paths/2,
+    url_allowed/1,
+    classify_address/1,
+    classify_ip/1,
+    in_cidr/2,
+    in_any_cidr/2,
+    resolve_and_pin/1,
+    pin_url/2,
+    build_client_ssl_opts/1,
+    classify_http_error/1,
+    is_tls_error/1
+]).
+-endif.
+
 %% Default per-request timeout (ms) when auth_validation_connection_timeout_ms
 %% is unset. Matches the LDAP backend's default.
 -define(DEFAULT_TIMEOUT_MS, 5_000).
