@@ -4,9 +4,9 @@
 %% -*- mode: erlang; -*-
 
 %% Unit tests for the auth-validation subsystem's pure modules: semaphore,
-%% ARN-resolution lock, registry, the LDAP backend's input parsing, and the
-%% LDAP query DSL parser (incl. upstream parity). The live bind/connect/TLS
-%% path lives in aws_auth_validate_ldap_SUITE; the HTTP pipeline lives in
+%% registry, the LDAP backend's input parsing, and the LDAP query DSL parser
+%% (incl. upstream parity). The live bind/connect/TLS path lives in
+%% aws_auth_validate_ldap_SUITE; the HTTP pipeline lives in
 %% aws_auth_validate_mgmt_SUITE.
 -module(aws_auth_validate_tests).
 
@@ -59,42 +59,6 @@ semaphore_crashed_holder_test_() ->
             wait_until_zero(50),
             [?_assertMatch({ok, _}, aws_auth_validate_semaphore:acquire())]
         end}.
-
-%%--------------------------------------------------------------------
-%% ARN resolution lock
-%%--------------------------------------------------------------------
-
-%% The lock is now a global:trans/4 lock with no server process, so there is
-%% nothing to start or stop -- with_lock/1 is callable directly. These cases
-%% exercise OUR wrapper's contract: it returns the closure's value, propagates
-%% an exception to the caller, and releases the lock even when the closure
-%% crashes.
-%%
-%% We deliberately do NOT unit-test that concurrent callers are serialized.
-%% Serialization is a property of global:trans/4 (OTP stdlib), which rabbit
-%% itself relies on in production (feature-flag state changes, stream
-%% coordinator startup) without unit-testing it. A timing/overlap probe of it
-%% is non-deterministic across the OTP matrix -- it passed on OTP 28 but
-%% failed intermittently on OTP 27 in CI (global's scheduling of competing
-%% set_lock waiters is not guaranteed in wall-clock terms), testing the
-%% library rather than our 3-line wrapper. See [[ci-failure-gotchas]]:
-%% timing-based concurrency assertions do not belong in this suite.
-arn_lock_test_() ->
-    [
-        {"returns the closure's value", fun() ->
-            ?assertEqual(42, aws_auth_validate_arn_lock:with_lock(fun() -> 42 end))
-        end},
-        {"propagates the closure's exception to the caller", fun() ->
-            ?assertError(
-                boom,
-                aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end)
-            )
-        end},
-        {"releases the lock after a crashing closure (next call still works)", fun() ->
-            catch aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end),
-            ?assertEqual(ok, aws_auth_validate_arn_lock:with_lock(fun() -> ok end))
-        end}
-    ].
 
 %%--------------------------------------------------------------------
 %% Registry
@@ -437,11 +401,9 @@ ldap_bind_raise_does_not_leak_password_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
-            ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
-            %% with_lock just runs the closure inline for the test.
-            meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
-            %% Resolve any ARN to our sentinel password.
-            meck:expect(aws_arn_util, resolve_arn, fun(_) -> {ok, ?SECRET} end),
+            %% Resolve any ARN to our sentinel password. resolve_arn/2 threads
+            %% the passed aws_lib:aws_state() back in the success 3-tuple.
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
             %% open() succeeds, then simple_bind/3 RAISES with the password
             %% present in the failing call's arguments -- the worst case for a
             %% crash-report leak.
@@ -454,8 +416,7 @@ ldap_bind_raise_does_not_leak_password_test_() ->
         end,
         fun(_) ->
             meck:unload(eldap),
-            meck:unload(aws_arn_util),
-            meck:unload(aws_auth_validate_arn_lock)
+            meck:unload(aws_arn_util)
         end,
         fun(_) ->
             Body = bind_body(),
@@ -500,8 +461,6 @@ cacert_arn_resolution_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
-            ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
-            meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
             %% Keep the suite hermetic: the TLS-off case reaches the connect
             %% path, so stub eldap:open to fail fast instead of dialling out.
             meck:expect(eldap, open, fun(_Servers, _Opts) -> {error, refused} end),
@@ -510,16 +469,15 @@ cacert_arn_resolution_test_() ->
         end,
         fun(_) ->
             meck:unload(eldap),
-            meck:unload(aws_auth_validate_arn_lock),
             meck:unload(aws_arn_util)
         end,
         [
             {"unresolvable CA-cert ARN -> input_invalid (no silent verify_none)", fun() ->
                 %% Password ARN resolves; CA-cert ARN does not.
-                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
                         true -> {error, not_found};
-                        false -> {ok, <<"pw">>}
+                        false -> {ok, <<"pw">>, State}
                     end
                 end),
                 ?assertMatch(
@@ -528,10 +486,10 @@ cacert_arn_resolution_test_() ->
                 )
             end},
             {"CA-cert ARN resolving to non-PEM data -> input_invalid", fun() ->
-                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
-                        true -> {ok, <<"this is not a PEM certificate">>};
-                        false -> {ok, <<"pw">>}
+                        true -> {ok, <<"this is not a PEM certificate">>, State};
+                        false -> {ok, <<"pw">>, State}
                     end
                 end),
                 ?assertMatch(
@@ -547,10 +505,10 @@ cacert_arn_resolution_test_() ->
                 %% fails loudly if resolve_cacert/1 runs it; the password ARN
                 %% resolves normally. The bind is then left to fail at connect
                 %% (8.8.8.8:389), which is NOT input_invalid.
-                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
                         true -> erlang:error(cacert_resolved_with_tls_off);
-                        false -> {ok, <<"pw">>}
+                        false -> {ok, <<"pw">>, State}
                     end
                 end),
                 Result = aws_auth_validate_ldap:validate(
