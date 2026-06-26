@@ -131,7 +131,7 @@ client_error_404_returns_auth_failed(Config) ->
 server_error_500_returns_auth_failed(Config) ->
     ?assertMatch({error, auth_failed, _}, validate(http_body(Config, "/error500"))).
 
-unreachable_port_returns_connection_failed(Config) ->
+unreachable_port_returns_connection_failed(_Config) ->
     %% Port 1 on loopback: nothing listens, so the connect fails fast.
     Body = #{
         <<"user_path">> => <<"http://127.0.0.1:1/ok200">>,

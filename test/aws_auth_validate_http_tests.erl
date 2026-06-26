@@ -578,9 +578,6 @@ http_probe_raise_does_not_leak_test_() ->
 %% next thing reached. Uses a public literal IP host so classify_ip/1 returns
 %% allow in the pure phase (mirrors base_body/0 in aws_auth_validate_tests,
 %% which used 8.8.8.8 for the same reason). https so ssl_options/ARNs matter.
-base_body() ->
-    base_body(#{}).
-
 base_body(Overrides) when is_map(Overrides) ->
     Base = #{<<"user_path">> => <<"https://8.8.8.8/auth/user">>},
     maps:merge(Base, Overrides).
