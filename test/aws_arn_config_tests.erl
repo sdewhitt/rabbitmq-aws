@@ -71,7 +71,9 @@ boot_path_test_() ->
         fun assume_role_failure_short_circuits/0,
         fun resolved_state_propagates_across_arns/0,
         fun resolve_arn_error_short_circuits/0,
-        fun self_resolving_handler_receives_state/0
+        fun self_resolving_handler_receives_state/0,
+        fun self_resolving_handler_state_propagates/0,
+        fun self_resolving_handler_error_has_context/0
     ]}.
 
 boot_setup() ->
@@ -213,13 +215,13 @@ resolve_arn_error_short_circuits() ->
 
 %% The self-resolving handler (Arn = undefined) is invoked as
 %% Mod:run(Args ++ [State]); it resolves its own ARNs, so the threaded state
-%% must arrive as the trailing argument.
+%% must arrive as the trailing argument and it returns {ok, State1}.
 self_resolving_handler_receives_state() ->
     Self = self(),
     %% run/4: Args is [Key, ConfigKey, Map] (3 elements), State appended.
     ok = meck:expect(?HANDLER, run, fun(_Key, _ConfigKey, _Map, State) ->
         Self ! {self_resolving_state, access_key(State)},
-        ok
+        {ok, State}
     end),
     ArnConfig = [
         {arns, [{?HANDLER, undefined, the_key, [the_key, providers, #{<<"0">> => <<"arn">>}]}]}
@@ -231,6 +233,49 @@ self_resolving_handler_receives_state() ->
         {self_resolving_state, Key} -> ?assertEqual(undefined, Key)
     after 1000 -> erlang:error(handler_not_called)
     end.
+
+%% The {ok, State1} a self-resolving handler returns must be threaded to the
+%% next handler, so credentials it refreshed are visible downstream. The
+%% self-resolving handler stamps credentials onto its returned state; the
+%% following regular ARN handler must observe them.
+self_resolving_handler_state_propagates() ->
+    Self = self(),
+    ok = meck:expect(?HANDLER, run, fun(_Key, _ConfigKey, _Map, State) ->
+        {ok, S} = aws_lib:set_credentials(?RESOLVE_KEY, "secret", "token", State),
+        {ok, S}
+    end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+        Self ! {next_handler_key, access_key(State)},
+        {ok, <<"data">>, State}
+    end),
+    ok = meck:expect(?HANDLER, run, fun(_Data, _Key, _Sub) -> ok end),
+    ArnConfig = [
+        {arns, [
+            {?HANDLER, undefined, the_key, [the_key, providers, #{<<"0">> => <<"arn">>}]},
+            {?HANDLER, "arn:aws:s3:::b/k", some_key, [some_key, sub_key]}
+        ]}
+    ],
+    Result = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
+    ?assertEqual({ok, {iam_role_result, not_assumed}}, Result),
+    receive
+        {next_handler_key, Key} -> ?assertEqual(?RESOLVE_KEY, Key)
+    after 1000 -> erlang:error(next_handler_not_called)
+    end.
+
+%% A resolve failure inside the real oauth2 handler is wrapped with provider
+%% context (the {error, {BinaryMsg, OrigError}} shape the regular handler path
+%% produces) rather than leaking a bare, context-free error. Exercises the real
+%% aws_arn_config_oauth2:run/4, mocking only the ARN resolution it calls.
+self_resolving_handler_error_has_context() ->
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, not_found} end),
+    Result = aws_arn_config_oauth2:run(
+        the_key, providers_https_cacertfile, #{<<"0">> => <<"arn:x">>}, aws_lib:new()
+    ),
+    ?assertMatch({error, {Msg, {error, not_found}}} when is_binary(Msg), Result),
+    {error, {Msg, _}} = Result,
+    %% The message names the failing provider key and ARN.
+    ?assert(binary:match(Msg, <<"oauth2 provider">>) =/= nomatch),
+    ?assert(binary:match(Msg, <<"arn:x">>) =/= nomatch).
 
 flush_resolved_state_key() ->
     receive
