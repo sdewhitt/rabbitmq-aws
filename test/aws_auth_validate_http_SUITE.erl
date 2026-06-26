@@ -45,7 +45,8 @@ groups() ->
             server_error_500_returns_auth_failed,
             unreachable_port_returns_connection_failed,
             self_signed_under_verify_peer_returns_tls_failed,
-            self_signed_under_verify_none_returns_ok
+            self_signed_under_verify_none_returns_ok,
+            custom_ca_under_verify_peer_returns_ok
         ]}
     ].
 
@@ -70,11 +71,17 @@ init_per_suite(Config0) ->
     {HttpPid, HttpPort} = start_http_stub(PrivDir),
     %% Start the HTTPS stub with a freshly-generated self-signed cert.
     {HttpsPid, HttpsPort} = start_https_stub(PrivDir),
+    %% A second HTTPS stub serving a CA-signed leaf; the CA PEM is returned so a
+    %% test can resolve a cacertfile_arn to it (the verify_peer success path).
+    {CaHttpsPid, CaHttpsPort, CaPem} = start_ca_https_stub(PrivDir),
     [
         {http_stub_pid, HttpPid},
         {http_port, HttpPort},
         {https_stub_pid, HttpsPid},
         {https_port, HttpsPort},
+        {ca_https_stub_pid, CaHttpsPid},
+        {ca_https_port, CaHttpsPort},
+        {ca_pem, CaPem},
         {started_inets, lists:member(inets, StartedInets)}
         | Config
     ].
@@ -82,6 +89,7 @@ init_per_suite(Config0) ->
 end_per_suite(Config) ->
     catch inets:stop(httpd, ?config(http_stub_pid, Config)),
     catch inets:stop(httpd, ?config(https_stub_pid, Config)),
+    catch inets:stop(httpd, ?config(ca_https_stub_pid, Config)),
     %% Only stop the inets application if this suite started it, so we leave
     %% the CT node exactly as we found it for later suites.
     case ?config(started_inets, Config) of
@@ -154,6 +162,34 @@ self_signed_under_verify_none_returns_ok(Config) ->
         <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
     },
     ?assertEqual(ok, validate(Body)).
+
+custom_ca_under_verify_peer_returns_ok(Config) ->
+    %% verify_peer SUCCESS with a customer CA supplied via cacertfile_arn.
+    %% Regression guard: if cacerts is built from pem_entry_decode/1 records,
+    %% ssl ignores them (unknown_ca -> tls_failed); the CA must be passed as
+    %% raw DER. resolve_arn and with_lock are mecked; the real httpc probe
+    %% runs.
+    CaPem = ?config(ca_pem, Config),
+    ok = meck:new(aws_arn_util, [passthrough]),
+    ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
+    try
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn) -> {ok, CaPem} end),
+        meck:expect(aws_auth_validate_arn_lock, with_lock, fun(Fun) -> Fun() end),
+        Port = ?config(ca_https_port, Config),
+        Url = iolist_to_binary(["https://127.0.0.1:", integer_to_list(Port), "/ok200"]),
+        Body = #{
+            <<"user_path">> => Url,
+            <<"http_method">> => <<"get">>,
+            <<"ssl_options">> => #{
+                <<"verify">> => <<"verify_peer">>,
+                <<"cacertfile_arn">> => <<"arn:aws:s3:::test-ca/ca.pem">>
+            }
+        },
+        ?assertEqual(ok, validate(Body))
+    after
+        meck:unload(aws_auth_validate_arn_lock),
+        meck:unload(aws_arn_util)
+    end.
 
 %%--------------------------------------------------------------------
 %% Request bodies + driver
@@ -247,3 +283,50 @@ gen_self_signed(PrivDir) ->
     _ = os:cmd(Cmd),
     true = filelib:is_regular(CertFile) andalso filelib:is_regular(KeyFile),
     {CertFile, KeyFile}.
+
+%% HTTPS stub whose leaf cert is signed by a generated test CA. Returns the CA
+%% PEM so a test can point a cacertfile_arn at it and have verify_peer succeed.
+start_ca_https_stub(PrivDir) ->
+    {CaPem, CertFile, KeyFile} = gen_ca_signed(PrivDir),
+    {ok, Pid} = inets:start(httpd, [
+        {port, 0},
+        {server_name, "aws_https_ca_stub"},
+        {server_root, PrivDir},
+        {document_root, PrivDir},
+        {bind_address, {127, 0, 0, 1}},
+        {socket_type, {ssl, [{certfile, CertFile}, {keyfile, KeyFile}]}},
+        {modules, [?MODULE]}
+    ]),
+    [{port, Port}] = httpd:info(Pid, [port]),
+    {Pid, Port, CaPem}.
+
+%% Generate a test CA + a leaf signed by it. The leaf has subjectAltName=
+%% IP:127.0.0.1 so hostname verification passes against the pinned loopback IP.
+gen_ca_signed(PrivDir) ->
+    J = fun(Name) -> filename:join(PrivDir, Name) end,
+    CaKey = J("ca-key.pem"),
+    CaCert = J("ca-cert.pem"),
+    LeafKey = J("leaf-key.pem"),
+    LeafCsr = J("leaf.csr"),
+    LeafCert = J("leaf-cert.pem"),
+    ExtFile = J("leaf-ext.cnf"),
+    ok = file:write_file(ExtFile, "subjectAltName=IP:127.0.0.1\n"),
+    Run = fun(Fmt, Args) -> _ = os:cmd(lists:flatten(io_lib:format(Fmt, Args))) end,
+    Run(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 1 -subj /CN=AwsAuthValidateTestCA 2>/dev/null",
+        [CaKey, CaCert]
+    ),
+    Run(
+        "openssl req -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj /CN=127.0.0.1 2>/dev/null",
+        [LeafKey, LeafCsr]
+    ),
+    Run(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 1 -extfile ~ts 2>/dev/null",
+        [LeafCsr, CaCert, CaKey, LeafCert, ExtFile]
+    ),
+    true = filelib:is_regular(LeafCert) andalso filelib:is_regular(LeafKey),
+    {ok, CaPem} = file:read_file(CaCert),
+    {CaPem, LeafCert, LeafKey}.
