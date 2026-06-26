@@ -129,18 +129,23 @@
 %% the app env only when an operator sets it explicitly.
 
 %% @doc Maximum HTTP request body size in bytes (effective default 65536).
+%% Bounds mirror the runtime guard in aws_auth_validate_mgmt:max_body_size/0
+%% so an out-of-range value is rejected at config time rather than silently
+%% falling back to the default.
 {mapping, "aws.auth_validation.max_body_size", "aws.auth_validation_max_body_size",
-    [{datatype, integer}]}.
+    [{datatype, {integer, [{min, 1}, {max, 10000000}]}}]}.
 
 %% @doc Maximum concurrent outbound auth-validation connections (effective
-%% default 5; applied by aws_sup).
+%% default 5; applied by aws_sup). Bounds mirror the runtime guard in
+%% aws_sup:get_int_env/3.
 {mapping, "aws.auth_validation.max_concurrent", "aws.auth_validation_max_concurrent",
-    [{datatype, integer}]}.
+    [{datatype, {integer, [{min, 1}, {max, 100}]}}]}.
 
 %% @doc Per-connection timeout in milliseconds for outbound calls
-%% (effective default 5000).
+%% (effective default 5000). Bounds mirror the runtime guard in
+%% aws_auth_validate_ldap:connection_timeout_ms/0.
 {mapping, "aws.auth_validation.connection_timeout_ms", "aws.auth_validation_connection_timeout_ms",
-    [{datatype, integer}]}.
+    [{datatype, {integer, [{min, 1}, {max, 60000}]}}]}.
 
 %% @doc Required management user tag to access the endpoint (effective
 %% default administrator).

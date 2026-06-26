@@ -116,6 +116,23 @@ registry_field_filter_override_test_() ->
         ]}.
 
 %%--------------------------------------------------------------------
+%% Mgmt status mapping
+%%--------------------------------------------------------------------
+
+status_for_category_known_test() ->
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(input_invalid)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(connection_failed)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(tls_failed)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(query_invalid)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(auth_failed)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(config_conflict)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(authz_unverified)).
+
+%% A category outside the documented set maps to 500 rather than crashing.
+status_for_category_unknown_test() ->
+    ?assertEqual(500, aws_auth_validate_mgmt:status_for_category(some_future_category)).
+
+%%--------------------------------------------------------------------
 %% LDAP backend (input parsing only - the real bind path needs slapd)
 %%--------------------------------------------------------------------
 

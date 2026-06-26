@@ -25,6 +25,12 @@
     accept_content/2
 ]).
 
+-ifdef(TEST).
+%% Exposed for unit tests: status_for_category/1 maps a backend error category
+%% to an HTTP status, including the catch-all for an unexpected category.
+-export([status_for_category/1]).
+-endif.
+
 -include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("aws.hrl").
@@ -194,7 +200,11 @@ status_for_category(tls_failed) -> 400;
 status_for_category(query_invalid) -> 400;
 status_for_category(auth_failed) -> 422;
 status_for_category(config_conflict) -> 422;
-status_for_category(authz_unverified) -> 422.
+status_for_category(authz_unverified) -> 422;
+%% A category outside the backend behaviour's documented set is our fault, not
+%% the caller's, so map it to 500 rather than crashing with a function_clause
+%% (which the with_semaphore/6 catch would also surface as a 500).
+status_for_category(_) -> 500.
 
 reply_error(Status, Category, Message, Req, Context) ->
     Body = rabbit_json:encode(#{
