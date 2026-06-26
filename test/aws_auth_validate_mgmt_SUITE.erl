@@ -107,8 +107,7 @@ init_per_group(feature_enabled, Config) ->
         %% SSRF filter (is_allowed_server/1) rejects it with input_invalid in
         %% parse_servers BEFORE later pipeline stages run, so cases that assert
         %% a later outcome (e.g. config_conflict_returns_422) would wrongly see
-        %% a 400. These tests never open a real connection, so allowing private
-        %% ranges here is safe and exercises the intended code path.
+        %% a 400. Allow private/loopback addresses for these in-suite requests.
         {auth_validation_allow_private_networks, true}
     ]);
 init_per_group(feature_enabled_custom_tag, Config) ->
