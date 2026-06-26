@@ -172,6 +172,7 @@ ldap_allowed_fields_test() ->
             <<"ssl_options">>,
             <<"dn_lookup_base">>,
             <<"dn_lookup_attribute">>,
+            <<"username">>,
             <<"queries">>
         ]
     ].
@@ -673,6 +674,153 @@ literal_dns_bare_string_query_test() ->
     %% value, not a DN, so it contributes nothing.
     {ok, Q} = aws_auth_validate_ldap_query:parse(<<"\"just a string\"">>),
     ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+%%--------------------------------------------------------------------
+%% Placeholder filling (aws_auth_validate_ldap_query:fill/2)
+%%--------------------------------------------------------------------
+
+%% A literal in_group DN is unchanged by fill/2 and becomes evaluable.
+fill_in_group_literal_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=admins,ou=groups,dc=x,dc=com\"}">>
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, [{username, "alice"}]),
+    ?assertEqual("cn=admins,ou=groups,dc=x,dc=com", DN),
+    ?assert(aws_auth_validate_ldap_query:is_evaluable(DN)).
+
+%% A ${username} placeholder in a DN sink is substituted and the result becomes
+%% evaluable.
+fill_username_in_dn_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},ou=groups,dc=x,dc=com\"}">>
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, [{username, "alice"}]),
+    ?assertEqual("cn=alice,ou=groups,dc=x,dc=com", DN),
+    ?assert(aws_auth_validate_ldap_query:is_evaluable(DN)).
+
+%% DN sinks RFC 4514-escape the substituted value; the user_dn key is exempt
+%% (it already holds a complete DN). A username with a comma must be escaped
+%% inside a DN component but a user_dn value must not.
+fill_dn_escaping_test() ->
+    {ok, Q1} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},dc=x\"}">>
+    ),
+    {in_group, DN1} = aws_auth_validate_ldap_query:fill(Q1, [{username, "a,b"}]),
+    ?assertEqual("cn=a\\,b,dc=x", DN1),
+    {ok, Q2} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"${user_dn}\"}">>
+    ),
+    {in_group, DN2} = aws_auth_validate_ldap_query:fill(
+        Q2, [{user_dn, "cn=a,ou=people,dc=x"}]
+    ),
+    ?assertEqual("cn=a,ou=people,dc=x", DN2).
+
+%% A per-operation placeholder we cannot supply (${vhost}) survives unfilled,
+%% so the DN stays non-evaluable and the backend degrades it.
+fill_residual_placeholder_not_evaluable_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=admins,ou=${vhost},dc=x\"}">>
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, [{username, "alice"}]),
+    ?assertNot(aws_auth_validate_ldap_query:is_evaluable(DN)).
+
+%% equals/match value operands are filled RAW (no DN escaping) -- they are ACL
+%% value sinks, not DNs.
+fill_value_operand_raw_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{equals, \"${username}\", \"a,b\"}">>
+    ),
+    {equals, V1, V2} = aws_auth_validate_ldap_query:fill(Q, [{username, "x,y"}]),
+    ?assertEqual("x,y", value_str(V1)),
+    ?assertEqual("a,b", value_str(V2)).
+
+%% ad_args/1 splits a DOMAIN\\user username and yields nothing for other shapes.
+ad_args_test() ->
+    ?assertEqual(
+        [{ad_domain, "CORP"}, {ad_user, "alice"}],
+        aws_auth_validate_ldap_query:ad_args("CORP\\alice")
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:ad_args("alice")),
+    ?assertEqual([], aws_auth_validate_ldap_query:ad_args(<<"alice">>)).
+
+%% No-username path is unchanged: a placeholder-bearing DN is not literal, so
+%% literal_dns/1 still skips it (backward-compat guard).
+fill_does_not_affect_literal_dns_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},dc=x\"}">>
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+value_str({string, S}) -> S;
+value_str(S) when is_list(S) -> S.
+
+%% Parity of fill/2 with the broker's fill machinery (design req R12). Our DN
+%% sinks must match rabbit_ldap_rfc4514:fill_dn/2 and our value sinks must match
+%% rabbit_auth_backend_ldap_util:fill/2. Skips unless both upstream modules are
+%% loadable (same matrix concern as the parser parity test).
+fill_parity_test_() ->
+    case fill_upstream_usable() of
+        true ->
+            [
+                {
+                    "dn:" ++ Fmt,
+                    ?_assertEqual(
+                        rabbit_ldap_rfc4514:fill_dn(Fmt, Args),
+                        fill_dn_via_query(Fmt, Args)
+                    )
+                }
+             || {Fmt, Args} <- fill_dn_corpus()
+            ] ++
+                [
+                    {
+                        "raw:" ++ Fmt,
+                        ?_assertEqual(
+                            rabbit_auth_backend_ldap_util:fill(Fmt, Args),
+                            fill_raw_via_query(Fmt, Args)
+                        )
+                    }
+                 || {Fmt, Args} <- fill_raw_corpus()
+                ];
+        false ->
+            []
+    end.
+
+%% Drive our DN-sink fill through a parsed in_group query and recover the DN.
+fill_dn_via_query(Fmt, Args) ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        list_to_binary("{in_group, \"" ++ Fmt ++ "\"}")
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, Args),
+    DN.
+
+%% Drive our value-sink (raw) fill through the second operand of an equals query.
+fill_raw_via_query(Fmt, Args) ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        list_to_binary("{equals, \"x\", \"" ++ Fmt ++ "\"}")
+    ),
+    {equals, _, V} = aws_auth_validate_ldap_query:fill(Q, Args),
+    value_str(V).
+
+fill_dn_corpus() ->
+    [
+        {"cn=${username},dc=x", [{username, "alice"}]},
+        {"cn=${username},dc=x", [{username, "a,b+c"}]},
+        {"${user_dn}", [{user_dn, "cn=a,ou=people,dc=x"}]},
+        {"cn=${ad_user},dc=${ad_domain}", [{ad_user, "u"}, {ad_domain, "d"}]}
+    ].
+
+fill_raw_corpus() ->
+    [
+        {"${username}", [{username, "alice"}]},
+        {"${username}", [{username, "a,b"}]},
+        {"pre-${username}-post", [{username, "x"}]}
+    ].
+
+fill_upstream_usable() ->
+    code:ensure_loaded(rabbit_ldap_rfc4514) =/= {error, nofile} andalso
+        code:ensure_loaded(rabbit_auth_backend_ldap_util) =/= {error, nofile} andalso
+        erlang:function_exported(rabbit_ldap_rfc4514, fill_dn, 2) andalso
+        erlang:function_exported(rabbit_auth_backend_ldap_util, fill, 2).
 
 %% Parity with rabbit_auth_backend_ldap_util:parse_query/1 (design req R12).
 %% The broker's parser throws via cuttlefish:invalid/2 on rejection; ours
