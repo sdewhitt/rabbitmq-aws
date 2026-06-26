@@ -120,6 +120,7 @@
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
 -define(REASON_BAD_DN_LOOKUP_BASE, <<"dn_lookup_base must be a non-empty string">>).
 -define(REASON_BAD_DN_LOOKUP_ATTR, <<"dn_lookup_attribute must be a non-empty string">>).
+-define(REASON_BAD_USERNAME, <<"username must be a non-empty string">>).
 -define(REASON_BAD_QUERIES, <<"queries must be an object of query strings">>).
 -define(REASON_BAD_QUERY_VALUE, <<"each query must be a non-empty string">>).
 -define(REASON_QUERY_PARSE, <<"one or more authorization queries are not valid">>).
@@ -128,6 +129,12 @@
 ).
 -define(REASON_AUTHZ_UNVERIFIED,
     <<"a DN referenced by an authorization query could not be verified">>
+).
+-define(REASON_NOT_MEMBER,
+    <<"the supplied username is not authorized by one or more authorization queries">>
+).
+-define(REASON_USERNAME_UNRESOLVED,
+    <<"the supplied username could not be resolved to a single directory entry">>
 ).
 
 method_name() ->
@@ -144,6 +151,7 @@ allowed_fields() ->
         <<"ssl_options">>,
         <<"dn_lookup_base">>,
         <<"dn_lookup_attribute">>,
+        <<"username">>,
         <<"queries">>
     ].
 
@@ -190,6 +198,7 @@ parse_input(Body) ->
         fun parse_ssl_options/2,
         fun parse_dn_lookup_base/2,
         fun parse_dn_lookup_attribute/2,
+        fun parse_username/2,
         fun parse_queries/2
     ],
     parse_input(Steps, Body, #{timeout => connection_timeout_ms()}).
@@ -382,6 +391,22 @@ parse_dn_lookup_attribute(Body, Acc) ->
             {ok, Acc#{dn_lookup_attribute => binary_to_list(Attr)}};
         _ ->
             {error, input_invalid, ?REASON_BAD_DN_LOOKUP_ATTR}
+    end.
+
+%% Optional principal to evaluate authorization queries against. When absent we
+%% store `none' and the authz check stays in its literal-DN reachability mode
+%% (exactly today's behavior). When present, the bound service connection
+%% resolves it to a user DN and the queries' ${username}/${user_dn} placeholders
+%% are filled so membership is actually evaluated. The username is an identifier,
+%% not a credential -- no principal password is accepted (see resolve_user_dn/2).
+parse_username(Body, Acc) ->
+    case maps:get(<<"username">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{username => none}};
+        Username when is_binary(Username), byte_size(Username) > 0 ->
+            {ok, Acc#{username => binary_to_list(Username)}};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_USERNAME}
     end.
 
 %% `queries' is an optional object mapping query names (tags, vhost_access,
@@ -607,13 +632,61 @@ peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 8 ->
 peer_allowed(_) ->
     blocked.
 
-%% After a successful bind, run the optional DN-lookup and authorization
-%% checks in sequence on the same bound handle. The first failure wins; if
-%% none are configured (or all pass) the request succeeds with `ok'.
+%% After a successful bind, run the optional DN-lookup, principal resolution,
+%% and authorization checks in sequence on the same bound handle. The first
+%% failure wins; if none are configured (or all pass) the request succeeds with
+%% `ok'. When a username was supplied we resolve it to a user DN here (between
+%% the dn_lookup-base reachability check and the query evaluation) so the authz
+%% queries can be evaluated for that principal rather than only reachability-
+%% checked.
 post_bind_checks(Handle, Params) ->
     case check_dn_lookup(Handle, Params) of
-        ok -> check_authz_queries(Handle, Params);
-        {error, _, _} = Err -> Err
+        ok ->
+            case resolve_principal_dn(Handle, Params) of
+                {ok, UserDn} ->
+                    check_authz_queries(Handle, Params#{resolved_user_dn => UserDn});
+                {error, _, _} = Err ->
+                    Err
+            end;
+        {error, _, _} = Err ->
+            Err
+    end.
+
+%% Resolve the request-supplied username to a single user DN, using the bound
+%% service connection -- the same equalityMatch(dn_lookup_attribute, username)
+%% search rabbit_auth_backend_ldap:dn_lookup/2 runs. This is a read over the
+%% admin's own credentials; no principal password is involved. We read the
+%% matched entry's object_name (its DN), not an attribute value. Unlike the
+%% broker -- which silently falls back to an escaped user_dn pattern on 0/many
+%% matches -- the endpoint treats anything other than exactly one match as
+%% authz_unverified, since at validation time an unresolvable username is
+%% precisely the misconfiguration the admin wants surfaced.
+%%
+%% `none' means no username was supplied (or no dn_lookup config to resolve it
+%% with): we return `unknown', and query evaluation falls back to the literal-DN
+%% reachability path -- exactly today's behavior.
+resolve_principal_dn(_Handle, #{username := none}) ->
+    {ok, unknown};
+resolve_principal_dn(_Handle, #{dn_lookup_base := none}) ->
+    {ok, unknown};
+resolve_principal_dn(_Handle, #{dn_lookup_attribute := none}) ->
+    {ok, unknown};
+resolve_principal_dn(Handle, #{
+    username := Username,
+    dn_lookup_base := Base,
+    dn_lookup_attribute := Attr
+}) ->
+    case
+        eldap:search(Handle, [
+            {base, Base},
+            {filter, eldap:equalityMatch(Attr, Username)},
+            {attributes, ["distinguishedName"]}
+        ])
+    of
+        {ok, #eldap_search_result{entries = [#eldap_entry{object_name = Dn}]}} ->
+            {ok, Dn};
+        _ ->
+            {error, authz_unverified, ?REASON_USERNAME_UNRESOLVED}
     end.
 
 %%--------------------------------------------------------------------
@@ -637,18 +710,35 @@ check_dn_lookup(Handle, #{dn_lookup_base := Base}) ->
 %% Authorization query validation
 %%--------------------------------------------------------------------
 
-%% For each parsed query, extract the fully-literal DNs (those with no
-%% ${...} runtime placeholder) and confirm each exists and is readable by
-%% the bound user. Queries that reference only runtime-filled DNs contribute
-%% no checks -- they were already validated for grammar at parse time.
-check_authz_queries(Handle, #{queries := Queries}) ->
+%% Two modes, selected by whether a principal was resolved:
+%%
+%%   * No principal (resolved_user_dn = unknown) -- today's behavior. For each
+%%     parsed query, extract the fully-literal DNs (no ${...} placeholder) and
+%%     confirm each exists and is readable. Queries that reference only
+%%     runtime-filled DNs contribute no checks (grammar-validated at parse time).
+%%
+%%   * With a principal -- fill each query's ${username}/${user_dn}/${ad_*}
+%%     placeholders for that user, then *evaluate* it against the bound handle
+%%     (membership, existence, attribute comparisons), mirroring how
+%%     rabbit_auth_backend_ldap evaluates the same query. A query that evaluates
+%%     false is the real misconfiguration signal (the user is not authorized);
+%%     a node still carrying an unfillable per-operation placeholder
+%%     (${vhost}/${resource}/...) is grammar-checked-only and degrades rather
+%%     than failing.
+check_authz_queries(Handle, #{queries := Queries, resolved_user_dn := unknown}) ->
     LiteralDns = lists:usort(
         lists:flatmap(
             fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
             Queries
         )
     ),
-    check_dns(Handle, LiteralDns).
+    check_dns(Handle, LiteralDns);
+check_authz_queries(Handle, #{queries := Queries, resolved_user_dn := UserDn} = Params) ->
+    Username = maps:get(username, Params),
+    Args =
+        [{username, Username}, {user_dn, UserDn}] ++
+            aws_auth_validate_ldap_query:ad_args(Username),
+    eval_queries(Handle, Queries, Args).
 
 check_dns(_Handle, []) ->
     ok;
@@ -657,6 +747,146 @@ check_dns(Handle, [DN | Rest]) ->
         true -> check_dns(Handle, Rest);
         _ -> {error, authz_unverified, ?REASON_AUTHZ_UNVERIFIED}
     end.
+
+%% Evaluate each query for the resolved principal. The first query that is
+%% conclusively false (the user is not authorized by it) wins and maps to
+%% authz_unverified; a query that cannot be evaluated (only unfillable
+%% per-operation placeholders) is skipped. All-pass/all-degrade -> ok.
+eval_queries(_Handle, [], _Args) ->
+    ok;
+eval_queries(Handle, [{_Name, Query} | Rest], Args) ->
+    Filled = aws_auth_validate_ldap_query:fill(Query, Args),
+    UserDn = proplists:get_value(user_dn, Args),
+    case eval_query(Handle, Filled, UserDn) of
+        skip -> eval_queries(Handle, Rest, Args);
+        true -> eval_queries(Handle, Rest, Args);
+        false -> {error, authz_unverified, ?REASON_NOT_MEMBER}
+    end.
+
+%% Evaluate one (already principal-filled) query against the bound handle,
+%% mirroring rabbit_auth_backend_ldap:evaluate0/4 minus the connection/creds
+%% machinery (the bind identity is fixed = the service account; the broker's
+%% as_user path is unreachable since no principal password exists). Returns
+%% `true' | `false' | `skip', where `skip' means the term could not be
+%% evaluated at validation time (an unfillable ${vhost}/${resource}/... DN, or a
+%% sub-result that itself degraded) and must not be treated as a failure.
+%% Composition guards against non-boolean (skipped) sub-results so `not'/`and'/
+%% `or' never badarg the way the broker's raw boolean ops could. UserDn is
+%% threaded through composition so nested membership terms can still evaluate.
+eval_query(_Handle, {constant, Bool}, _UserDn) when is_boolean(Bool) ->
+    Bool;
+eval_query(Handle, {exists, DN}, _UserDn) ->
+    eval_dn_probe(DN, fun(Dn) -> object_exists(Handle, Dn) end);
+eval_query(Handle, {in_group, DN}, UserDn) ->
+    eval_query(Handle, {in_group, DN, "member"}, UserDn);
+eval_query(Handle, {in_group, DN, Desc}, UserDn) ->
+    eval_membership(Handle, DN, Desc, UserDn);
+eval_query(Handle, {in_group_nested, DN}, UserDn) ->
+    eval_query(Handle, {in_group_nested, DN, "member"}, UserDn);
+eval_query(Handle, {in_group_nested, DN, Desc}, UserDn) ->
+    %% Nested membership needs a group-search base the endpoint does not model
+    %% (the broker's group_lookup_base). Rather than search a wrong base, fall
+    %% back to direct membership at the named group -- a safe subset that still
+    %% catches the common "is the user in THIS group" case; deeper nesting
+    %% degrades to that single hop.
+    eval_membership(Handle, DN, Desc, UserDn);
+eval_query(Handle, {in_group_nested, DN, Desc, _Scope}, UserDn) ->
+    eval_membership(Handle, DN, Desc, UserDn);
+eval_query(Handle, {'not', Sub}, UserDn) ->
+    %% Negate only a conclusive sub-result; a skipped sub-result stays skipped.
+    case eval_query(Handle, Sub, UserDn) of
+        skip -> skip;
+        Bool -> not Bool
+    end;
+eval_query(Handle, {'and', Subs}, UserDn) when is_list(Subs) ->
+    eval_and(Handle, Subs, UserDn);
+eval_query(Handle, {'or', Subs}, UserDn) when is_list(Subs) ->
+    eval_or(Handle, Subs, UserDn);
+eval_query(_Handle, _Other, _UserDn) ->
+    %% equals/match/for and any residual shape need per-operation context
+    %% (${vhost}/${resource}/...) or attribute reads the endpoint does not model
+    %% for validation; degrade rather than guess.
+    skip.
+
+%% Conjunction over true/false/skip: any conclusive false short-circuits to
+%% false; otherwise the result is true only if every conjunct is true, else skip
+%% (at least one conjunct degraded).
+eval_and(_Handle, [], _UserDn) ->
+    true;
+eval_and(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        false -> false;
+        skip -> eval_and_skip(Handle, Rest, UserDn);
+        true -> eval_and(Handle, Rest, UserDn)
+    end.
+
+%% After a conjunct degraded, a later conclusive false still makes the whole
+%% `and' false; otherwise it can only be skip (cannot prove all-true).
+eval_and_skip(_Handle, [], _UserDn) ->
+    skip;
+eval_and_skip(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        false -> false;
+        _ -> eval_and_skip(Handle, Rest, UserDn)
+    end.
+
+%% Disjunction over true/false/skip: any conclusive true short-circuits to true;
+%% otherwise false only if every disjunct is false, else skip.
+eval_or(_Handle, [], _UserDn) ->
+    false;
+eval_or(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        true -> true;
+        skip -> eval_or_skip(Handle, Rest, UserDn);
+        false -> eval_or(Handle, Rest, UserDn)
+    end.
+
+eval_or_skip(_Handle, [], _UserDn) ->
+    skip;
+eval_or_skip(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        true -> true;
+        _ -> eval_or_skip(Handle, Rest, UserDn)
+    end.
+
+%% Resolve a (filled) DN to a probe result, degrading when a placeholder
+%% survived (per-operation context we cannot supply).
+eval_dn_probe(DN, Probe) ->
+    case aws_auth_validate_ldap_query:is_evaluable(DN) of
+        true -> Probe(dn_str(DN));
+        false -> skip
+    end.
+
+%% Membership probe mirroring rabbit_auth_backend_ldap in_group/3: a base-scoped
+%% search at the group DN with an equalityMatch on the membership attribute
+%% (default "member") against the resolved user DN. A match means the user is a
+%% member. Distinct from object_exists/2, which only proves the group EXISTS;
+%% reusing that here would wrongly pass a real-but-non-member group. Any
+%% non-{ok,_} collapses to false (never raises -- R6).
+eval_membership(_Handle, _DN, _Desc, undefined) ->
+    %% No resolved principal in scope for this sub-result; degrade.
+    skip;
+eval_membership(Handle, DN, Desc, UserDn) ->
+    eval_dn_probe(DN, fun(GroupDn) -> member_exists(Handle, GroupDn, Desc, UserDn) end).
+
+member_exists(Handle, GroupDn, Desc, UserDn) ->
+    case
+        eldap:search(Handle, [
+            {base, GroupDn},
+            {filter, eldap:equalityMatch(Desc, UserDn)},
+            {attributes, ["objectClass"]},
+            {scope, eldap:baseObject()}
+        ])
+    of
+        {ok, #eldap_search_result{entries = Entries}} ->
+            length(Entries) > 0;
+        _ ->
+            false
+    end.
+
+dn_str({string, Pattern}) -> dn_str(Pattern);
+dn_str(DN) when is_binary(DN) -> binary_to_list(DN);
+dn_str(DN) when is_list(DN) -> DN.
 
 %% Base-scoped existence probe. Mirrors rabbit_auth_backend_ldap:object_exists/3
 %% (base object, present(objectClass) filter) so a DN this returns true for is
