@@ -275,10 +275,10 @@ resolve_cacert(#{ssl_options := SslOpts} = Params) ->
         Arn when is_binary(Arn) ->
             case resolve_arn(Arn) of
                 {ok, PemData} ->
-                    %% pem_entry_decode/1 can raise on a malformed entry; an
-                    %% empty/undecodable PEM returns `skip'. Both mean the ARN
-                    %% does not hold a usable CA cert -- report input_invalid
-                    %% rather than degrading the trust anchor.
+                    %% A malformed PEM can raise during decode; an empty/
+                    %% certless PEM returns `skip'. Both mean the ARN does not
+                    %% hold a usable CA cert -- report input_invalid rather than
+                    %% degrading the trust anchor.
                     try decode_pem_cacerts(PemData) of
                         skip -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID};
                         Certs -> {ok, Params#{ssl_options => SslOpts#{cacerts => Certs}}}
@@ -801,13 +801,19 @@ to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
 to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
 to_version(<<"tlsv1">>) -> tlsv1.
 
-%% Decode PEM data into the decoded cert terms eldap expects under `cacerts'.
-%% Returns `skip' when the data holds no decodable PEM entries (so resolve_cacert/1
-%% can reject it as input_invalid rather than proceeding with an empty trust set).
+%% Decode a CA-bundle PEM into the raw DER binaries ssl's `cacerts' option
+%% expects. eldap has NO special cacerts contract: build_ssl_opts/1's proplist
+%% is handed to eldap:open/2 as {sslopts, _} and to eldap:start_tls/3, both of
+%% which forward it straight to the `ssl' module -- the same ssl httpc uses. ssl
+%% silently ignores decoded #'OTPCertificate'{} records (pem_entry_decode/1
+%% output) as a trust anchor -> unknown_ca -> a spurious tls_failed. So pass raw
+%% DER, exactly as the HTTP backend's decode_pem_cacerts/1 now does. Returns
+%% `skip' when the data holds no certificate entries (so resolve_cacert/1 can
+%% reject it as input_invalid rather than proceeding with an empty trust set).
 decode_pem_cacerts(B) when is_binary(B) ->
-    case public_key:pem_decode(B) of
+    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
         [] -> skip;
-        Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
+        Ders -> Ders
     end.
 
 %%--------------------------------------------------------------------

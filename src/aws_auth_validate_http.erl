@@ -1054,13 +1054,13 @@ os_cacerts() ->
     end.
 
 %% Decode a CA-bundle PEM into the raw DER binaries ssl's {cacerts, _} option
-%% expects. This is DELIBERATELY different from the LDAP backend's identically
-%% named helper: eldap wants pem_entry_decode/1 records, but ssl/httpc wants
-%% DER. Passing decoded #'OTPCertificate'{} records here makes ssl silently
-%% ignore the trust anchor -> unknown_ca -> a spurious tls_failed (see the
-%% custom_ca_under_verify_peer_returns_ok regression guard). Mirror
-%% decode_client_cert/1: take only the 'Certificate' entries, as raw DER. A PEM
-%% with no certificate entry yields no anchor (skip), same as an empty bundle.
+%% expects. Passing decoded #'OTPCertificate'{} records (pem_entry_decode/1
+%% output) makes ssl silently ignore the trust anchor -> unknown_ca -> a
+%% spurious tls_failed (see the custom_ca_under_verify_peer_returns_ok
+%% regression guard). Mirror decode_client_cert/1: take only the 'Certificate'
+%% entries, as raw DER. A PEM with no certificate entry yields no anchor (skip),
+%% same as an empty bundle. The LDAP backend's identically named helper does the
+%% same thing for the same reason -- eldap forwards sslopts to this same ssl.
 decode_pem_cacerts(B) when is_binary(B) ->
     case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
         [] -> skip;
