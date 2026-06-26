@@ -5,21 +5,22 @@
 
 -module(aws_arn_config_oauth2).
 
--export([run/3, run/4]).
+-export([run/4]).
 
 run(ArnData, _KeyStr, https, cacertfile) ->
-    handle_content(cacertfile, ArnData).
-
-run(_KeyStr, providers_https_cacertfile, OAuth2Map) when is_map(OAuth2Map) ->
+    handle_content(cacertfile, ArnData);
+run(_KeyStr, providers_https_cacertfile, OAuth2Map, State) when is_map(OAuth2Map) ->
     % Note:
     % In this case, the ARNs are the values of ArnMap, and the keys
-    % are whatever key is necessary to handle the content
-    F = fun(MapKey, Arn) ->
-        case aws_arn_util:resolve_arn(Arn) of
-            {ok, Content} ->
+    % are whatever key is necessary to handle the content.
+    % maps:fold threads the aws_state() through each ARN resolution so the
+    % updated state (and any refreshed credentials) propagates across entries.
+    F = fun(MapKey, Arn, StateAcc) ->
+        case aws_arn_util:resolve_arn(Arn, StateAcc) of
+            {ok, Content, StateAcc1} ->
                 case handle_oauth2_providers(MapKey, Content) of
                     ok ->
-                        ok;
+                        StateAcc1;
                     Error ->
                         throw({handle_content_error, Error})
                 end;
@@ -28,7 +29,8 @@ run(_KeyStr, providers_https_cacertfile, OAuth2Map) when is_map(OAuth2Map) ->
         end
     end,
     try
-        ok = maps:foreach(F, OAuth2Map)
+        _FinalState = maps:fold(F, State, OAuth2Map),
+        ok
     catch
         throw:{arn_map_error, Error} ->
             Error;
