@@ -148,7 +148,12 @@
     [{datatype, {integer, [{min, 1}, {max, 60000}]}}]}.
 
 %% @doc Required management user tag to access the endpoint (effective
-%% default administrator).
+%% default administrator). This endpoint makes outbound LDAP/network
+%% connections to operator-supplied targets, so any user with the configured
+%% tag can use it to probe reachability of hosts the broker can reach (an SSRF
+%% surface, mitigated by the SSRF filter in aws_auth_validate_ldap). Lowering
+%% this from administrator grants that capability to less-privileged users;
+%% keep it at administrator unless that trade-off is understood.
 {mapping, "aws.auth_validation.required_user_tag", "aws.auth_validation_required_user_tag",
     [{datatype, atom}]}.
 
