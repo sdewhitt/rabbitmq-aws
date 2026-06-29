@@ -198,6 +198,7 @@ ldap_allowed_fields_test() ->
             <<"dn_lookup_base">>,
             <<"dn_lookup_attribute">>,
             <<"username">>,
+            <<"assume_role_arn">>,
             <<"queries">>
         ]
     ].
@@ -464,6 +465,22 @@ ldap_queries_input_test_() ->
             aws_auth_validate_ldap:validate(
                 base_body(#{<<"queries">> => #{<<"tags">> => <<"{bogus_term, 1, 2}">>}})
             )
+        )
+    ].
+
+%% assume_role_arn is optional; a wrong-typed or empty value is rejected in the
+%% pure phase (input_invalid) before any STS AssumeRole call is made. A valid
+%% shape proceeds to the network phase -- not exercised here (needs AWS), but the
+%% bind path is covered in aws_auth_validate_ldap_SUITE.
+ldap_assume_role_arn_input_test_() ->
+    [
+        ?_assertMatch(
+            {error, input_invalid, _},
+            aws_auth_validate_ldap:validate(base_body(#{<<"assume_role_arn">> => 123}))
+        ),
+        ?_assertMatch(
+            {error, input_invalid, _},
+            aws_auth_validate_ldap:validate(base_body(#{<<"assume_role_arn">> => <<>>}))
         )
     ].
 

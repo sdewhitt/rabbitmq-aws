@@ -128,6 +128,8 @@
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+-define(REASON_BAD_ASSUME_ROLE_ARN, <<"assume_role_arn must be a non-empty string">>).
+-define(REASON_ASSUME_ROLE, <<"failed to assume the requested role">>).
 -define(REASON_BAD_DN_LOOKUP_BASE, <<"dn_lookup_base must be a non-empty string">>).
 -define(REASON_BAD_DN_LOOKUP_ATTR, <<"dn_lookup_attribute must be a non-empty string">>).
 -define(REASON_BAD_USERNAME, <<"username must be a non-empty string">>).
@@ -165,6 +167,7 @@ allowed_fields() ->
         <<"dn_lookup_base">>,
         <<"dn_lookup_attribute">>,
         <<"username">>,
+        <<"assume_role_arn">>,
         <<"queries">>
     ].
 
@@ -183,16 +186,72 @@ validate(Body) when is_map(Body) ->
                 {error, _, _} = Err ->
                     Err;
                 ok ->
-                    case resolve_password(Body, Params) of
+                    case resolve_request_state(Params) of
                         {error, _, _} = Err ->
                             Err;
-                        {ok, Params1} ->
-                            case resolve_cacert(Params1) of
-                                {error, _, _} = Err -> Err;
-                                {ok, Params2} -> do_ldap_validate(Params2)
+                        {ok, Params0} ->
+                            case resolve_password(Body, Params0) of
+                                {error, _, _} = Err ->
+                                    Err;
+                                {ok, Params1} ->
+                                    case resolve_cacert(Params1) of
+                                        {error, _, _} = Err -> Err;
+                                        {ok, Params2} -> do_ldap_validate(Params2)
+                                    end
                             end
                     end
             end
+    end.
+
+%% Build the per-request aws_lib state used for every ARN fetch in this request,
+%% assuming a role first when one is in effect. Runs in the network phase, after
+%% all pure input validation has passed, so a malformed request never triggers
+%% an STS AssumeRole call.
+%%
+%% Role precedence (highest first):
+%%   1. a caller-supplied `assume_role_arn' in the request body, or
+%%   2. the operator-configured `aws.arns.assume_role_arn' -- the SAME role the
+%%      plugin already assumes at boot to resolve every configured ARN. Honoring
+%%      it here closes a parity gap: without it the validate endpoint would
+%%      resolve password_arn/cacertfile_arn with the broker's bare ambient role
+%%      even though the operator told the plugin to use a specific role for ARN
+%%      resolution. This is operator config, not caller input, so it raises no
+%%      confused-deputy concern.
+%%   3. otherwise no role is assumed and ARNs resolve with the broker's ambient
+%%      role -- the prior behavior.
+%%
+%% The state is request-local (aws_lib threads credentials per call -- there is
+%% no global singleton to clobber), so an assumed role's credentials are visible
+%% only to this request's ARN resolutions and are discarded when the request ends.
+resolve_request_state(#{assume_role_arn := none} = Params) ->
+    case configured_assume_role_arn() of
+        none -> {ok, Params#{aws_state => aws_lib:new()}};
+        RoleArn -> assume_into_state(RoleArn, Params)
+    end;
+resolve_request_state(#{assume_role_arn := RoleArn} = Params) ->
+    assume_into_state(RoleArn, Params).
+
+assume_into_state(RoleArn, Params) ->
+    case aws_iam:assume_role(RoleArn, aws_lib:new()) of
+        {ok, State} -> {ok, Params#{aws_state => State}};
+        {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
+    end.
+
+%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
+%% read from the same `aws, arn_config' env the boot sequence uses
+%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
+%% when unset.
+configured_assume_role_arn() ->
+    case application:get_env(aws, arn_config) of
+        {ok, ArnConfig} when is_list(ArnConfig) ->
+            case proplists:get_value(assume_role_arn, ArnConfig) of
+                undefined -> none;
+                Arn when is_list(Arn) -> Arn;
+                Arn when is_binary(Arn) -> binary_to_list(Arn);
+                _ -> none
+            end;
+        _ ->
+            none
     end.
 
 %%--------------------------------------------------------------------
@@ -212,7 +271,9 @@ parse_input(Body) ->
         fun parse_dn_lookup_base/2,
         fun parse_dn_lookup_attribute/2,
         fun parse_username/2,
-        fun parse_queries/2
+        fun parse_assume_role_arn/2,
+        fun parse_queries/2,
+        fun limit_literal_dns/2
     ],
     parse_input(Steps, Body, #{timeout => connection_timeout_ms()}).
 
@@ -262,10 +323,10 @@ parse_user_dn(Body, Acc) ->
 %% fetch. The resolved password is added to the params map and never logged
 %% or returned. Validated for shape here (rather than in parse_input) so the
 %% network call stays out of the pure pipeline.
-resolve_password(Body, Params) ->
+resolve_password(Body, #{aws_state := State} = Params) ->
     case maps:get(<<"password_arn">>, Body, undefined) of
         Arn when is_binary(Arn), byte_size(Arn) > 0 ->
-            case resolve_arn(Arn) of
+            case resolve_arn(Arn, State) of
                 {ok, Password} -> {ok, Params#{password => Password}};
                 {error, _} -> {error, input_invalid, ?REASON_ARN_RESOLVE}
             end;
@@ -290,12 +351,12 @@ resolve_password(Body, Params) ->
 %% fetch and could reject an otherwise-valid plaintext config.
 resolve_cacert(#{use_ssl := false, use_starttls := false} = Params) ->
     {ok, Params};
-resolve_cacert(#{ssl_options := SslOpts} = Params) ->
+resolve_cacert(#{ssl_options := SslOpts, aws_state := State} = Params) ->
     case maps:get(<<"cacertfile_arn">>, SslOpts, undefined) of
         undefined ->
             {ok, Params};
         Arn when is_binary(Arn) ->
-            case resolve_arn(Arn) of
+            case resolve_arn(Arn, State) of
                 {ok, PemData} ->
                     %% pem_entry_decode/1 can raise on a malformed entry; an
                     %% empty/undecodable PEM returns `skip'. Both mean the ARN
@@ -420,6 +481,25 @@ parse_username(Body, Acc) ->
             {ok, Acc#{username => binary_to_list(Username)}};
         _ ->
             {error, input_invalid, ?REASON_BAD_USERNAME}
+    end.
+
+%% Optional IAM role ARN to assume before resolving the request's ARNs
+%% (password_arn, ssl_options.cacertfile_arn). When absent we store `none' and
+%% resolution uses the broker's ambient role -- exactly today's behavior. When
+%% present, the network phase derives a per-request aws_lib state with this role
+%% assumed (aws_iam:assume_role/2) and threads it through every ARN fetch, so
+%% the credentials never touch a global singleton and cannot affect any other
+%% request or the broker itself. Shape-validated here in the pure phase; the
+%% actual assume happens in the network phase (resolve_request_state/2), after
+%% all input validation, so a malformed request never triggers an STS call.
+parse_assume_role_arn(Body, Acc) ->
+    case maps:get(<<"assume_role_arn">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{assume_role_arn => none}};
+        Arn when is_binary(Arn), byte_size(Arn) > 0 ->
+            {ok, Acc#{assume_role_arn => binary_to_list(Arn)}};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_ASSUME_ROLE_ARN}
     end.
 
 %% `queries' is an optional object mapping query names (tags, vhost_access,
@@ -764,13 +844,10 @@ check_dn_lookup(Handle, #{dn_lookup_base := Base}) ->
 %%     a node still carrying an unfillable per-operation placeholder
 %%     (${vhost}/${resource}/...) is grammar-checked-only and degrades rather
 %%     than failing.
-check_authz_queries(Handle, #{queries := Queries, resolved_user_dn := unknown}) ->
-    LiteralDns = lists:usort(
-        lists:flatmap(
-            fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
-            Queries
-        )
-    ),
+check_authz_queries(Handle, #{resolved_user_dn := unknown, literal_dns := LiteralDns}) ->
+    %% Probe exactly the literal-DN set computed and bounded by limit_literal_dns/2
+    %% in the pure phase (single source of truth: the count we bound is the count
+    %% we probe), rather than recomputing it here.
     check_dns(Handle, LiteralDns);
 check_authz_queries(Handle, #{queries := Queries, resolved_user_dn := UserDn} = Params) ->
     Username = maps:get(username, Params),
@@ -1081,17 +1158,19 @@ decode_pem_cacerts(B) when is_binary(B) ->
 
 %%--------------------------------------------------------------------
 
-%% Each request builds its own aws_state(); region and credentials are
-%% threaded through that value rather than written to a shared singleton, so
-%% concurrent validations can no longer clobber each other's region and no
-%% lock is needed. R6 is preserved -- resolution runs in the caller process and
-%% the resolved secret is neither logged nor returned (only adapted to the
-%% caller's {ok, Binary} contract). R3 is preserved -- this still runs only
-%% after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
-%% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
-%% two callers expect; the threaded state is request-scoped and discarded here.
-resolve_arn(Arn) when is_binary(Arn) ->
-    State = aws_lib:new(),
+%% Resolve an ARN using the request's threaded aws_state(). The state is built
+%% once per request by resolve_request_state/1 -- a default state (broker's
+%% ambient role) or one with a caller-supplied role assumed -- and is passed to
+%% every ARN fetch in the request. Region and credentials live in that value,
+%% not a shared singleton, so concurrent validations cannot clobber each other
+%% and an assumed role's credentials are confined to this request. R6 is
+%% preserved -- resolution runs in the caller process and the resolved secret is
+%% neither logged nor returned (only adapted to the caller's {ok, Binary}
+%% contract). R3 is preserved -- this still runs only after the pure validation
+%% pipeline. The 3-tuple {ok, Data, State1} from aws_arn_util:resolve_arn/2 is
+%% adapted back to the {ok, Binary} contract the callers expect; the returned
+%% state is request-scoped and discarded here.
+resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
         {error, _} = Error -> Error
