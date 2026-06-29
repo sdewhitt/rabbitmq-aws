@@ -27,8 +27,9 @@
 
 -ifdef(TEST).
 %% Exposed for unit tests: status_for_category/1 maps a backend error category
-%% to an HTTP status, including the catch-all for an unexpected category.
--export([status_for_category/1]).
+%% to an HTTP status, including the catch-all for an unexpected category;
+%% max_body_size/0 resolves the configured body-size limit against its bounds.
+-export([status_for_category/1, max_body_size/0]).
 -endif.
 
 -include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
@@ -302,7 +303,7 @@ feature_enabled() ->
 
 max_body_size() ->
     case application:get_env(aws, auth_validation_max_body_size) of
-        {ok, N} when is_integer(N), N > 0, N =< 10_000_000 -> N;
+        {ok, N} when is_integer(N), N > 0, N =< 1_048_576 -> N;
         _ -> ?DEFAULT_MAX_BODY_SIZE
     end.
 

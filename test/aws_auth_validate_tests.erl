@@ -133,6 +133,50 @@ status_for_category_unknown_test() ->
     ?assertEqual(500, aws_auth_validate_mgmt:status_for_category(some_future_category)).
 
 %%--------------------------------------------------------------------
+%% Mgmt body-size bound
+%%--------------------------------------------------------------------
+
+%% max_body_size/0 honours an in-range configured value and falls back to the
+%% effective default for anything outside 1..1_048_576 (the 1 MB ceiling). The
+%% effective default (65_536) is asserted indirectly via the out-of-range cases.
+max_body_size_bound_test_() ->
+    {foreach, fun() -> application:unset_env(aws, auth_validation_max_body_size) end,
+        fun(_) -> application:unset_env(aws, auth_validation_max_body_size) end, [
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 4096),
+                ?assertEqual(4096, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% The ceiling itself is accepted.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 1_048_576),
+                ?assertEqual(1_048_576, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% One byte over the ceiling falls back to the default.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 1_048_577),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% The old 10 MB ceiling is now out of range and falls back.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 10_000_000),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% Non-positive and non-integer values fall back too.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 0),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, not_an_integer),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% Unset reads as the default.
+            fun() ->
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end
+        ]}.
+
+%%--------------------------------------------------------------------
 %% LDAP backend (input parsing only - the real bind path needs slapd)
 %%--------------------------------------------------------------------
 
