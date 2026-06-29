@@ -549,6 +549,7 @@ tls_body(CacertArn) ->
 %%--------------------------------------------------------------------
 
 parse_accepts_test_() ->
+    ok = ensure_query_vocabulary_interned(),
     [
         ?_assertMatch({ok, _}, aws_auth_validate_ldap_query:parse(Q))
      || Q <- accepted_queries()
@@ -562,6 +563,35 @@ parse_rejects_test_() ->
 
 parse_accepts_string_input_test() ->
     ?assertMatch({ok, _}, aws_auth_validate_ldap_query:parse("{constant, true}")).
+
+%% Atom-exhaustion guard: the query string is attacker-controlled, so parsing
+%% must never intern a new atom. A query naming an atom the broker has never
+%% interned is rejected, and crucially the rejection creates zero atoms (the
+%% old erl_scan:string/1 path interned one atom per distinct identifier).
+
+parse_rejects_unknown_atom_does_not_intern_test() ->
+    %% A syntactically valid term whose tag atom does not exist in the VM.
+    Q = <<"[{zzz_phantom_tag_never_interned, {constant, true}}]">>,
+    Before = erlang:system_info(atom_count),
+    Result = aws_auth_validate_ldap_query:parse(Q),
+    After = erlang:system_info(atom_count),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual(0, After - Before).
+
+parse_rejects_atom_flood_without_interning_test() ->
+    %% Many distinct never-seen atoms in one query: the pre-safe-lexer code
+    %% would have interned one atom each. Assert the whole batch is rejected
+    %% and not a single atom is created.
+    Atoms = [
+        unicode:characters_to_binary(["zzz_flood_atom_", integer_to_list(N)])
+     || N <- lists:seq(1, 500)
+    ],
+    Q = <<"[", (iolist_to_binary(lists:join(<<", ">>, Atoms)))/binary, "]">>,
+    Before = erlang:system_info(atom_count),
+    Result = aws_auth_validate_ldap_query:parse(Q),
+    After = erlang:system_info(atom_count),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual(0, After - Before).
 
 %% Literal DN extraction (the placeholder-free DNs used for static reachability)
 
@@ -596,6 +626,7 @@ literal_dns_nested_and_or_test() ->
     ).
 
 literal_dns_tag_queries_test() ->
+    ok = ensure_query_vocabulary_interned(),
     {ok, Q} = aws_auth_validate_ldap_query:parse(
         <<"[{administrator, {in_group, \"cn=admins,dc=x\"}}, {management, {constant, true}}]">>
     ),
@@ -611,6 +642,7 @@ literal_dns_exists_test() ->
     ).
 
 literal_dns_for_test() ->
+    ok = ensure_query_vocabulary_interned(),
     {ok, Q} = aws_auth_validate_ldap_query:parse(
         <<"{for, [{permission, configure, {in_group, \"cn=cfg,dc=x\"}}]}">>
     ),
@@ -687,6 +719,39 @@ upstream_parser_usable() ->
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+%% The query DSL parser tokenizes via the safe, non-interning lexer, so it
+%% only accepts atoms that ALREADY exist in the VM. A running broker has
+%% interned the whole legitimate vocabulary -- grammar keywords (from the
+%% parser module itself), the configure/write/read permissions and the
+%% for-query variable names (from core rabbit and rabbit_auth_backend_ldap),
+%% the in_group_nested scopes, and every configured user tag. The bare eunit
+%% node has executed almost none of that code, so those atoms are absent and a
+%% legitimate query would be wrongly rejected here (but NOT in production).
+%% Reference the vocabulary the corpus exercises as literals so the test node
+%% mirrors a running broker. This list is test scaffolding, not a parser
+%% allowlist: the parser accepts ANY already-interned atom (open tag set),
+%% exactly as the broker does.
+ensure_query_vocabulary_interned() ->
+    %% list_to_atom/1 unconditionally interns, which is exactly what a running
+    %% broker has already done for this vocabulary through normal operation.
+    %% (A literal atom list would only intern at THIS module's load time, which
+    %% eunit does not guarantee precedes the parser's list_to_existing_atom/1
+    %% check; list_to_atom/1 is unambiguous.)
+    _ = [
+        list_to_atom(A)
+     || A <- [
+            %% permissions
+            "configure", "write", "read",
+            %% for-query variable names
+            "username", "user_dn", "vhost", "resource", "name", "permission",
+            %% in_group_nested scopes
+            "subtree", "singlelevel", "single_level", "onelevel", "one_level",
+            %% the specific tags the accepted-query corpus references
+            "administrator", "management"
+        ]
+    ],
+    ok.
 
 stop(Pid) ->
     unlink(Pid),

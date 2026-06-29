@@ -35,6 +35,13 @@
 
 %% Parse one query expression. Accepts the same top-level term shapes as the
 %% broker's parse_query/1. Returns the parsed Erlang term on success.
+%%
+%% Tokenization goes through aws_auth_validate_ldap_query_lexer (a safe,
+%% non-interning lexer), NOT erl_scan:string/1. The query string is
+%% attacker-controlled, and erl_scan interns an atom per distinct identifier;
+%% the safe lexer resolves atoms with list_to_existing_atom/1 instead, so a
+%% query referencing an atom the broker has never interned is rejected rather
+%% than permanently growing the atom table. See the lexer module for detail.
 -spec parse(binary() | string()) -> {ok, query()} | {error, binary()}.
 parse(Query) when is_binary(Query) ->
     parse(unicode:characters_to_list(Query, utf8));
@@ -65,7 +72,11 @@ fixup(Query0) ->
     end.
 
 scan(Str) ->
-    case erl_scan:string(Str) of
+    %% Safe, non-interning tokenizer: an atom that does not already exist makes
+    %% the lexer return {error, ...} rather than minting it (see the lexer
+    %% module). The token shape is identical to erl_scan's, so the downstream
+    %% erl_parse:parse_term/1 is unchanged.
+    case aws_auth_validate_ldap_query_lexer:string(Str) of
         {ok, Tokens, _EndLine} -> {ok, Tokens};
         {error, _Info, _Loc} -> {error, scan_failed}
     end.
