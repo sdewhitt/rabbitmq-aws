@@ -44,8 +44,12 @@
 %% A second user, used as a group member / DN-lookup target.
 -define(ALICE_DN, "cn=alice,ou=people,dc=rabbitmq,dc=com").
 -define(ALICE_PW, "alice-password").
-%% A group that really exists (for authz query reachability checks).
+%% A group that really exists (for authz query reachability checks). Both svc
+%% and alice are members.
 -define(ADMINS_GROUP_DN, "cn=admins,ou=groups,dc=rabbitmq,dc=com").
+%% A group that exists but does NOT include alice (only svc), for the negative
+%% membership case.
+-define(OTHERS_GROUP_DN, "cn=others,ou=groups,dc=rabbitmq,dc=com").
 %% A group that does NOT exist (for the negative authz case).
 -define(MISSING_GROUP_DN, "cn=does-not-exist,ou=groups,dc=rabbitmq,dc=com").
 
@@ -73,6 +77,12 @@ groups() ->
             authz_query_existing_group_returns_ok,
             authz_query_missing_group_returns_authz_unverified,
             authz_query_runtime_placeholder_returns_ok,
+            username_in_group_returns_ok,
+            username_in_group_placeholder_dn_returns_ok,
+            username_not_in_group_returns_authz_unverified,
+            username_unresolvable_returns_authz_unverified,
+            username_runtime_placeholder_degrades_returns_ok,
+            username_membership_parity_with_backend,
             parity_with_backend_bind
         ]}
     ].
@@ -251,13 +261,147 @@ authz_query_missing_group_returns_authz_unverified(Config) ->
     ?assertMatch({error, authz_unverified, _}, validate(Config, Body)).
 
 %% A query whose only DN contains a ${...} placeholder has no literal DN to
-%% check, so it passes (grammar-validated, not directory-checked).
+%% check, so it passes (grammar-validated, not directory-checked). NOTE: this
+%% case supplies NO username, so it exercises the unchanged literal-DN path --
+%% a backward-compatibility guard for the new username feature below.
 authz_query_runtime_placeholder_returns_ok(Config) ->
     Query = <<"{in_group, \"cn=${username},ou=groups,dc=rabbitmq,dc=com\"}">>,
     Body = (base_body(Config))#{
         <<"queries">> => #{<<"tags">> => Query}
     },
     ?assertEqual(ok, validate(Config, Body)).
+
+%%--------------------------------------------------------------------
+%% Authorization query EVALUATION (username supplied)
+%%--------------------------------------------------------------------
+%% These supply a `username', so the endpoint resolves it to a DN over the
+%% bound service handle and evaluates membership -- not just reachability.
+
+%% alice IS a member of cn=admins (member=[svc,alice]); a literal in_group on
+%% that group, evaluated for username=alice, returns ok.
+username_in_group_returns_ok(Config) ->
+    Query = list_to_binary("{in_group, \"" ++ ?ADMINS_GROUP_DN ++ "\"}"),
+    Body = (base_body(Config))#{
+        <<"username">> => <<"alice">>,
+        <<"dn_lookup_base">> => list_to_binary(?PEOPLE_OU),
+        <<"dn_lookup_attribute">> => <<"cn">>,
+        <<"queries">> => #{<<"vhost_access">> => Query}
+    },
+    ?assertEqual(ok, validate(Config, Body)).
+
+%% A ${username} placeholder DN that the broker would fill: with username=alice
+%% it resolves to cn=alice,ou=people and is a real entry, so membership against
+%% admins (filled DN) is evaluated and returns ok. Proves the fill + resolve +
+%% equalityMatch(member, userDN) path, not mere reachability.
+username_in_group_placeholder_dn_returns_ok(Config) ->
+    Query = <<"{in_group, \"cn=admins,ou=groups,dc=rabbitmq,dc=com\"}">>,
+    Body = (base_body(Config))#{
+        <<"username">> => <<"alice">>,
+        <<"dn_lookup_base">> => list_to_binary(?PEOPLE_OU),
+        <<"dn_lookup_attribute">> => <<"cn">>,
+        <<"queries">> => #{<<"tags">> => Query}
+    },
+    ?assertEqual(ok, validate(Config, Body)).
+
+%% alice is NOT a member of cn=others (member=[svc] only); evaluating membership
+%% for username=alice returns authz_unverified even though the group exists.
+username_not_in_group_returns_authz_unverified(Config) ->
+    Query = list_to_binary("{in_group, \"" ++ ?OTHERS_GROUP_DN ++ "\"}"),
+    Body = (base_body(Config))#{
+        <<"username">> => <<"alice">>,
+        <<"dn_lookup_base">> => list_to_binary(?PEOPLE_OU),
+        <<"dn_lookup_attribute">> => <<"cn">>,
+        <<"queries">> => #{<<"vhost_access">> => Query}
+    },
+    ?assertMatch({error, authz_unverified, _}, validate(Config, Body)).
+
+%% A username with no matching directory entry cannot be resolved to a single
+%% DN, so the endpoint returns authz_unverified (deliberate divergence from the
+%% broker's silent escaped-DN fallback: surface the misconfiguration).
+username_unresolvable_returns_authz_unverified(Config) ->
+    Query = list_to_binary("{in_group, \"" ++ ?ADMINS_GROUP_DN ++ "\"}"),
+    Body = (base_body(Config))#{
+        <<"username">> => <<"ghost">>,
+        <<"dn_lookup_base">> => list_to_binary(?PEOPLE_OU),
+        <<"dn_lookup_attribute">> => <<"cn">>,
+        <<"queries">> => #{<<"vhost_access">> => Query}
+    },
+    ?assertMatch({error, authz_unverified, _}, validate(Config, Body)).
+
+%% A DN keyed on per-operation context (${vhost}) cannot be filled even with a
+%% username, so that query node degrades (grammar-checked only) and the request
+%% still succeeds -- graceful degradation, not a hard failure.
+username_runtime_placeholder_degrades_returns_ok(Config) ->
+    Query = <<"{in_group, \"cn=admins,ou=${vhost},dc=rabbitmq,dc=com\"}">>,
+    Body = (base_body(Config))#{
+        <<"username">> => <<"alice">>,
+        <<"dn_lookup_base">> => list_to_binary(?PEOPLE_OU),
+        <<"dn_lookup_attribute">> => <<"cn">>,
+        <<"queries">> => #{<<"vhost_access">> => Query}
+    },
+    ?assertEqual(ok, validate(Config, Body)).
+
+%% R11/R12 membership parity: the endpoint's in_group decision for a resolved
+%% principal must match a direct eldap equalityMatch(member, userDN) search --
+%% the same primitive rabbit_auth_backend_ldap:in_group/3 runs. Check both the
+%% positive (admins) and negative (others) group for alice.
+username_membership_parity_with_backend(Config) ->
+    Port = ?config(ldap_port, Config),
+    AliceDn = ?ALICE_DN,
+    Cases = [
+        {?ADMINS_GROUP_DN, true},
+        {?OTHERS_GROUP_DN, false}
+    ],
+    [
+        begin
+            Query = list_to_binary("{in_group, \"" ++ GroupDn ++ "\"}"),
+            Body = (base_body(Config))#{
+                <<"username">> => <<"alice">>,
+                <<"dn_lookup_base">> => list_to_binary(?PEOPLE_OU),
+                <<"dn_lookup_attribute">> => <<"cn">>,
+                <<"queries">> => #{<<"vhost_access">> => Query}
+            },
+            EndpointOk =
+                case validate(Config, Body) of
+                    ok -> true;
+                    {error, authz_unverified, _} -> false
+                end,
+            BackendOk = direct_member(Port, GroupDn, AliceDn),
+            ?assertEqual(
+                Expected,
+                EndpointOk,
+                lists:flatten(io_lib:format("endpoint membership for ~ts", [GroupDn]))
+            ),
+            ?assertEqual(
+                BackendOk,
+                EndpointOk,
+                lists:flatten(io_lib:format("membership parity for ~ts", [GroupDn]))
+            )
+        end
+     || {GroupDn, Expected} <- Cases
+    ],
+    ok.
+
+%% Direct base-scoped equalityMatch(member, UserDN) at the group DN -- the
+%% broker's in_group primitive -- bound as the rootdn.
+direct_member(Port, GroupDn, UserDn) ->
+    {ok, H} = eldap:open(["localhost"], [{port, Port}]),
+    ok = eldap:simple_bind(H, ?ADMIN_DN, ?ADMIN_PW),
+    Result =
+        case
+            eldap:search(H, [
+                {base, GroupDn},
+                {filter, eldap:equalityMatch("member", UserDn)},
+                {attributes, ["objectClass"]},
+                {scope, eldap:baseObject()}
+            ])
+        of
+            {ok, {eldap_search_result, Entries, _Ref, _Ctrls}} -> length(Entries) > 0;
+            {ok, {eldap_search_result, Entries, _Ref}} -> length(Entries) > 0;
+            _ -> false
+        end,
+    catch eldap:close(H),
+    Result.
 
 %%--------------------------------------------------------------------
 %% R12: parity with the broker's bind path
@@ -395,6 +539,13 @@ seed(Port) ->
             {"cn", ["admins"]},
             {"member", [?BIND_DN, ?ALICE_DN]}
         ]),
+        %% A group alice is NOT a member of (only svc), for the negative
+        %% membership case.
+        ok = add(H, ?OTHERS_GROUP_DN, [
+            {"objectClass", ["groupOfNames"]},
+            {"cn", ["others"]},
+            {"member", [?BIND_DN]}
+        ]),
         ok
     after
         catch eldap:close(H)
@@ -406,6 +557,7 @@ delete_seed(Port) ->
         [
             del(H, DN)
          || DN <- [
+                ?OTHERS_GROUP_DN,
                 ?ADMINS_GROUP_DN,
                 ?ALICE_DN,
                 ?BIND_DN,
