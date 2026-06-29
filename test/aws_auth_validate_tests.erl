@@ -4,9 +4,9 @@
 %% -*- mode: erlang; -*-
 
 %% Unit tests for the auth-validation subsystem's pure modules: semaphore,
-%% ARN-resolution lock, registry, the LDAP backend's input parsing, and the
-%% LDAP query DSL parser (incl. upstream parity). The live bind/connect/TLS
-%% path lives in aws_auth_validate_ldap_SUITE; the HTTP pipeline lives in
+%% registry, the LDAP backend's input parsing, and the LDAP query DSL parser
+%% (incl. upstream parity). The live bind/connect/TLS path lives in
+%% aws_auth_validate_ldap_SUITE; the HTTP pipeline lives in
 %% aws_auth_validate_mgmt_SUITE.
 -module(aws_auth_validate_tests).
 
@@ -61,42 +61,6 @@ semaphore_crashed_holder_test_() ->
         end}.
 
 %%--------------------------------------------------------------------
-%% ARN resolution lock
-%%--------------------------------------------------------------------
-
-%% The lock is now a global:trans/4 lock with no server process, so there is
-%% nothing to start or stop -- with_lock/1 is callable directly. These cases
-%% exercise OUR wrapper's contract: it returns the closure's value, propagates
-%% an exception to the caller, and releases the lock even when the closure
-%% crashes.
-%%
-%% We deliberately do NOT unit-test that concurrent callers are serialized.
-%% Serialization is a property of global:trans/4 (OTP stdlib), which rabbit
-%% itself relies on in production (feature-flag state changes, stream
-%% coordinator startup) without unit-testing it. A timing/overlap probe of it
-%% is non-deterministic across the OTP matrix -- it passed on OTP 28 but
-%% failed intermittently on OTP 27 in CI (global's scheduling of competing
-%% set_lock waiters is not guaranteed in wall-clock terms), testing the
-%% library rather than our 3-line wrapper. See [[ci-failure-gotchas]]:
-%% timing-based concurrency assertions do not belong in this suite.
-arn_lock_test_() ->
-    [
-        {"returns the closure's value", fun() ->
-            ?assertEqual(42, aws_auth_validate_arn_lock:with_lock(fun() -> 42 end))
-        end},
-        {"propagates the closure's exception to the caller", fun() ->
-            ?assertError(
-                boom,
-                aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end)
-            )
-        end},
-        {"releases the lock after a crashing closure (next call still works)", fun() ->
-            catch aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end),
-            ?assertEqual(ok, aws_auth_validate_arn_lock:with_lock(fun() -> ok end))
-        end}
-    ].
-
-%%--------------------------------------------------------------------
 %% Registry
 %%--------------------------------------------------------------------
 
@@ -148,6 +112,67 @@ registry_field_filter_override_test_() ->
                 ?assert(lists:member(<<"servers">>, Effective)),
                 ?assert(lists:member(<<"port">>, Effective)),
                 ?assertNot(lists:member(<<"unknown">>, Effective))
+            end
+        ]}.
+
+%%--------------------------------------------------------------------
+%% Mgmt status mapping
+%%--------------------------------------------------------------------
+
+status_for_category_known_test() ->
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(input_invalid)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(connection_failed)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(tls_failed)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(query_invalid)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(auth_failed)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(config_conflict)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(authz_unverified)).
+
+%% A category outside the documented set maps to 500 rather than crashing.
+status_for_category_unknown_test() ->
+    ?assertEqual(500, aws_auth_validate_mgmt:status_for_category(some_future_category)).
+
+%%--------------------------------------------------------------------
+%% Mgmt body-size bound
+%%--------------------------------------------------------------------
+
+%% max_body_size/0 honours an in-range configured value and falls back to the
+%% effective default for anything outside 1..1_048_576 (the 1 MB ceiling). The
+%% effective default (65_536) is asserted indirectly via the out-of-range cases.
+max_body_size_bound_test_() ->
+    {foreach, fun() -> application:unset_env(aws, auth_validation_max_body_size) end,
+        fun(_) -> application:unset_env(aws, auth_validation_max_body_size) end, [
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 4096),
+                ?assertEqual(4096, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% The ceiling itself is accepted.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 1_048_576),
+                ?assertEqual(1_048_576, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% One byte over the ceiling falls back to the default.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 1_048_577),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% The old 10 MB ceiling is now out of range and falls back.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 10_000_000),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% Non-positive and non-integer values fall back too.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 0),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, not_an_integer),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% Unset reads as the default.
+            fun() ->
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
             end
         ]}.
 
@@ -231,6 +256,21 @@ server_blocks_ipv6_link_local_test() ->
 server_blocks_ipv4_mapped_imds_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::ffff:169.254.169.254")).
 
+%% NAT64 (64:ff9b::/96) embeds a v4 address; on a host with a NAT64/DNS64
+%% resolver 64:ff9b::169.254.169.254 translates to IMDS, so it must be blocked.
+server_blocks_nat64_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("64:ff9b::169.254.169.254")).
+
+%% NAT64 wrapping a public v4 stays allowed: the embedded address, not the
+%% prefix, decides.
+server_allows_nat64_public_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("64:ff9b::8.8.8.8")).
+
+%% 240.0.0.0/4 (reserved/Class E) and the 255.255.255.255 limited broadcast.
+server_blocks_reserved_and_broadcast_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("240.0.0.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("255.255.255.255")).
+
 server_rejects_unresolvable_test() ->
     ?assertEqual(
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
@@ -269,6 +309,16 @@ peer_allowed_rebound_to_v6_imds_blocked_test() ->
     ?assertEqual(
         blocked,
         aws_auth_validate_ldap:peer_allowed({ok, {{16#fd00, 16#0ec2, 0, 0, 0, 0, 0, 16#254}, 636}})
+    ).
+
+%% A peer that rebound to NAT64-wrapped IMDS (64:ff9b::169.254.169.254) must be
+%% caught on the live socket.
+peer_allowed_rebound_to_nat64_imds_blocked_test() ->
+    ?assertEqual(
+        blocked,
+        aws_auth_validate_ldap:peer_allowed(
+            {ok, {{16#0064, 16#ff9b, 0, 0, 0, 0, 16#a9fe, 16#a9fe}, 389}}
+        )
     ).
 
 %% Fail closed: an undeterminable peer (peername error) is treated as blocked.
@@ -417,6 +467,47 @@ ldap_queries_input_test_() ->
         )
     ].
 
+%% The literal-DN probe budget (?MAX_LITERAL_DNS = 100) is enforced in the pure
+%% phase, before any secret fetch or connection. resolve_arn is mocked to fail
+%% so the at-limit case (which passes the budget gate) cannot dial out; the
+%% over-limit case is rejected before resolve_arn is ever reached.
+ldap_literal_dn_budget_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, mocked} end),
+            ok
+        end,
+        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
+            Over = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(101)}}),
+            AtLimit = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(100)}}),
+            [
+                %% 101 distinct literal DNs is rejected with the specific
+                %% too-many reason in the pure phase.
+                ?_assertEqual(
+                    {error, input_invalid,
+                        <<"authorization queries reference too many distinct literal DNs to verify">>},
+                    aws_auth_validate_ldap:validate(Over)
+                ),
+                %% Exactly 100 passes the budget gate and proceeds to password-
+                %% ARN resolution (mocked to fail), so the result is the ARN-
+                %% resolve failure, NOT the too-many-DNs reason.
+                ?_assertEqual(
+                    {error, input_invalid, <<"failed to resolve ARN">>},
+                    aws_auth_validate_ldap:validate(AtLimit)
+                )
+            ]
+        end}.
+
+%% Build an `or' query of N distinct {in_group, DN} terms, yielding N distinct
+%% literal DNs.
+or_in_group_query(N) ->
+    Terms = [
+        lists:flatten(io_lib:format("{in_group, \"cn=g~b,dc=example,dc=com\"}", [I]))
+     || I <- lists:seq(1, N)
+    ],
+    list_to_binary("{'or', [" ++ string:join(Terms, ", ") ++ "]}").
+
 %%--------------------------------------------------------------------
 %% R6: password must never reach a crash report / log, even on a raise
 %%--------------------------------------------------------------------
@@ -438,11 +529,9 @@ ldap_bind_raise_does_not_leak_password_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
-            ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
-            %% with_lock just runs the closure inline for the test.
-            meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
-            %% Resolve any ARN to our sentinel password.
-            meck:expect(aws_arn_util, resolve_arn, fun(_) -> {ok, ?SECRET} end),
+            %% Resolve any ARN to our sentinel password. resolve_arn/2 threads
+            %% the passed aws_lib:aws_state() back in the success 3-tuple.
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
             %% open() succeeds, then simple_bind/3 RAISES with the password
             %% present in the failing call's arguments -- the worst case for a
             %% crash-report leak.
@@ -455,8 +544,7 @@ ldap_bind_raise_does_not_leak_password_test_() ->
         end,
         fun(_) ->
             meck:unload(eldap),
-            meck:unload(aws_arn_util),
-            meck:unload(aws_auth_validate_arn_lock)
+            meck:unload(aws_arn_util)
         end,
         fun(_) ->
             Body = bind_body(),
@@ -501,8 +589,6 @@ cacert_arn_resolution_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
-            ok = meck:new(aws_auth_validate_arn_lock, [passthrough]),
-            meck:expect(aws_auth_validate_arn_lock, with_lock, fun(F) -> F() end),
             %% Keep the suite hermetic: the TLS-off case reaches the connect
             %% path, so stub eldap:open to fail fast instead of dialling out.
             meck:expect(eldap, open, fun(_Servers, _Opts) -> {error, refused} end),
@@ -511,16 +597,15 @@ cacert_arn_resolution_test_() ->
         end,
         fun(_) ->
             meck:unload(eldap),
-            meck:unload(aws_auth_validate_arn_lock),
             meck:unload(aws_arn_util)
         end,
         [
             {"unresolvable CA-cert ARN -> input_invalid (no silent verify_none)", fun() ->
                 %% Password ARN resolves; CA-cert ARN does not.
-                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
                         true -> {error, not_found};
-                        false -> {ok, <<"pw">>}
+                        false -> {ok, <<"pw">>, State}
                     end
                 end),
                 ?assertMatch(
@@ -529,10 +614,10 @@ cacert_arn_resolution_test_() ->
                 )
             end},
             {"CA-cert ARN resolving to non-PEM data -> input_invalid", fun() ->
-                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
-                        true -> {ok, <<"this is not a PEM certificate">>};
-                        false -> {ok, <<"pw">>}
+                        true -> {ok, <<"this is not a PEM certificate">>, State};
+                        false -> {ok, <<"pw">>, State}
                     end
                 end),
                 ?assertMatch(
@@ -548,10 +633,10 @@ cacert_arn_resolution_test_() ->
                 %% fails loudly if resolve_cacert/1 runs it; the password ARN
                 %% resolves normally. The bind is then left to fail at connect
                 %% (8.8.8.8:389), which is NOT input_invalid.
-                meck:expect(aws_arn_util, resolve_arn, fun(Arn) ->
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
                         true -> erlang:error(cacert_resolved_with_tls_off);
-                        false -> {ok, <<"pw">>}
+                        false -> {ok, <<"pw">>, State}
                     end
                 end),
                 Result = aws_auth_validate_ldap:validate(
@@ -575,6 +660,7 @@ tls_body(CacertArn) ->
 %%--------------------------------------------------------------------
 
 parse_accepts_test_() ->
+    ok = ensure_query_vocabulary_interned(),
     [
         ?_assertMatch({ok, _}, aws_auth_validate_ldap_query:parse(Q))
      || Q <- accepted_queries()
@@ -588,6 +674,35 @@ parse_rejects_test_() ->
 
 parse_accepts_string_input_test() ->
     ?assertMatch({ok, _}, aws_auth_validate_ldap_query:parse("{constant, true}")).
+
+%% Atom-exhaustion guard: the query string is attacker-controlled, so parsing
+%% must never intern a new atom. A query naming an atom the broker has never
+%% interned is rejected, and crucially the rejection creates zero atoms (the
+%% old erl_scan:string/1 path interned one atom per distinct identifier).
+
+parse_rejects_unknown_atom_does_not_intern_test() ->
+    %% A syntactically valid term whose tag atom does not exist in the VM.
+    Q = <<"[{zzz_phantom_tag_never_interned, {constant, true}}]">>,
+    Before = erlang:system_info(atom_count),
+    Result = aws_auth_validate_ldap_query:parse(Q),
+    After = erlang:system_info(atom_count),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual(0, After - Before).
+
+parse_rejects_atom_flood_without_interning_test() ->
+    %% Many distinct never-seen atoms in one query: the pre-safe-lexer code
+    %% would have interned one atom each. Assert the whole batch is rejected
+    %% and not a single atom is created.
+    Atoms = [
+        unicode:characters_to_binary(["zzz_flood_atom_", integer_to_list(N)])
+     || N <- lists:seq(1, 500)
+    ],
+    Q = <<"[", (iolist_to_binary(lists:join(<<", ">>, Atoms)))/binary, "]">>,
+    Before = erlang:system_info(atom_count),
+    Result = aws_auth_validate_ldap_query:parse(Q),
+    After = erlang:system_info(atom_count),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual(0, After - Before).
 
 %% Literal DN extraction (the placeholder-free DNs used for static reachability)
 
@@ -622,6 +737,7 @@ literal_dns_nested_and_or_test() ->
     ).
 
 literal_dns_tag_queries_test() ->
+    ok = ensure_query_vocabulary_interned(),
     {ok, Q} = aws_auth_validate_ldap_query:parse(
         <<"[{administrator, {in_group, \"cn=admins,dc=x\"}}, {management, {constant, true}}]">>
     ),
@@ -637,6 +753,7 @@ literal_dns_exists_test() ->
     ).
 
 literal_dns_for_test() ->
+    ok = ensure_query_vocabulary_interned(),
     {ok, Q} = aws_auth_validate_ldap_query:parse(
         <<"{for, [{permission, configure, {in_group, \"cn=cfg,dc=x\"}}]}">>
     ),
@@ -860,6 +977,51 @@ upstream_parser_usable() ->
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+%% The query DSL parser tokenizes via the safe, non-interning lexer, so it
+%% only accepts atoms that ALREADY exist in the VM. A running broker has
+%% interned the whole legitimate vocabulary -- grammar keywords (from the
+%% parser module itself), the configure/write/read permissions and the
+%% for-query variable names (from core rabbit and rabbit_auth_backend_ldap),
+%% the in_group_nested scopes, and every configured user tag. The bare eunit
+%% node has executed almost none of that code, so those atoms are absent and a
+%% legitimate query would be wrongly rejected here (but NOT in production).
+%% Reference the vocabulary the corpus exercises as literals so the test node
+%% mirrors a running broker. This list is test scaffolding, not a parser
+%% allowlist: the parser accepts ANY already-interned atom (open tag set),
+%% exactly as the broker does.
+ensure_query_vocabulary_interned() ->
+    %% list_to_atom/1 unconditionally interns, which is exactly what a running
+    %% broker has already done for this vocabulary through normal operation.
+    %% (A literal atom list would only intern at THIS module's load time, which
+    %% eunit does not guarantee precedes the parser's list_to_existing_atom/1
+    %% check; list_to_atom/1 is unambiguous.)
+    _ = [
+        list_to_atom(A)
+     || A <- [
+            %% permissions
+            "configure",
+            "write",
+            "read",
+            %% for-query variable names
+            "username",
+            "user_dn",
+            "vhost",
+            "resource",
+            "name",
+            "permission",
+            %% in_group_nested scopes
+            "subtree",
+            "singlelevel",
+            "single_level",
+            "onelevel",
+            "one_level",
+            %% the specific tags the accepted-query corpus references
+            "administrator",
+            "management"
+        ]
+    ],
+    ok.
 
 stop(Pid) ->
     unlink(Pid),

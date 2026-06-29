@@ -55,6 +55,16 @@
 
 -define(DEFAULT_TIMEOUT_MS, 5_000).
 
+%% Upper bound on the number of distinct literal DNs probed in one request.
+%% Each literal DN is one base-scoped eldap:search bounded by the request
+%% timeout (default 5s, max 60s), and all probes run sequentially while holding
+%% a semaphore permit, so an unbounded set would let a single request pin a
+%% permit for a long time and starve the bounded pool. A legitimate config has
+%% a handful of literal group DNs across the four query types; 100 is well above
+%% that. Enforced in the pure (network-free) phase, so an over-budget request is
+%% rejected before any secret fetch or outbound connection.
+-define(MAX_LITERAL_DNS, 100).
+
 %% Accepted query names within the `queries' object. Mirrors the broker's
 %% auth_ldap.queries.* config keys.
 -define(QUERY_NAMES, [
@@ -124,6 +134,9 @@
 -define(REASON_BAD_QUERIES, <<"queries must be an object of query strings">>).
 -define(REASON_BAD_QUERY_VALUE, <<"each query must be a non-empty string">>).
 -define(REASON_QUERY_PARSE, <<"one or more authorization queries are not valid">>).
+-define(REASON_TOO_MANY_LITERAL_DNS,
+    <<"authorization queries reference too many distinct literal DNs to verify">>
+).
 -define(REASON_DN_LOOKUP_BASE_UNVERIFIED,
     <<"dn_lookup_base does not exist or is not readable by the bind user">>
 ).
@@ -447,6 +460,27 @@ parse_query_map([{Name, Value} | Rest], Acc, Parsed) ->
             end
     end.
 
+%% Compute the distinct literal DNs the authz queries will make us probe and
+%% reject the request if there are too many (see ?MAX_LITERAL_DNS). Runs in the
+%% pure phase, after parse_queries/2, so an over-budget request never resolves a
+%% secret or opens a connection. The computed set is stored so check_authz_
+%% queries/2 probes exactly this set rather than recomputing it (single source
+%% of truth: the count we bound is the count we probe).
+limit_literal_dns(_Body, #{queries := Queries} = Acc) ->
+    LiteralDns = literal_dns(Queries),
+    case length(LiteralDns) > ?MAX_LITERAL_DNS of
+        true -> {error, input_invalid, ?REASON_TOO_MANY_LITERAL_DNS};
+        false -> {ok, Acc#{literal_dns => LiteralDns}}
+    end.
+
+literal_dns(Queries) ->
+    lists:usort(
+        lists:flatmap(
+            fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
+            Queries
+        )
+    ).
+
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
 %% Server address validation: resolve the hostname and reject addresses in
@@ -494,6 +528,8 @@ is_private_ip({192, 168, _, _}) -> true;
 is_private_ip({169, 254, _, _}) -> true;
 is_private_ip({100, B, _, _}) when B >= 64, B =< 127 -> true;
 is_private_ip({0, _, _, _}) -> true;
+%% 240.0.0.0/4 (reserved/Class E, including 255.255.255.255 limited broadcast).
+is_private_ip({B, _, _, _}) when B >= 240 -> true;
 is_private_ip(_) -> false.
 
 %% Block the IPv6 ranges that correspond to the v4 blocks above, so the filter
@@ -503,14 +539,17 @@ is_private_ip(_) -> false.
 %%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
 %%                  address fd00:ec2::254 -- the whole point of this block.
 %%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
-%% IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses embed
-%% a v4 address in the low 32 bits; re-check those against the v4 ranges so e.g.
-%% ::ffff:169.254.169.254 cannot reach IMDS.
+%% IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), and NAT64
+%% (64:ff9b::a.b.c.d) addresses embed a v4 address in the low 32 bits; re-check
+%% those against the v4 ranges so e.g. ::ffff:169.254.169.254 (and the NAT64
+%% form 64:ff9b::169.254.169.254, which a host with a NAT64/DNS64 resolver would
+%% translate to IMDS) cannot reach IMDS.
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
 is_private_ip6({0, 0, 0, 0, 0, 16#ffff, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
+is_private_ip6({16#0064, 16#ff9b, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6({0, 0, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6(_) -> false.
 
@@ -1042,15 +1081,21 @@ decode_pem_cacerts(B) when is_binary(B) ->
 
 %%--------------------------------------------------------------------
 
-%% ARN resolution mutates the shared rabbitmq_aws region/credential
-%% singleton (aws_sms/aws_acm_pca call rabbitmq_aws:set_region/1), so
-%% serialize it across concurrent validation requests to prevent region
-%% clobbering between a set_region and its HTTP call. See
-%% aws_auth_validate_arn_lock.
+%% Each request builds its own aws_state(); region and credentials are
+%% threaded through that value rather than written to a shared singleton, so
+%% concurrent validations can no longer clobber each other's region and no
+%% lock is needed. R6 is preserved -- resolution runs in the caller process and
+%% the resolved secret is neither logged nor returned (only adapted to the
+%% caller's {ok, Binary} contract). R3 is preserved -- this still runs only
+%% after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
+%% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
+%% two callers expect; the threaded state is request-scoped and discarded here.
 resolve_arn(Arn) when is_binary(Arn) ->
-    aws_auth_validate_arn_lock:with_lock(fun() ->
-        aws_arn_util:resolve_arn(binary_to_list(Arn))
-    end).
+    State = aws_lib:new(),
+    case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
+        {ok, Data, _State1} -> {ok, Data};
+        {error, _} = Error -> Error
+    end.
 
 connection_timeout_ms() ->
     case application:get_env(aws, auth_validation_connection_timeout_ms) of

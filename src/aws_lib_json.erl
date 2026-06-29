@@ -17,12 +17,12 @@ decode(Value) when is_list(Value) ->
 decode(<<>>) ->
     [];
 decode(Value) when is_binary(Value) ->
-    {ok, Decoded0} = thoas:decode(Value),
+    Decoded0 = rabbit_json:decode(Value),
     Decoded = maps:to_list(Decoded0),
     convert_binary_values(Decoded, []).
 
 -spec convert_binary_values(Value :: list(), Accumulator :: list()) -> list().
-%% @doc Convert the binary key/value pairs returned by thoas to strings.
+%% @doc Convert the binary key/value pairs returned by the JSON decoder to strings.
 %% @end
 convert_binary_values([], Value) ->
     Value;
