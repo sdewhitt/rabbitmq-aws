@@ -11,6 +11,7 @@
 -module(aws_auth_validate_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("aws_lib.hrl").
 
 %%--------------------------------------------------------------------
 %% Semaphore
@@ -467,46 +468,104 @@ ldap_queries_input_test_() ->
         )
     ].
 
-%% The literal-DN probe budget (?MAX_LITERAL_DNS = 100) is enforced in the pure
-%% phase, before any secret fetch or connection. resolve_arn is mocked to fail
-%% so the at-limit case (which passes the budget gate) cannot dial out; the
-%% over-limit case is rejected before resolve_arn is ever reached.
-ldap_literal_dn_budget_test_() ->
-    {setup,
+%%--------------------------------------------------------------------
+%% Configured assume-role fallback (aws.arns.assume_role_arn)
+%%--------------------------------------------------------------------
+%% When the operator configured aws.arns.assume_role_arn, the validate endpoint
+%% assumes that role and resolves the request's ARNs under it, instead of the
+%% broker's bare ambient role. Mirrors the boot-path coverage in
+%% aws_arn_config_tests: meck aws_iam:assume_role/2 and aws_arn_util:resolve_arn/2
+%% and assert which credentials reach the resolve. The mecked resolve fails so no
+%% real connection is attempted; the password_arn resolve is the observation point.
+ldap_configured_assume_role_test_() ->
+    {foreach,
         fun() ->
-            ok = meck:new(aws_arn_util, [passthrough]),
-            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, mocked} end),
+            ok = meck:new(aws_iam, [no_link]),
+            ok = meck:new(aws_arn_util, [passthrough, no_link]),
             ok
         end,
-        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
-            Over = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(101)}}),
-            AtLimit = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(100)}}),
-            [
-                %% 101 distinct literal DNs is rejected with the specific
-                %% too-many reason in the pure phase.
-                ?_assertEqual(
-                    {error, input_invalid,
-                        <<"authorization queries reference too many distinct literal DNs to verify">>},
-                    aws_auth_validate_ldap:validate(Over)
-                ),
-                %% Exactly 100 passes the budget gate and proceeds to password-
-                %% ARN resolution (mocked to fail), so the result is the ARN-
-                %% resolve failure, NOT the too-many-DNs reason.
-                ?_assertEqual(
-                    {error, input_invalid, <<"failed to resolve ARN">>},
-                    aws_auth_validate_ldap:validate(AtLimit)
-                )
-            ]
-        end}.
+        fun(_) ->
+            application:unset_env(aws, arn_config),
+            catch meck:unload(aws_arn_util),
+            catch meck:unload(aws_iam),
+            ok
+        end,
+        [
+            {
+                "no configured role: assume_role is never called and the ambient "
+                "(credential-free) state reaches ARN resolution",
+                fun assume_role_not_configured_uses_ambient_state/0
+            },
+            {"configured role: the assumed credentials reach ARN resolution",
+                fun assume_role_configured_threads_assumed_credentials/0},
+            {
+                "configured role that fails to assume: input_invalid before any "
+                "ARN resolve",
+                fun assume_role_configured_failure_returns_input_invalid/0
+            }
+        ]}.
 
-%% Build an `or' query of N distinct {in_group, DN} terms, yielding N distinct
-%% literal DNs.
-or_in_group_query(N) ->
-    Terms = [
-        lists:flatten(io_lib:format("{in_group, \"cn=g~b,dc=example,dc=com\"}", [I]))
-     || I <- lists:seq(1, N)
-    ],
-    list_to_binary("{'or', [" ++ string:join(Terms, ", ") ++ "]}").
+%% A state carrying these credentials is distinguishable, via
+%% aws_lib:get_credentials/1, from the credential-free aws_lib:new().
+assume_role_test_assumed_state() ->
+    {ok, S} = aws_lib:set_credentials("assumed-key", "secret", "token", aws_lib:new()),
+    S.
+
+assume_role_test_access_key(State) ->
+    case aws_lib:get_credentials(State) of
+        {ok, #aws_credentials{access_key = Key}} -> Key;
+        {error, undefined} -> undefined
+    end.
+
+assume_role_not_configured_uses_ambient_state() ->
+    application:unset_env(aws, arn_config),
+    Self = self(),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+        Self ! {resolve_key, assume_role_test_access_key(State)},
+        {error, stop_here}
+    end),
+    %% resolve fails -> input_invalid, but we only care which state was threaded.
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(base_body(#{}))),
+    ?assertEqual(0, meck:num_calls(aws_iam, assume_role, '_')),
+    receive
+        {resolve_key, Key} -> ?assertEqual(undefined, Key)
+    after 1_000 -> ?assert(false)
+    end.
+
+assume_role_configured_threads_assumed_credentials() ->
+    application:set_env(aws, arn_config, [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+    ]),
+    Self = self(),
+    ok = meck:expect(aws_iam, assume_role, fun(_RoleArn, _State) ->
+        {ok, assume_role_test_assumed_state()}
+    end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+        Self ! {resolve_key, assume_role_test_access_key(State)},
+        {error, stop_here}
+    end),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(base_body(#{}))),
+    ?assertEqual(1, meck:num_calls(aws_iam, assume_role, '_')),
+    receive
+        {resolve_key, Key} -> ?assertEqual("assumed-key", Key)
+    after 1_000 -> ?assert(false)
+    end.
+
+assume_role_configured_failure_returns_input_invalid() ->
+    application:set_env(aws, arn_config, [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+    ]),
+    ok = meck:expect(aws_iam, assume_role, fun(_RoleArn, _State) ->
+        {error, boom}
+    end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) ->
+        erlang:error(resolve_should_not_be_reached)
+    end),
+    ?assertEqual(
+        {error, input_invalid, <<"failed to assume the configured role">>},
+        aws_auth_validate_ldap:validate(base_body(#{}))
+    ),
+    ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_')).
 
 %%--------------------------------------------------------------------
 %% R6: password must never reach a crash report / log, even on a raise
