@@ -211,6 +211,21 @@ server_blocks_ipv6_link_local_test() ->
 server_blocks_ipv4_mapped_imds_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::ffff:169.254.169.254")).
 
+%% NAT64 (64:ff9b::/96) embeds a v4 address; on a host with a NAT64/DNS64
+%% resolver 64:ff9b::169.254.169.254 translates to IMDS, so it must be blocked.
+server_blocks_nat64_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("64:ff9b::169.254.169.254")).
+
+%% NAT64 wrapping a public v4 stays allowed: the embedded address, not the
+%% prefix, decides.
+server_allows_nat64_public_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("64:ff9b::8.8.8.8")).
+
+%% 240.0.0.0/4 (reserved/Class E) and the 255.255.255.255 limited broadcast.
+server_blocks_reserved_and_broadcast_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("240.0.0.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("255.255.255.255")).
+
 server_rejects_unresolvable_test() ->
     ?assertEqual(
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
@@ -249,6 +264,16 @@ peer_allowed_rebound_to_v6_imds_blocked_test() ->
     ?assertEqual(
         blocked,
         aws_auth_validate_ldap:peer_allowed({ok, {{16#fd00, 16#0ec2, 0, 0, 0, 0, 0, 16#254}, 636}})
+    ).
+
+%% A peer that rebound to NAT64-wrapped IMDS (64:ff9b::169.254.169.254) must be
+%% caught on the live socket.
+peer_allowed_rebound_to_nat64_imds_blocked_test() ->
+    ?assertEqual(
+        blocked,
+        aws_auth_validate_ldap:peer_allowed(
+            {ok, {{16#0064, 16#ff9b, 0, 0, 0, 0, 16#a9fe, 16#a9fe}, 389}}
+        )
     ).
 
 %% Fail closed: an undeterminable peer (peername error) is treated as blocked.
