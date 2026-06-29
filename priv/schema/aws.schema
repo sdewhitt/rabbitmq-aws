@@ -129,7 +129,7 @@
 %% the app env only when an operator sets it explicitly.
 
 %% @doc Maximum HTTP request body size in bytes (effective default 65536).
-%% The 1..10000000 bound is enforced at runtime by
+%% The 1..1048576 bound is enforced at runtime by
 %% aws_auth_validate_mgmt:max_body_size/0, which falls back to the default for
 %% an out-of-range value. The datatype is plain `integer' rather than an inline
 %% {integer, [{min, _}, {max, _}]}: the constrained form is rejected by older
