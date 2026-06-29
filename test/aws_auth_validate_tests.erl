@@ -422,6 +422,48 @@ ldap_queries_input_test_() ->
         )
     ].
 
+%% The literal-DN probe budget (?MAX_LITERAL_DNS = 100) is enforced in the pure
+%% phase, before any secret fetch or connection. resolve_arn is mocked to fail
+%% so the at-limit case (which passes the budget gate) cannot dial out; the
+%% over-limit case is rejected before resolve_arn is ever reached.
+ldap_literal_dn_budget_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, mocked} end),
+            ok
+        end,
+        fun(_) -> meck:unload(aws_arn_util) end,
+        fun(_) ->
+            Over = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(101)}}),
+            AtLimit = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(100)}}),
+            [
+                %% 101 distinct literal DNs is rejected with the specific
+                %% too-many reason in the pure phase.
+                ?_assertEqual(
+                    {error, input_invalid,
+                        <<"authorization queries reference too many distinct literal DNs to verify">>},
+                    aws_auth_validate_ldap:validate(Over)
+                ),
+                %% Exactly 100 passes the budget gate and proceeds to password-
+                %% ARN resolution (mocked to fail), so the result is the ARN-
+                %% resolve failure, NOT the too-many-DNs reason.
+                ?_assertEqual(
+                    {error, input_invalid, <<"failed to resolve ARN">>},
+                    aws_auth_validate_ldap:validate(AtLimit)
+                )
+            ]
+        end}.
+
+%% Build an `or' query of N distinct {in_group, DN} terms, yielding N distinct
+%% literal DNs.
+or_in_group_query(N) ->
+    Terms = [
+        lists:flatten(io_lib:format("{in_group, \"cn=g~b,dc=example,dc=com\"}", [I]))
+     || I <- lists:seq(1, N)
+    ],
+    list_to_binary("{'or', [" ++ string:join(Terms, ", ") ++ "]}").
+
 %%--------------------------------------------------------------------
 %% R6: password must never reach a crash report / log, even on a raise
 %%--------------------------------------------------------------------

@@ -55,6 +55,16 @@
 
 -define(DEFAULT_TIMEOUT_MS, 5_000).
 
+%% Upper bound on the number of distinct literal DNs probed in one request.
+%% Each literal DN is one base-scoped eldap:search bounded by the request
+%% timeout (default 5s, max 60s), and all probes run sequentially while holding
+%% a semaphore permit, so an unbounded set would let a single request pin a
+%% permit for a long time and starve the bounded pool. A legitimate config has
+%% a handful of literal group DNs across the four query types; 100 is well above
+%% that. Enforced in the pure (network-free) phase, so an over-budget request is
+%% rejected before any secret fetch or outbound connection.
+-define(MAX_LITERAL_DNS, 100).
+
 %% Accepted query names within the `queries' object. Mirrors the broker's
 %% auth_ldap.queries.* config keys.
 -define(QUERY_NAMES, [
@@ -123,6 +133,9 @@
 -define(REASON_BAD_QUERIES, <<"queries must be an object of query strings">>).
 -define(REASON_BAD_QUERY_VALUE, <<"each query must be a non-empty string">>).
 -define(REASON_QUERY_PARSE, <<"one or more authorization queries are not valid">>).
+-define(REASON_TOO_MANY_LITERAL_DNS,
+    <<"authorization queries reference too many distinct literal DNs to verify">>
+).
 -define(REASON_DN_LOOKUP_BASE_UNVERIFIED,
     <<"dn_lookup_base does not exist or is not readable by the bind user">>
 ).
@@ -190,7 +203,8 @@ parse_input(Body) ->
         fun parse_ssl_options/2,
         fun parse_dn_lookup_base/2,
         fun parse_dn_lookup_attribute/2,
-        fun parse_queries/2
+        fun parse_queries/2,
+        fun limit_literal_dns/2
     ],
     parse_input(Steps, Body, #{timeout => connection_timeout_ms()}).
 
@@ -422,6 +436,27 @@ parse_query_map([{Name, Value} | Rest], Acc, Parsed) ->
             end
     end.
 
+%% Compute the distinct literal DNs the authz queries will make us probe and
+%% reject the request if there are too many (see ?MAX_LITERAL_DNS). Runs in the
+%% pure phase, after parse_queries/2, so an over-budget request never resolves a
+%% secret or opens a connection. The computed set is stored so check_authz_
+%% queries/2 probes exactly this set rather than recomputing it (single source
+%% of truth: the count we bound is the count we probe).
+limit_literal_dns(_Body, #{queries := Queries} = Acc) ->
+    LiteralDns = literal_dns(Queries),
+    case length(LiteralDns) > ?MAX_LITERAL_DNS of
+        true -> {error, input_invalid, ?REASON_TOO_MANY_LITERAL_DNS};
+        false -> {ok, Acc#{literal_dns => LiteralDns}}
+    end.
+
+literal_dns(Queries) ->
+    lists:usort(
+        lists:flatmap(
+            fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
+            Queries
+        )
+    ).
+
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
 %% Server address validation: resolve the hostname and reject addresses in
@@ -642,17 +677,12 @@ check_dn_lookup(Handle, #{dn_lookup_base := Base}) ->
 %% Authorization query validation
 %%--------------------------------------------------------------------
 
-%% For each parsed query, extract the fully-literal DNs (those with no
-%% ${...} runtime placeholder) and confirm each exists and is readable by
-%% the bound user. Queries that reference only runtime-filled DNs contribute
-%% no checks -- they were already validated for grammar at parse time.
-check_authz_queries(Handle, #{queries := Queries}) ->
-    LiteralDns = lists:usort(
-        lists:flatmap(
-            fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
-            Queries
-        )
-    ),
+%% Confirm each literal DN (those with no ${...} runtime placeholder) referenced
+%% by the authz queries exists and is readable by the bound user. Queries that
+%% reference only runtime-filled DNs contribute no checks -- they were already
+%% validated for grammar at parse time. The set was computed and bounded in the
+%% pure phase by limit_literal_dns/2; we probe exactly it.
+check_authz_queries(Handle, #{literal_dns := LiteralDns}) ->
     check_dns(Handle, LiteralDns).
 
 check_dns(_Handle, []) ->
