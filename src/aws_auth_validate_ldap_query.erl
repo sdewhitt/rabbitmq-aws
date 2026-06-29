@@ -13,7 +13,7 @@
 %% validation endpoint must not diverge from rabbit_auth_backend_ldap). A
 %% parity test in aws_auth_validate_tests guards against drift.
 %%
-%% Two deliberate differences from the upstream helper:
+%% Three deliberate differences from the upstream helper:
 %%   1. It returns {ok, Query} | {error, Reason} instead of throwing via
 %%      cuttlefish:invalid/2 -- this runs in the request path, not at
 %%      config-load time.
@@ -21,9 +21,18 @@
 %%      DNs that are fully literal (contain no ${...} runtime placeholder).
 %%      Those are the only DNs the endpoint can check for existence without
 %%      a runtime principal, and they drive the static reachability check.
+%%   3. It adds fill/2 (and ad_args/1, is_evaluable/1), which substitute a
+%%      request-supplied principal into ${...} placeholders so the backend can
+%%      *evaluate* membership queries, not just reachability-check static DNs.
+%%      fill/2 mirrors rabbit_auth_backend_ldap_util:fill/2 (raw substitution
+%%      for value sinks) and rabbit_ldap_rfc4514:fill_dn/2 (RFC 4514 escaping
+%%      for DN sinks, exempting the user_dn key). It is re-implemented here
+%%      rather than called directly because rabbitmq_auth_backend_ldap is only
+%%      a TEST_DEP, not a runtime dependency (same rationale as parse/1); a
+%%      parity test guards against drift.
 -module(aws_auth_validate_ldap_query).
 
--export([parse/1, literal_dns/1, is_literal/1]).
+-export([parse/1, literal_dns/1, is_literal/1, fill/2, is_evaluable/1, ad_args/1]).
 
 -export_type([query/0]).
 
@@ -189,6 +198,175 @@ dn_to_list(DN) when is_list(DN) -> DN.
 %% runtime by the broker's fill/2 (e.g. ${username}, ${vhost}).
 has_placeholder(Str) ->
     string:find(Str, "${") =/= nomatch.
+
+%% True when a DN pattern is *evaluable*: a concrete string that, after fill/2
+%% has substituted the principal placeholders, no longer contains any ${...}
+%% placeholder. Distinct from is_literal/1 only in intent -- is_literal/1 gates
+%% the no-principal reachability path (a DN that was literal to begin with);
+%% is_evaluable/1 gates the post-fill evaluation path (a DN that became concrete
+%% once the username/user_dn were filled in). A residual placeholder means the
+%% term keyed on per-operation context (${vhost}/${resource}/...) we cannot
+%% supply, so the backend skips (degrades) rather than failing it.
+-spec is_evaluable(term()) -> boolean().
+is_evaluable(DN) ->
+    is_literal(DN).
+
+%%--------------------------------------------------------------------
+%% Placeholder filling (principal substitution)
+%%--------------------------------------------------------------------
+
+%% Substitute the principal placeholders in a parsed query, returning a query
+%% term of the SAME shape with its DN/value sinks filled. Mirrors the broker's
+%% two-mode fill: DN-bearing operands (exists/in_group/in_group_nested/
+%% attribute) are RFC 4514-escaped per Args value (except the user_dn key,
+%% which already holds a complete DN), while value operands of equals/match and
+%% bare/{string,_} terms are filled raw (they are ACL value sinks, not DNs).
+%%
+%% Args is the principal context the endpoint can supply without a live AMQP
+%% operation: [{username, U}, {user_dn, D} | ad_args(U)]. Keys absent from a
+%% template are left untouched; values that cannot be stringified are dropped to
+%% "" (to_repl parity). Placeholders keyed on per-operation context
+%% (${vhost}/${resource}/${name}/${permission}) are simply not in Args, so they
+%% survive unfilled and the DN stays non-evaluable (the backend degrades it).
+-spec fill(query(), [{atom(), term()}]) -> query().
+fill({constant, _} = T, _Args) ->
+    T;
+fill({exists, DN}, Args) ->
+    {exists, fill_dn(DN, Args)};
+fill({in_group, DN}, Args) ->
+    {in_group, fill_dn(DN, Args)};
+fill({in_group, DN, Desc}, Args) ->
+    {in_group, fill_dn(DN, Args), Desc};
+fill({in_group_nested, DN}, Args) ->
+    {in_group_nested, fill_dn(DN, Args)};
+fill({in_group_nested, DN, Desc}, Args) ->
+    {in_group_nested, fill_dn(DN, Args), Desc};
+fill({in_group_nested, DN, Desc, Scope}, Args) ->
+    {in_group_nested, fill_dn(DN, Args), Desc, Scope};
+fill({attribute, DN, AttrName}, Args) ->
+    {attribute, fill_dn(DN, Args), AttrName};
+fill({'not', SubQuery}, Args) ->
+    {'not', fill(SubQuery, Args)};
+fill({'and', Queries}, Args) when is_list(Queries) ->
+    {'and', [fill(Q, Args) || Q <- Queries]};
+fill({'or', Queries}, Args) when is_list(Queries) ->
+    {'or', [fill(Q, Args) || Q <- Queries]};
+fill({for, Clauses}, Args) when is_list(Clauses) ->
+    {for, [fill_for_clause(C, Args) || C <- Clauses]};
+fill({equals, A1, A2}, Args) ->
+    {equals, fill_value(A1, Args), fill_value(A2, Args)};
+fill({match, A1, A2}, Args) ->
+    {match, fill_value(A1, Args), fill_value(A2, Args)};
+%% tag_queries: a list of {Tag, SubQuery} pairs. Recurse into the sub-query of
+%% each pair; leave any non-pair element untouched.
+fill(List, Args) when is_list(List) ->
+    [fill_list_element(E, Args) || E <- List];
+fill(Other, _Args) ->
+    Other.
+
+fill_for_clause({Type, Value, SubQuery}, Args) ->
+    {Type, Value, fill(SubQuery, Args)};
+fill_for_clause(Other, _Args) ->
+    Other.
+
+fill_list_element({Tag, SubQuery}, Args) ->
+    {Tag, fill(SubQuery, Args)};
+fill_list_element(Other, _Args) ->
+    Other.
+
+%% A value operand of equals/match: a {string, Pattern} or a bare string is an
+%% ACL value sink and is filled RAW (no DN escaping); an embedded DN-bearing
+%% term (e.g. {attribute, DN, _}) recurses through fill/2 so its DN is escaped.
+fill_value({string, Pattern}, Args) ->
+    {string, fill_raw(Pattern, Args)};
+fill_value(Operand, Args) when is_tuple(Operand) ->
+    fill(Operand, Args);
+fill_value(Operand, Args) ->
+    case is_dn_string(to_str(Operand)) of
+        true -> fill_raw(Operand, Args);
+        false -> Operand
+    end.
+
+%% Active-Directory split: a DOMAIN\user username yields ${ad_domain}/${ad_user}
+%% fill args; any other shape yields none. Mirrors
+%% rabbit_auth_backend_ldap_util:get_active_directory_args/1.
+-spec ad_args(string() | binary()) -> [{atom(), string()}].
+ad_args(Username) when is_binary(Username) ->
+    ad_args(binary_to_list(Username));
+ad_args(Username) when is_list(Username) ->
+    case string:split(Username, "\\", all) of
+        [Domain, User] when Domain =/= [], User =/= [] ->
+            [{ad_domain, Domain}, {ad_user, User}];
+        _ ->
+            []
+    end;
+ad_args(_) ->
+    [].
+
+%% Fill a DN sink: RFC 4514-escape every Args value except user_dn (which is
+%% already a complete DN), then substitute. Mirrors rabbit_ldap_rfc4514:fill_dn/2.
+fill_dn({string, Pattern}, Args) ->
+    {string, fill_dn(Pattern, Args)};
+fill_dn(DN, Args) ->
+    fill_raw(DN, [{K, escape_arg(K, V)} || {K, V} <- Args]).
+
+escape_arg(user_dn, V) -> V;
+escape_arg(_, V) -> escape_value(V).
+
+%% Raw template fill: replace each ${Key} with to_repl(Value), per Args entry,
+%% globally. Mirrors rabbit_auth_backend_ldap_util:fill/2 exactly (including the
+%% & / backslash escaping in to_repl that protects re:replace's replacement
+%% syntax). Operates on, and returns, a flat string.
+fill_raw(Fmt, []) ->
+    to_str(Fmt);
+fill_raw(Fmt, [{K, V} | T]) ->
+    Var = "\\$\\{" ++ atom_to_list(K) ++ "\\}",
+    fill_raw(re:replace(to_str(Fmt), Var, to_repl(V), [global, {return, list}]), T).
+
+%% Escape backslash and ampersand so a substituted value cannot inject
+%% re:replace replacement directives. Unstringifiable values become "".
+to_repl(V) when is_atom(V) -> to_repl(atom_to_list(V));
+to_repl(V) when is_binary(V) -> to_repl(binary_to_list(V));
+to_repl([]) -> [];
+to_repl([$\\ | T]) -> [$\\, $\\ | to_repl(T)];
+to_repl([$& | T]) -> [$\\, $& | to_repl(T)];
+to_repl([H | T]) when is_integer(H) -> [H | to_repl(T)];
+to_repl(_) -> [].
+
+%% RFC 4514 escaping of a DN attribute value (Section 2.4): backslash-escape
+%%   , + " \ < > ; and NUL anywhere; a leading SPACE or #; a trailing SPACE.
+%% Mirrors rabbit_ldap_rfc4514:escape_value/1.
+escape_value(V) when is_binary(V) -> escape_value(binary_to_list(V));
+escape_value(V) when is_atom(V) -> escape_value(atom_to_list(V));
+escape_value([]) -> [];
+escape_value([H | T]) when H =:= $\s; H =:= $# -> [$\\, H | escape_middle(T)];
+escape_value(V) when is_list(V) -> escape_middle(V);
+escape_value(V) -> V.
+
+escape_middle([]) ->
+    [];
+escape_middle([$\s]) ->
+    [$\\, $\s];
+escape_middle([H | T]) ->
+    case is_special(H) of
+        true -> [$\\, H | escape_middle(T)];
+        false -> [H | escape_middle(T)]
+    end.
+
+is_special($,) -> true;
+is_special($+) -> true;
+is_special($") -> true;
+is_special($\\) -> true;
+is_special($<) -> true;
+is_special($>) -> true;
+is_special($;) -> true;
+is_special(0) -> true;
+is_special(_) -> false.
+
+to_str(V) when is_binary(V) -> binary_to_list(V);
+to_str(V) when is_list(V) -> V;
+to_str(V) when is_atom(V) -> atom_to_list(V);
+to_str(V) -> V.
 
 %% A printable flat string (proper list of integers in a sane char range).
 is_dn_string([]) ->
