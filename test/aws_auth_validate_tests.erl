@@ -433,8 +433,7 @@ ldap_literal_dn_budget_test_() ->
             meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, mocked} end),
             ok
         end,
-        fun(_) -> meck:unload(aws_arn_util) end,
-        fun(_) ->
+        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
             Over = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(101)}}),
             AtLimit = base_body(#{<<"queries">> => #{<<"tags">> => or_in_group_query(100)}}),
             [
@@ -809,13 +808,25 @@ ensure_query_vocabulary_interned() ->
         list_to_atom(A)
      || A <- [
             %% permissions
-            "configure", "write", "read",
+            "configure",
+            "write",
+            "read",
             %% for-query variable names
-            "username", "user_dn", "vhost", "resource", "name", "permission",
+            "username",
+            "user_dn",
+            "vhost",
+            "resource",
+            "name",
+            "permission",
             %% in_group_nested scopes
-            "subtree", "singlelevel", "single_level", "onelevel", "one_level",
+            "subtree",
+            "singlelevel",
+            "single_level",
+            "onelevel",
+            "one_level",
             %% the specific tags the accepted-query corpus references
-            "administrator", "management"
+            "administrator",
+            "management"
         ]
     ],
     ok.
