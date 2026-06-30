@@ -495,14 +495,34 @@ classify_ip({16#2002, W1, W2, _, _, _, _, _}) ->
     classify_ip(v4_from_words(W1, W2));
 classify_ip({_, _, _, _} = V4) ->
     case in_any_cidr(V4, ?DENIED_V4_CIDRS) of
-        true -> deny;
+        true -> classify_denied(V4);
         false -> allow
     end;
 classify_ip({_, _, _, _, _, _, _, _} = V6) ->
     case in_any_cidr(V6, ?DENIED_V6_CIDRS) of
-        true -> deny;
+        true -> classify_denied(V6);
         false -> allow
     end.
+
+%% A denied address is normally `deny'. The ONE exception is loopback when
+%% auth_validation_allow_private_networks is set: that flag (default false, off
+%% in production) lets the HTTP integration suite probe a local stub server on
+%% 127.0.0.1/::1. It is the HTTP analogue of the same flag the LDAP backend
+%% honours for local-slapd tests. It relaxes ONLY loopback -- IMDS, link-local,
+%% and unspecified stay denied even with the flag on, so it cannot be used to
+%% reach instance metadata.
+classify_denied(IP) ->
+    case is_loopback(IP) andalso allow_private_networks() of
+        true -> allow;
+        false -> deny
+    end.
+
+is_loopback({127, _, _, _}) -> true;
+is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_loopback(_) -> false.
+
+allow_private_networks() ->
+    application:get_env(aws, auth_validation_allow_private_networks, false) =:= true.
 
 %% Two 16-bit words -> a v4 4-tuple {a,b,c,d}.
 v4_from_words(W1, W2) ->
@@ -1033,10 +1053,18 @@ os_cacerts() ->
         _:_ -> []
     end.
 
+%% Decode a CA-bundle PEM into the raw DER binaries ssl's {cacerts, _} option
+%% expects. Passing decoded #'OTPCertificate'{} records (pem_entry_decode/1
+%% output) makes ssl silently ignore the trust anchor -> unknown_ca -> a
+%% spurious tls_failed (see the custom_ca_under_verify_peer_returns_ok
+%% regression guard). Mirror decode_client_cert/1: take only the 'Certificate'
+%% entries, as raw DER. A PEM with no certificate entry yields no anchor (skip),
+%% same as an empty bundle. The LDAP backend's identically named helper does the
+%% same thing for the same reason -- eldap forwards sslopts to this same ssl.
 decode_pem_cacerts(B) when is_binary(B) ->
-    case public_key:pem_decode(B) of
+    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
         [] -> skip;
-        Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
+        Ders -> Ders
     end.
 
 to_list(B) when is_binary(B) -> binary_to_list(B);
