@@ -36,12 +36,22 @@ case "$(uname -s)" in
             readonly slapd=/usr/sbin/slapd
         fi
 
+        # The slapd backend modules live under different paths across
+        # distributions: /usr/lib/openldap (older RH), /usr/lib/ldap
+        # (Debian), and /usr/lib64/openldap (Amazon Linux 2023 and other
+        # 64-bit RH-family systems).
         if [ -d /usr/lib/openldap ]
         then
             readonly modulepath=/usr/lib/openldap
+        elif [ -d /usr/lib64/openldap ]
+        then
+            readonly modulepath=/usr/lib64/openldap
         elif [ -d /usr/lib/ldap ]
         then
             readonly modulepath=/usr/lib/ldap
+        elif [ -d /usr/lib64/ldap ]
+        then
+            readonly modulepath=/usr/lib64/ldap
         fi
 
         if [ -d /etc/openldap/schema ]

@@ -190,8 +190,12 @@ open_connection(Service, Options, State0) ->
 
     Host = endpoint_host(Region, Service),
     Port = 443,
-    GunPid = create_gun_connection(Host, Port, Options),
-    {ok, {GunPid, Service}, State1}.
+    case create_gun_connection(Host, Port, Options) of
+        {ok, GunPid} ->
+            {ok, {GunPid, Service}, State1};
+        {error, _Reason} = Error ->
+            Error
+    end.
 
 %% Close a direct connection
 -spec close_connection(Handle :: connection_handle()) -> ok.
@@ -726,7 +730,11 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
                     {ok, Payload, State2};
                 {error, Message, Response} ->
-                    ?LOG_WARNING("Error occurred: ~ts", [Message]),
+                    %% Message may be a status string (from format_response/1
+                    %% on an HTTP error) or a tuple such as
+                    %% {gun_open_failed, Reason} on a connection failure, so
+                    %% use ~tp rather than ~ts.
+                    ?LOG_WARNING("Error occurred: ~tp", [Message]),
                     case Response of
                         {_, Payload} ->
                             ?LOG_WARNING("Failed AWS request: ~ts~nResponse: ~tp", [
@@ -748,10 +756,17 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
 %% Gun HTTP client functions
 gun_request(Method, URI, Headers, Body, Options) ->
     {Host, Port, Path} = parse_uri(URI),
-    GunPid = create_gun_connection(Host, Port, Options),
-    Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
-    gun:close(GunPid),
-    Reply.
+    %% A connection failure is returned as {error, Reason} (not raised) so it
+    %% flows through format_response/1 into the {error, _, _} shape the retry
+    %% loop in api_request_with_retries/8 matches, rather than escaping it.
+    case create_gun_connection(Host, Port, Options) of
+        {ok, GunPid} ->
+            Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
+            gun:close(GunPid),
+            Reply;
+        {error, _Reason} = Error ->
+            format_response(Error)
+    end.
 
 do_gun_request(ConnPid, get, Path, Headers, _Body) ->
     gun:get(ConnPid, Path, Headers);
@@ -794,13 +809,13 @@ create_gun_connection(Host, Port, Options) ->
         {ok, ConnPid} ->
             case gun:await_up(ConnPid, ConnectTimeout) of
                 {ok, _Protocol} ->
-                    ConnPid;
+                    {ok, ConnPid};
                 {error, Reason} ->
                     gun:close(ConnPid),
-                    error({gun_connection_failed, Reason})
+                    {error, {gun_connection_failed, Reason}}
             end;
         {error, Reason} ->
-            error({gun_open_failed, Reason})
+            {error, {gun_open_failed, Reason}}
     end.
 
 create_uri(Host, Path) when is_list(Path) ->
@@ -871,8 +886,17 @@ direct_gun_request(GunPid, Method, Path, Headers, Body, Options) ->
                 {response, fin, Status, RespHeaders} ->
                     {ok, {{http_version, Status, status_text(Status)}, RespHeaders, <<>>}};
                 {response, nofin, Status, RespHeaders} ->
-                    {ok, RespBody} = gun:await_body(GunPid, StreamRef, Timeout),
-                    {ok, {{http_version, Status, status_text(Status)}, RespHeaders, RespBody}};
+                    %% await_body/3 can return {error, timeout} (and other
+                    %% {error, _} reasons); surface it cleanly rather than
+                    %% letting a hard match turn it into a {badmatch, _} term.
+                    case gun:await_body(GunPid, StreamRef, Timeout) of
+                        {ok, RespBody} ->
+                            {ok, {
+                                {http_version, Status, status_text(Status)}, RespHeaders, RespBody
+                            }};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
                 {error, Reason} ->
                     {error, Reason}
             end

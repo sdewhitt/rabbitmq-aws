@@ -318,6 +318,30 @@ perform_request_test_() ->
                     ?assert(is_record(State1, aws_state)),
                     meck:validate(gun)
                 end
+            },
+            {
+                "await_body timeout is returned as a clean {error, timeout}",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                    meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                    meck:expect(gun, close, fun(_) -> ok end),
+                    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                    meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                    meck:expect(gun, await, fun(_Pid, _, _) ->
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    end),
+                    %% The headers arrive but the body read times out. This must
+                    %% surface as {error, timeout}, not {error, {badmatch, _}}.
+                    meck:expect(gun, await_body, fun(_Pid, _, _) -> {error, timeout} end),
+
+                    Result = aws_lib:request("ec2", get, "/", "", [], [], State),
+                    ?assertEqual({error, timeout, undefined}, Result),
+                    meck:validate(gun)
+                end
             }
         ]
     }.
@@ -485,6 +509,38 @@ api_get_request_test_() ->
                 {ok, Body, State1} = aws_lib:api_get_request("AWS", "API", State),
                 ?assertEqual([{"data", "value"}], Body),
                 ?assert(is_record(State1, aws_state)),
+                meck:validate(gun)
+            end},
+            {"gun:open failure re-enters the retry loop rather than raising", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                %% A connection that never opens must be retried and then
+                %% reported as the exhausted-retries error, not escape as a
+                %% {gun_open_failed, _} exception.
+                meck:expect(gun, open, fun(_, _, _) -> {error, econnrefused} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual({error, "AWS service is unavailable"}, Result),
+                meck:validate(gun)
+            end},
+            {"gun:await_up failure re-enters the retry loop rather than raising", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                %% The socket opens but the protocol never comes up; this too
+                %% must be retried, not raised as {gun_connection_failed, _}.
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {error, timeout} end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual({error, "AWS service is unavailable"}, Result),
                 meck:validate(gun)
             end}
         ]
