@@ -17,9 +17,13 @@
 %% tuple -- a `deny' is a correctly-working server, not a misconfiguration. So
 %% we do NOT assert that any particular principal is authorized. Instead we
 %% confirm each configured `*_path' is reachable over (m)TLS and answers like
-%% an auth server (a well-formed HTTP response). That catches the actual pain
-%% (wrong URL, TLS/CA misconfig, unreachable host) without needing a real test
-%% credential or an authz-semantics judgement.
+%% an auth server -- a usable HTTP status (200/201) AND a body matching
+%% rabbit_auth_backend_http's allow/deny grammar. That catches the actual pain
+%% (wrong URL, TLS/CA misconfig, unreachable host, path pointing at a service
+%% that is not an auth backend) without needing a real test credential or an
+%% authz-semantics judgement. We check the SHAPE of the response, not its
+%% verdict: a `deny' for our synthetic probe principal is a success, since a
+%% well-formed deny still proves the endpoint speaks the auth protocol.
 %%
 %% A future credentialed-probe mode (assert user_path returns `allow' for a
 %% supplied username + password_arn) is intentionally out of scope here; see
@@ -59,7 +63,8 @@
     pin_url/2,
     build_client_ssl_opts/1,
     classify_http_error/1,
-    is_tls_error/1
+    is_tls_error/1,
+    classify_response/2
 ]).
 -endif.
 
@@ -570,14 +575,19 @@ ip_to_int(Tuple) ->
 %% Reachability-only: confirm each configured path is reachable over (m)TLS and
 %% answers like an auth server. We send a representative request with a clearly
 %% SYNTHETIC username (never a real credential) and treat:
-%%   * a 2xx the real backend accepts (200/201)  -> reachable + auth-shaped (ok)
+%%   * a 2xx the real backend accepts (200/201) AND a body matching the
+%%       allow/deny grammar                       -> reachable + auth-shaped (ok)
+%%   * a 2xx whose body is neither allow nor deny  -> reached a server, but it is
+%%       not an auth backend (auth_failed) -- catches a path pointing at a health
+%%       check, HTML page, or proxy that returns 200 for everything
 %%   * any other well-formed HTTP status          -> reachable but the path is
 %%       likely wrong (auth_failed) -- catches user_path pointing at the wrong
 %%       endpoint, the most common config mistake after TLS/connectivity
 %%   * connection refused / DNS / timeout         -> connection_failed
 %%   * TLS handshake / cert verification failure  -> tls_failed
-%% We do NOT interpret allow vs deny: both are 2xx and both mean "the server is
-%% working", so a deny for the synthetic user is a success, not a failure.
+%% We check the SHAPE of the response, not its verdict: allow and deny are both
+%% successes (a deny for the synthetic user still proves the endpoint speaks the
+%% auth protocol). Only a body matching NEITHER is a failure.
 %%
 %% The whole probe runs inside a try/catch that collapses any raise to
 %% connection_failed, so a resolved secret can never reach a crash report (R6).
@@ -695,9 +705,14 @@ probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts, Profi
                     {autoredirect, false}
                 ] ++ ssl_http_opt(Url, Host, SslOpts),
             case httpc:request(Method, Request, HttpOpts, [{body_format, binary}], Profile) of
-                {ok, {{_Vsn, Code, _Phrase}, _Headers, _Body}} ->
+                {ok, {{_Vsn, Code, _Phrase}, _Headers, Body}} ->
                     case lists:member(Code, ?AUTH_RESPONSE_CODES) of
-                        true -> ok;
+                        %% A usable status is necessary but not sufficient: the
+                        %% body must also match rabbit_auth_backend_http's
+                        %% allow/deny grammar, or any 200-returning service
+                        %% (health check, HTML page, proxy) would pass as an
+                        %% auth backend. See classify_response/2.
+                        true -> classify_response(Key, Body);
                         false -> {error, auth_failed, ?REASON_ENDPOINT}
                     end;
                 {error, Reason} ->
@@ -799,6 +814,53 @@ is_tls_atom(A) ->
         certificate_unknown,
         no_peercert
     ]).
+
+%% Response-contract check: the status code proved the server answered, this
+%% proves it answered like rabbit_auth_backend_http. A `deny' (or a `deny'-
+%% shaped response) is a SUCCESS here -- the probe uses a synthetic principal
+%% the server is expected to reject, and a well-formed deny still proves the
+%% endpoint speaks the auth protocol. We only fail when the body matches
+%% NEITHER allow nor deny, which means the configured path points at something
+%% that is not an auth backend (the false-pass this guard closes). We never
+%% echo the body (R4): a mismatch returns the fixed ?REASON_ENDPOINT.
+%%
+%% Grammar (mirrors rabbit_auth_backend_http:parse_resp/1, which does
+%% string:to_lower(string:strip(Body)) then matches):
+%%   * user_path (authn): exactly `deny', or anything beginning with `allow'
+%%     (an `allow' optionally followed by space-separated tags).
+%%   * vhost/resource/topic_path (authz): exactly `allow' or `deny'.
+classify_response(Key, Body) ->
+    case response_matches_contract(Key, normalize_resp(Body)) of
+        true -> ok;
+        false -> {error, auth_failed, ?REASON_ENDPOINT}
+    end.
+
+%% Normalize exactly as rabbit_auth_backend_http does: strip leading/trailing
+%% whitespace, then lowercase. Tolerates a non-binary/oversized body defensively
+%% (an auth response is tiny; anything else is not auth-shaped).
+normalize_resp(Body) when is_binary(Body) ->
+    string:lowercase(string:trim(Body));
+normalize_resp(_) ->
+    <<>>.
+
+%% user_path authenticates, so it accepts allow-with-tags (prefix match), the
+%% same as the real backend's `"allow" ++ Rest' clause. The authz paths only
+%% ever return a bare allow/deny.
+response_matches_contract(<<"user_path">>, Resp) ->
+    Resp =:= <<"deny">> orelse is_allow_prefix(Resp);
+response_matches_contract(_AuthzPath, Resp) ->
+    Resp =:= <<"allow">> orelse Resp =:= <<"deny">>.
+
+%% True when Resp is `allow' or `allow' followed by a whitespace-delimited tag
+%% list (e.g. `allow administrator management'). A bare `allowxyz' is rejected:
+%% the real backend tolerates it, but for a config-validation signal we want the
+%% canonical separator so a near-miss body is flagged rather than waved through.
+is_allow_prefix(<<"allow">>) ->
+    true;
+is_allow_prefix(<<"allow", Sep, _/binary>>) ->
+    Sep =:= $\s orelse Sep =:= $\t;
+is_allow_prefix(_) ->
+    false.
 
 %% Build the httpc Request tuple for the configured method. For GET the query
 %% goes in the URL; for POST it is a form-encoded body, matching
