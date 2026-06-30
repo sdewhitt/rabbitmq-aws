@@ -439,6 +439,10 @@ ini_split_line_test_() ->
                     <<"credential_process = aws sso ... --account=123 --role=admin">>
                 )
             )
+        end},
+        {"blank line is a single empty token", fun() ->
+            ?assertEqual([""], aws_lib_config:ini_split_line(<<>>)),
+            ?assertEqual([""], aws_lib_config:ini_split_line(<<" ">>))
         end}
     ].
 

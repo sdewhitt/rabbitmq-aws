@@ -402,6 +402,11 @@
         [{aws, [{auth_validation_enabled, true}]}],
         [aws_auth_validation_enabled]},
 
+    {aws_auth_validation_disabled,
+        "aws.auth_validation.enabled = false",
+        [{aws, [{auth_validation_enabled, false}]}],
+        [aws_auth_validation_disabled]},
+
     {aws_auth_validation_max_concurrent,
         "aws.auth_validation.max_concurrent = 8",
         [{aws, [{auth_validation_max_concurrent, 8}]}],
