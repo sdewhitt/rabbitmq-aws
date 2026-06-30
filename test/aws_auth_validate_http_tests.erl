@@ -562,6 +562,42 @@ http_probe_raise_does_not_leak_test_() ->
             ]
         end}.
 
+%% Response-contract grammar (classify_response/2). The status code is checked
+%% by the probe; this checks the body shape that gates a 2xx onto `ok'. A `deny'
+%% (or allow-with-tags on user_path) is a SUCCESS -- we validate the shape, not
+%% the verdict. A body matching neither is auth_failed (the false-pass guard).
+http_response_contract_test_() ->
+    Endpoint = <<"HTTP auth server did not return a usable response">>,
+    Cases = [
+        %% {Key, Body, Expected}
+        %% user_path (authn): deny, allow, and allow-with-tags all pass.
+        {<<"user_path">>, <<"allow">>, ok},
+        {<<"user_path">>, <<"deny">>, ok},
+        {<<"user_path">>, <<"allow administrator management">>, ok},
+        %% Normalization: leading/trailing whitespace + case are tolerated,
+        %% mirroring rabbit_auth_backend_http's lower(strip(Body)).
+        {<<"user_path">>, <<"  ALLOW  ">>, ok},
+        {<<"user_path">>, <<"Deny\n">>, ok},
+        {<<"user_path">>, <<"allow\tmanagement">>, ok},
+        %% authz paths only ever return a bare allow/deny.
+        {<<"vhost_path">>, <<"allow">>, ok},
+        {<<"resource_path">>, <<"deny">>, ok},
+        {<<"topic_path">>, <<"ALLOW">>, ok},
+        %% Non-auth bodies are rejected even though the status was 2xx.
+        {<<"user_path">>, <<"<html>hi</html>">>, {error, auth_failed, Endpoint}},
+        {<<"user_path">>, <<"">>, {error, auth_failed, Endpoint}},
+        {<<"user_path">>, <<"allowed">>, {error, auth_failed, Endpoint}},
+        {<<"user_path">>, <<"{\"result\":\"allow\"}">>, {error, auth_failed, Endpoint}},
+        %% allow-with-tags is NOT valid on an authz path (exact match only).
+        {<<"vhost_path">>, <<"allow administrator">>, {error, auth_failed, Endpoint}},
+        %% A non-binary body (defensive) is not auth-shaped.
+        {<<"user_path">>, undefined, {error, auth_failed, Endpoint}}
+    ],
+    [
+        ?_assertEqual(Expected, aws_auth_validate_http:classify_response(Key, Body))
+     || {Key, Body, Expected} <- Cases
+    ].
+
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
