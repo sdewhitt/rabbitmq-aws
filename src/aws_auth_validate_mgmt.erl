@@ -1,0 +1,303 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
+%% Cowboy REST handler that exposes
+%%   PUT /api/aws/auth/validate/:method
+%% Implements the rabbit_mgmt_extension behaviour so the route is
+%% mounted automatically by the management plugin. Each request flows
+%% through a fixed pipeline: feature toggle -> management auth -> user
+%% tag gate -> body size cap -> JSON decode -> concurrency semaphore ->
+%% registry dispatch -> audit log -> response.
+-module(aws_auth_validate_mgmt).
+
+-behaviour(rabbit_mgmt_extension).
+
+-export([dispatcher/0, web_ui/0]).
+
+-export([
+    init/2,
+    content_types_accepted/2,
+    allowed_methods/2,
+    resource_exists/2,
+    is_authorized/2,
+    accept_content/2
+]).
+
+-include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include("aws.hrl").
+
+-define(DEFAULT_MAX_BODY_SIZE, 65_536).
+-define(DEFAULT_REQUIRED_USER_TAG, administrator).
+
+dispatcher() -> [{"/aws/auth/validate/:method", ?MODULE, []}].
+
+web_ui() -> [].
+
+%%--------------------------------------------------------------------
+%% cowboy_rest callbacks
+%%--------------------------------------------------------------------
+
+init(Req, _Opts) ->
+    {cowboy_rest, rabbit_mgmt_cors:set_headers(Req, ?MODULE), #context{}}.
+
+content_types_accepted(ReqData, Context) ->
+    {[{'*', accept_content}], ReqData, Context}.
+
+allowed_methods(ReqData, Context) ->
+    {[<<"PUT">>, <<"OPTIONS">>], ReqData, Context}.
+
+resource_exists(ReqData, Context) ->
+    {feature_enabled(), ReqData, Context}.
+
+is_authorized(ReqData, Context) ->
+    case required_user_tag() of
+        administrator ->
+            rabbit_mgmt_util:is_authorized_admin(ReqData, Context);
+        Tag ->
+            case rabbit_mgmt_util:is_authorized(ReqData, Context) of
+                {true, ReqData1, Context1} ->
+                    authorize_tag(Tag, ReqData1, Context1);
+                Other ->
+                    Other
+            end
+    end.
+
+%%--------------------------------------------------------------------
+%% Request pipeline
+%%--------------------------------------------------------------------
+
+accept_content(Req0, Context) ->
+    %% Enforce the feature toggle here, before touching any worker. For a PUT,
+    %% cowboy_rest routes resource_exists/2 -> false into the create path
+    %% (accept_content), NOT a 404 -- so resource_exists alone does not gate
+    %% the endpoint. When the feature is disabled, aws_sup starts no
+    %% semaphore worker, so reaching the pipeline below would gen_server:call
+    %% a non-existent process and crash (HTTP 500). Short-circuit to 404
+    %% instead, matching the documented toggle behaviour.
+    case feature_enabled() of
+        false ->
+            reply_error(404, method_disabled, <<"Validation method disabled">>, Req0, Context);
+        true ->
+            T0 = erlang:monotonic_time(millisecond),
+            SourceIP = peer_ip(Req0),
+            Method = cowboy_req:binding(method, Req0),
+            with_body(T0, SourceIP, Method, Req0, Context)
+    end.
+
+with_body(T0, SourceIP, Method, Req0, Context) ->
+    MaxBytes = max_body_size(),
+    case read_body(Req0, MaxBytes) of
+        {error, body_too_large, Req1} ->
+            audit(Method, SourceIP, input_invalid, T0),
+            reply_error(400, body_too_large, <<"Request body too large">>, Req1, Context);
+        {ok, RawBody, Req1} ->
+            case decode_json(RawBody) of
+                {error, _} ->
+                    audit(Method, SourceIP, input_invalid, T0),
+                    reply_error(400, input_invalid, <<"Invalid JSON body">>, Req1, Context);
+                {ok, BodyMap} when is_map(BodyMap) ->
+                    with_semaphore(T0, SourceIP, Method, BodyMap, Req1, Context);
+                {ok, _NotMap} ->
+                    audit(Method, SourceIP, input_invalid, T0),
+                    reply_error(
+                        400, input_invalid, <<"JSON body must be an object">>, Req1, Context
+                    )
+            end
+    end.
+
+with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
+    %% acquire/0 is a gen_server:call to the semaphore worker. The worker is
+    %% started by aws_sup only at boot when the feature is enabled; if the env
+    %% was flipped to true at runtime (no restart) or the supervisor gave up on
+    %% the worker, the call exits {noproc, _}. Catch exactly that here -- the
+    %% atomic acquire IS the liveness check, so there is no time-of-check vs
+    %% time-of-use window -- and map it to the same graceful 503 as a full
+    %% semaphore. Any other exit propagates (it is a genuine fault).
+    case try_acquire() of
+        not_ready ->
+            audit(Method, SourceIP, capacity_exhausted, T0),
+            reply_error(
+                503,
+                capacity_exhausted,
+                <<"Validation service is not ready; broker restart required">>,
+                Req,
+                Context
+            );
+        {error, full} ->
+            audit(Method, SourceIP, capacity_exhausted, T0),
+            reply_error(503, capacity_exhausted, <<"Service at capacity">>, Req, Context);
+        {ok, Ref} ->
+            try
+                %% Defense in depth for R6: a backend must always *return* a
+                %% fixed-category result, but if one ever raises, the escaping
+                %% exception would carry BodyMap (and any future secret it
+                %% holds) into a Cowboy crash report. Catch here, discarding the
+                %% class/reason/stacktrace so no request term is logged.
+                %%
+                %% A raise here is OUR fault, not the caller's: a real
+                %% unreachable server is *returned* as connection_failed by the
+                %% backend (which has its own R6 try/catch), so reaching this
+                %% clause means an unexpected internal error. Report it as a 500
+                %% rather than a 400 connection_failed, which would wrongly tell
+                %% the caller their LDAP server is unreachable.
+                Result = aws_auth_validate_registry:dispatch(Method, BodyMap),
+                audit(Method, SourceIP, result_category(Result), T0),
+                respond(Result, Req, Context)
+            catch
+                _Class:_Reason:_Stack ->
+                    audit(Method, SourceIP, internal_error, T0),
+                    reply_error(
+                        500,
+                        internal_error,
+                        <<"Internal error during validation">>,
+                        Req,
+                        Context
+                    )
+            after
+                aws_auth_validate_semaphore:release(Ref)
+            end
+    end.
+
+%% Acquire a semaphore slot, treating an absent worker as `not_ready' rather
+%% than letting the noproc exit escape. This is the single point of contact
+%% with the worker, so the acquire doubles as the liveness check -- no
+%% separate whereis/check beforehand, hence no TOCTOU window. Only a noproc
+%% (worker not registered / dead) is converted; every other exit propagates.
+try_acquire() ->
+    try
+        aws_auth_validate_semaphore:acquire()
+    catch
+        exit:{noproc, _} -> not_ready
+    end.
+
+%%--------------------------------------------------------------------
+%% Response mapping
+%%--------------------------------------------------------------------
+
+respond(ok, Req, Context) ->
+    Req1 = cowboy_req:reply(204, #{}, <<>>, Req),
+    {stop, Req1, Context};
+respond({error, unknown_method}, Req, Context) ->
+    reply_error(404, unknown_method, <<"Unknown validation method">>, Req, Context);
+respond({error, method_disabled}, Req, Context) ->
+    reply_error(404, method_disabled, <<"Validation method disabled">>, Req, Context);
+respond({error, Category, Reason}, Req, Context) when is_atom(Category), is_binary(Reason) ->
+    Status = status_for_category(Category),
+    reply_error(Status, Category, Reason, Req, Context).
+
+status_for_category(input_invalid) -> 400;
+status_for_category(connection_failed) -> 400;
+status_for_category(tls_failed) -> 400;
+status_for_category(query_invalid) -> 400;
+status_for_category(auth_failed) -> 422;
+status_for_category(config_conflict) -> 422;
+status_for_category(authz_unverified) -> 422.
+
+reply_error(Status, Category, Message, Req, Context) ->
+    Body = rabbit_json:encode(#{
+        error => atom_to_binary(Category, utf8),
+        message => Message
+    }),
+    Headers = #{<<"content-type">> => <<"application/json">>},
+    Req1 = cowboy_req:reply(Status, Headers, Body, Req),
+    {stop, Req1, Context}.
+
+result_category(ok) -> success;
+result_category({error, unknown_method}) -> unknown_method;
+result_category({error, method_disabled}) -> method_disabled;
+result_category({error, Category, _Reason}) -> Category.
+
+%%--------------------------------------------------------------------
+%% Authorization helpers
+%%--------------------------------------------------------------------
+
+%% Operator-configured non-administrator tag gating. The default
+%% (administrator) is handled in is_authorized/2 via the management
+%% plugin's helper, which already handles oauth tokens etc.
+%%
+%% An OPTIONS preflight reaches is_authorized/2 too, but rabbit_mgmt_util
+%% short-circuits OPTIONS to {true, _, Context} WITHOUT authenticating, so
+%% Context#context.user is `undefined'. Let that case through (the admin
+%% path does the same) so a CORS preflight is not rejected with a spurious
+%% 401 -- there is no body to act on, and the actual PUT is still gated.
+authorize_tag(_Tag, ReqData, #context{user = undefined} = Context) ->
+    {true, ReqData, Context};
+authorize_tag(Tag, ReqData, #context{user = #user{tags = Tags}} = Context) ->
+    case lists:member(Tag, Tags) of
+        true -> {true, ReqData, Context};
+        false -> not_authorised(ReqData, Context)
+    end;
+authorize_tag(_Tag, ReqData, Context) ->
+    not_authorised(ReqData, Context).
+
+not_authorised(ReqData, Context) ->
+    Body = rabbit_json:encode(#{
+        error => <<"insufficient_user_tag">>,
+        message => <<"User does not have required tag">>
+    }),
+    Headers = #{<<"content-type">> => <<"application/json">>},
+    Req1 = cowboy_req:reply(401, Headers, Body, ReqData),
+    {stop, Req1, Context}.
+
+%%--------------------------------------------------------------------
+%% Request helpers
+%%--------------------------------------------------------------------
+
+peer_ip(Req) ->
+    case cowboy_req:peer(Req) of
+        {IP, _Port} -> IP;
+        _ -> {0, 0, 0, 0}
+    end.
+
+read_body(Req0, MaxBytes) ->
+    Opts = #{length => MaxBytes + 1, period => 5_000},
+    case cowboy_req:read_body(Req0, Opts) of
+        {ok, Body, Req1} when byte_size(Body) =< MaxBytes ->
+            {ok, Body, Req1};
+        {ok, _Body, Req1} ->
+            {error, body_too_large, Req1};
+        {more, _Body, Req1} ->
+            {error, body_too_large, Req1}
+    end.
+
+decode_json(<<>>) ->
+    {ok, #{}};
+decode_json(Raw) ->
+    rabbit_json:try_decode(Raw).
+
+audit(Method, SourceIP, ResultCategory, T0) ->
+    Duration = erlang:monotonic_time(millisecond) - T0,
+    ?AWS_LOG_INFO(
+        "auth_validate: method=~ts source_ip=~ts result=~ts duration_ms=~B",
+        [Method, format_ip(SourceIP), ResultCategory, Duration]
+    ).
+
+format_ip(IP) when is_tuple(IP) ->
+    case inet:ntoa(IP) of
+        {error, _} -> <<"unknown">>;
+        Str -> list_to_binary(Str)
+    end;
+format_ip(_) ->
+    <<"unknown">>.
+
+%%--------------------------------------------------------------------
+%% Configuration accessors
+%%--------------------------------------------------------------------
+
+feature_enabled() ->
+    application:get_env(aws, auth_validation_enabled, false) =:= true.
+
+max_body_size() ->
+    case application:get_env(aws, auth_validation_max_body_size) of
+        {ok, N} when is_integer(N), N > 0, N =< 10_000_000 -> N;
+        _ -> ?DEFAULT_MAX_BODY_SIZE
+    end.
+
+required_user_tag() ->
+    case application:get_env(aws, auth_validation_required_user_tag) of
+        {ok, Tag} when is_atom(Tag) -> Tag;
+        _ -> ?DEFAULT_REQUIRED_USER_TAG
+    end.
