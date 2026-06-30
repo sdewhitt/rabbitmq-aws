@@ -11,6 +11,7 @@
 -module(aws_auth_validate_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("aws_lib.hrl").
 
 %%--------------------------------------------------------------------
 %% Semaphore
@@ -116,6 +117,67 @@ registry_field_filter_override_test_() ->
         ]}.
 
 %%--------------------------------------------------------------------
+%% Mgmt status mapping
+%%--------------------------------------------------------------------
+
+status_for_category_known_test() ->
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(input_invalid)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(connection_failed)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(tls_failed)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(query_invalid)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(auth_failed)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(config_conflict)),
+    ?assertEqual(422, aws_auth_validate_mgmt:status_for_category(authz_unverified)).
+
+%% A category outside the documented set maps to 500 rather than crashing.
+status_for_category_unknown_test() ->
+    ?assertEqual(500, aws_auth_validate_mgmt:status_for_category(some_future_category)).
+
+%%--------------------------------------------------------------------
+%% Mgmt body-size bound
+%%--------------------------------------------------------------------
+
+%% max_body_size/0 honours an in-range configured value and falls back to the
+%% effective default for anything outside 1..1_048_576 (the 1 MB ceiling). The
+%% effective default (65_536) is asserted indirectly via the out-of-range cases.
+max_body_size_bound_test_() ->
+    {foreach, fun() -> application:unset_env(aws, auth_validation_max_body_size) end,
+        fun(_) -> application:unset_env(aws, auth_validation_max_body_size) end, [
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 4096),
+                ?assertEqual(4096, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% The ceiling itself is accepted.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 1_048_576),
+                ?assertEqual(1_048_576, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% One byte over the ceiling falls back to the default.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 1_048_577),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% The old 10 MB ceiling is now out of range and falls back.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 10_000_000),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% Non-positive and non-integer values fall back too.
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, 0),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            fun() ->
+                application:set_env(aws, auth_validation_max_body_size, not_an_integer),
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end,
+            %% Unset reads as the default.
+            fun() ->
+                ?assertEqual(65_536, aws_auth_validate_mgmt:max_body_size())
+            end
+        ]}.
+
+%%--------------------------------------------------------------------
 %% LDAP backend (input parsing only - the real bind path needs slapd)
 %%--------------------------------------------------------------------
 
@@ -136,6 +198,7 @@ ldap_allowed_fields_test() ->
             <<"ssl_options">>,
             <<"dn_lookup_base">>,
             <<"dn_lookup_attribute">>,
+            <<"username">>,
             <<"queries">>
         ]
     ].
@@ -162,6 +225,18 @@ server_blocks_rfc1918_192_test() ->
 server_blocks_zero_network_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("0.0.0.0")).
 
+%% 100.64.0.0/10 (RFC 6598) carrier-grade NAT shared address space.
+server_blocks_cgnat_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.64.0.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.100.50.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.127.255.255")).
+
+%% Boundary: 100.63.x and 100.128.x are public space and must stay allowed, so
+%% the /10 mask (second octet 64..127) is not widened to the whole 100/8.
+server_allows_cgnat_boundaries_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("100.63.255.255")),
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("100.128.0.0")).
+
 server_blocks_ipv6_loopback_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::1")).
 
@@ -181,6 +256,21 @@ server_blocks_ipv6_link_local_test() ->
 %% An IPv4-mapped v6 address embedding IMDS must not bypass the v4 ranges.
 server_blocks_ipv4_mapped_imds_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("::ffff:169.254.169.254")).
+
+%% NAT64 (64:ff9b::/96) embeds a v4 address; on a host with a NAT64/DNS64
+%% resolver 64:ff9b::169.254.169.254 translates to IMDS, so it must be blocked.
+server_blocks_nat64_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("64:ff9b::169.254.169.254")).
+
+%% NAT64 wrapping a public v4 stays allowed: the embedded address, not the
+%% prefix, decides.
+server_allows_nat64_public_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("64:ff9b::8.8.8.8")).
+
+%% 240.0.0.0/4 (reserved/Class E) and the 255.255.255.255 limited broadcast.
+server_blocks_reserved_and_broadcast_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("240.0.0.1")),
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("255.255.255.255")).
 
 server_rejects_unresolvable_test() ->
     ?assertEqual(
@@ -206,6 +296,10 @@ peer_allowed_rebound_to_imds_blocked_test() ->
 peer_allowed_private_v4_blocked_test() ->
     ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({ok, {{10, 0, 0, 5}, 389}})).
 
+%% A peer that rebound into CGNAT (RFC 6598) must be caught on the live socket.
+peer_allowed_rebound_to_cgnat_blocked_test() ->
+    ?assertEqual(blocked, aws_auth_validate_ldap:peer_allowed({ok, {{100, 64, 0, 1}, 389}})).
+
 peer_allowed_public_v6_ok_test() ->
     ?assertEqual(
         ok, aws_auth_validate_ldap:peer_allowed({ok, {{16#2606, 16#4700, 0, 0, 0, 0, 0, 1}, 636}})
@@ -216,6 +310,16 @@ peer_allowed_rebound_to_v6_imds_blocked_test() ->
     ?assertEqual(
         blocked,
         aws_auth_validate_ldap:peer_allowed({ok, {{16#fd00, 16#0ec2, 0, 0, 0, 0, 0, 16#254}, 636}})
+    ).
+
+%% A peer that rebound to NAT64-wrapped IMDS (64:ff9b::169.254.169.254) must be
+%% caught on the live socket.
+peer_allowed_rebound_to_nat64_imds_blocked_test() ->
+    ?assertEqual(
+        blocked,
+        aws_auth_validate_ldap:peer_allowed(
+            {ok, {{16#0064, 16#ff9b, 0, 0, 0, 0, 16#a9fe, 16#a9fe}, 389}}
+        )
     ).
 
 %% Fail closed: an undeterminable peer (peername error) is treated as blocked.
@@ -363,6 +467,105 @@ ldap_queries_input_test_() ->
             )
         )
     ].
+
+%%--------------------------------------------------------------------
+%% Configured assume-role fallback (aws.arns.assume_role_arn)
+%%--------------------------------------------------------------------
+%% When the operator configured aws.arns.assume_role_arn, the validate endpoint
+%% assumes that role and resolves the request's ARNs under it, instead of the
+%% broker's bare ambient role. Mirrors the boot-path coverage in
+%% aws_arn_config_tests: meck aws_iam:assume_role/2 and aws_arn_util:resolve_arn/2
+%% and assert which credentials reach the resolve. The mecked resolve fails so no
+%% real connection is attempted; the password_arn resolve is the observation point.
+ldap_configured_assume_role_test_() ->
+    {foreach,
+        fun() ->
+            ok = meck:new(aws_iam, [no_link]),
+            ok = meck:new(aws_arn_util, [passthrough, no_link]),
+            ok
+        end,
+        fun(_) ->
+            application:unset_env(aws, arn_config),
+            catch meck:unload(aws_arn_util),
+            catch meck:unload(aws_iam),
+            ok
+        end,
+        [
+            {
+                "no configured role: assume_role is never called and the ambient "
+                "(credential-free) state reaches ARN resolution",
+                fun assume_role_not_configured_uses_ambient_state/0
+            },
+            {"configured role: the assumed credentials reach ARN resolution",
+                fun assume_role_configured_threads_assumed_credentials/0},
+            {
+                "configured role that fails to assume: input_invalid before any "
+                "ARN resolve",
+                fun assume_role_configured_failure_returns_input_invalid/0
+            }
+        ]}.
+
+%% A state carrying these credentials is distinguishable, via
+%% aws_lib:get_credentials/1, from the credential-free aws_lib:new().
+assume_role_test_assumed_state() ->
+    {ok, S} = aws_lib:set_credentials("assumed-key", "secret", "token", aws_lib:new()),
+    S.
+
+assume_role_test_access_key(State) ->
+    case aws_lib:get_credentials(State) of
+        {ok, #aws_credentials{access_key = Key}} -> Key;
+        {error, undefined} -> undefined
+    end.
+
+assume_role_not_configured_uses_ambient_state() ->
+    application:unset_env(aws, arn_config),
+    Self = self(),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+        Self ! {resolve_key, assume_role_test_access_key(State)},
+        {error, stop_here}
+    end),
+    %% resolve fails -> input_invalid, but we only care which state was threaded.
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(base_body(#{}))),
+    ?assertEqual(0, meck:num_calls(aws_iam, assume_role, '_')),
+    receive
+        {resolve_key, Key} -> ?assertEqual(undefined, Key)
+    after 1_000 -> ?assert(false)
+    end.
+
+assume_role_configured_threads_assumed_credentials() ->
+    application:set_env(aws, arn_config, [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+    ]),
+    Self = self(),
+    ok = meck:expect(aws_iam, assume_role, fun(_RoleArn, _State) ->
+        {ok, assume_role_test_assumed_state()}
+    end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+        Self ! {resolve_key, assume_role_test_access_key(State)},
+        {error, stop_here}
+    end),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(base_body(#{}))),
+    ?assertEqual(1, meck:num_calls(aws_iam, assume_role, '_')),
+    receive
+        {resolve_key, Key} -> ?assertEqual("assumed-key", Key)
+    after 1_000 -> ?assert(false)
+    end.
+
+assume_role_configured_failure_returns_input_invalid() ->
+    application:set_env(aws, arn_config, [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+    ]),
+    ok = meck:expect(aws_iam, assume_role, fun(_RoleArn, _State) ->
+        {error, boom}
+    end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) ->
+        erlang:error(resolve_should_not_be_reached)
+    end),
+    ?assertEqual(
+        {error, input_invalid, <<"failed to assume the configured role">>},
+        aws_auth_validate_ldap:validate(base_body(#{}))
+    ),
+    ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_')).
 
 %%--------------------------------------------------------------------
 %% R6: password must never reach a crash report / log, even on a raise
@@ -516,6 +719,7 @@ tls_body(CacertArn) ->
 %%--------------------------------------------------------------------
 
 parse_accepts_test_() ->
+    ok = ensure_query_vocabulary_interned(),
     [
         ?_assertMatch({ok, _}, aws_auth_validate_ldap_query:parse(Q))
      || Q <- accepted_queries()
@@ -529,6 +733,35 @@ parse_rejects_test_() ->
 
 parse_accepts_string_input_test() ->
     ?assertMatch({ok, _}, aws_auth_validate_ldap_query:parse("{constant, true}")).
+
+%% Atom-exhaustion guard: the query string is attacker-controlled, so parsing
+%% must never intern a new atom. A query naming an atom the broker has never
+%% interned is rejected, and crucially the rejection creates zero atoms (the
+%% old erl_scan:string/1 path interned one atom per distinct identifier).
+
+parse_rejects_unknown_atom_does_not_intern_test() ->
+    %% A syntactically valid term whose tag atom does not exist in the VM.
+    Q = <<"[{zzz_phantom_tag_never_interned, {constant, true}}]">>,
+    Before = erlang:system_info(atom_count),
+    Result = aws_auth_validate_ldap_query:parse(Q),
+    After = erlang:system_info(atom_count),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual(0, After - Before).
+
+parse_rejects_atom_flood_without_interning_test() ->
+    %% Many distinct never-seen atoms in one query: the pre-safe-lexer code
+    %% would have interned one atom each. Assert the whole batch is rejected
+    %% and not a single atom is created.
+    Atoms = [
+        unicode:characters_to_binary(["zzz_flood_atom_", integer_to_list(N)])
+     || N <- lists:seq(1, 500)
+    ],
+    Q = <<"[", (iolist_to_binary(lists:join(<<", ">>, Atoms)))/binary, "]">>,
+    Before = erlang:system_info(atom_count),
+    Result = aws_auth_validate_ldap_query:parse(Q),
+    After = erlang:system_info(atom_count),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual(0, After - Before).
 
 %% Literal DN extraction (the placeholder-free DNs used for static reachability)
 
@@ -563,6 +796,7 @@ literal_dns_nested_and_or_test() ->
     ).
 
 literal_dns_tag_queries_test() ->
+    ok = ensure_query_vocabulary_interned(),
     {ok, Q} = aws_auth_validate_ldap_query:parse(
         <<"[{administrator, {in_group, \"cn=admins,dc=x\"}}, {management, {constant, true}}]">>
     ),
@@ -578,6 +812,7 @@ literal_dns_exists_test() ->
     ).
 
 literal_dns_for_test() ->
+    ok = ensure_query_vocabulary_interned(),
     {ok, Q} = aws_auth_validate_ldap_query:parse(
         <<"{for, [{permission, configure, {in_group, \"cn=cfg,dc=x\"}}]}">>
     ),
@@ -615,6 +850,153 @@ literal_dns_bare_string_query_test() ->
     %% value, not a DN, so it contributes nothing.
     {ok, Q} = aws_auth_validate_ldap_query:parse(<<"\"just a string\"">>),
     ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+%%--------------------------------------------------------------------
+%% Placeholder filling (aws_auth_validate_ldap_query:fill/2)
+%%--------------------------------------------------------------------
+
+%% A literal in_group DN is unchanged by fill/2 and becomes evaluable.
+fill_in_group_literal_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=admins,ou=groups,dc=x,dc=com\"}">>
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, [{username, "alice"}]),
+    ?assertEqual("cn=admins,ou=groups,dc=x,dc=com", DN),
+    ?assert(aws_auth_validate_ldap_query:is_evaluable(DN)).
+
+%% A ${username} placeholder in a DN sink is substituted and the result becomes
+%% evaluable.
+fill_username_in_dn_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},ou=groups,dc=x,dc=com\"}">>
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, [{username, "alice"}]),
+    ?assertEqual("cn=alice,ou=groups,dc=x,dc=com", DN),
+    ?assert(aws_auth_validate_ldap_query:is_evaluable(DN)).
+
+%% DN sinks RFC 4514-escape the substituted value; the user_dn key is exempt
+%% (it already holds a complete DN). A username with a comma must be escaped
+%% inside a DN component but a user_dn value must not.
+fill_dn_escaping_test() ->
+    {ok, Q1} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},dc=x\"}">>
+    ),
+    {in_group, DN1} = aws_auth_validate_ldap_query:fill(Q1, [{username, "a,b"}]),
+    ?assertEqual("cn=a\\,b,dc=x", DN1),
+    {ok, Q2} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"${user_dn}\"}">>
+    ),
+    {in_group, DN2} = aws_auth_validate_ldap_query:fill(
+        Q2, [{user_dn, "cn=a,ou=people,dc=x"}]
+    ),
+    ?assertEqual("cn=a,ou=people,dc=x", DN2).
+
+%% A per-operation placeholder we cannot supply (${vhost}) survives unfilled,
+%% so the DN stays non-evaluable and the backend degrades it.
+fill_residual_placeholder_not_evaluable_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=admins,ou=${vhost},dc=x\"}">>
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, [{username, "alice"}]),
+    ?assertNot(aws_auth_validate_ldap_query:is_evaluable(DN)).
+
+%% equals/match value operands are filled RAW (no DN escaping) -- they are ACL
+%% value sinks, not DNs.
+fill_value_operand_raw_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{equals, \"${username}\", \"a,b\"}">>
+    ),
+    {equals, V1, V2} = aws_auth_validate_ldap_query:fill(Q, [{username, "x,y"}]),
+    ?assertEqual("x,y", value_str(V1)),
+    ?assertEqual("a,b", value_str(V2)).
+
+%% ad_args/1 splits a DOMAIN\\user username and yields nothing for other shapes.
+ad_args_test() ->
+    ?assertEqual(
+        [{ad_domain, "CORP"}, {ad_user, "alice"}],
+        aws_auth_validate_ldap_query:ad_args("CORP\\alice")
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:ad_args("alice")),
+    ?assertEqual([], aws_auth_validate_ldap_query:ad_args(<<"alice">>)).
+
+%% No-username path is unchanged: a placeholder-bearing DN is not literal, so
+%% literal_dns/1 still skips it (backward-compat guard).
+fill_does_not_affect_literal_dns_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},dc=x\"}">>
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+value_str({string, S}) -> S;
+value_str(S) when is_list(S) -> S.
+
+%% Parity of fill/2 with the broker's fill machinery (design req R12). Our DN
+%% sinks must match rabbit_ldap_rfc4514:fill_dn/2 and our value sinks must match
+%% rabbit_auth_backend_ldap_util:fill/2. Skips unless both upstream modules are
+%% loadable (same matrix concern as the parser parity test).
+fill_parity_test_() ->
+    case fill_upstream_usable() of
+        true ->
+            [
+                {
+                    "dn:" ++ Fmt,
+                    ?_assertEqual(
+                        rabbit_ldap_rfc4514:fill_dn(Fmt, Args),
+                        fill_dn_via_query(Fmt, Args)
+                    )
+                }
+             || {Fmt, Args} <- fill_dn_corpus()
+            ] ++
+                [
+                    {
+                        "raw:" ++ Fmt,
+                        ?_assertEqual(
+                            rabbit_auth_backend_ldap_util:fill(Fmt, Args),
+                            fill_raw_via_query(Fmt, Args)
+                        )
+                    }
+                 || {Fmt, Args} <- fill_raw_corpus()
+                ];
+        false ->
+            []
+    end.
+
+%% Drive our DN-sink fill through a parsed in_group query and recover the DN.
+fill_dn_via_query(Fmt, Args) ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        list_to_binary("{in_group, \"" ++ Fmt ++ "\"}")
+    ),
+    {in_group, DN} = aws_auth_validate_ldap_query:fill(Q, Args),
+    DN.
+
+%% Drive our value-sink (raw) fill through the second operand of an equals query.
+fill_raw_via_query(Fmt, Args) ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        list_to_binary("{equals, \"x\", \"" ++ Fmt ++ "\"}")
+    ),
+    {equals, _, V} = aws_auth_validate_ldap_query:fill(Q, Args),
+    value_str(V).
+
+fill_dn_corpus() ->
+    [
+        {"cn=${username},dc=x", [{username, "alice"}]},
+        {"cn=${username},dc=x", [{username, "a,b+c"}]},
+        {"${user_dn}", [{user_dn, "cn=a,ou=people,dc=x"}]},
+        {"cn=${ad_user},dc=${ad_domain}", [{ad_user, "u"}, {ad_domain, "d"}]}
+    ].
+
+fill_raw_corpus() ->
+    [
+        {"${username}", [{username, "alice"}]},
+        {"${username}", [{username, "a,b"}]},
+        {"pre-${username}-post", [{username, "x"}]}
+    ].
+
+fill_upstream_usable() ->
+    code:ensure_loaded(rabbit_ldap_rfc4514) =/= {error, nofile} andalso
+        code:ensure_loaded(rabbit_auth_backend_ldap_util) =/= {error, nofile} andalso
+        erlang:function_exported(rabbit_ldap_rfc4514, fill_dn, 2) andalso
+        erlang:function_exported(rabbit_auth_backend_ldap_util, fill, 2).
 
 %% Parity with rabbit_auth_backend_ldap_util:parse_query/1 (design req R12).
 %% The broker's parser throws via cuttlefish:invalid/2 on rejection; ours
@@ -654,6 +1036,51 @@ upstream_parser_usable() ->
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+%% The query DSL parser tokenizes via the safe, non-interning lexer, so it
+%% only accepts atoms that ALREADY exist in the VM. A running broker has
+%% interned the whole legitimate vocabulary -- grammar keywords (from the
+%% parser module itself), the configure/write/read permissions and the
+%% for-query variable names (from core rabbit and rabbit_auth_backend_ldap),
+%% the in_group_nested scopes, and every configured user tag. The bare eunit
+%% node has executed almost none of that code, so those atoms are absent and a
+%% legitimate query would be wrongly rejected here (but NOT in production).
+%% Reference the vocabulary the corpus exercises as literals so the test node
+%% mirrors a running broker. This list is test scaffolding, not a parser
+%% allowlist: the parser accepts ANY already-interned atom (open tag set),
+%% exactly as the broker does.
+ensure_query_vocabulary_interned() ->
+    %% list_to_atom/1 unconditionally interns, which is exactly what a running
+    %% broker has already done for this vocabulary through normal operation.
+    %% (A literal atom list would only intern at THIS module's load time, which
+    %% eunit does not guarantee precedes the parser's list_to_existing_atom/1
+    %% check; list_to_atom/1 is unambiguous.)
+    _ = [
+        list_to_atom(A)
+     || A <- [
+            %% permissions
+            "configure",
+            "write",
+            "read",
+            %% for-query variable names
+            "username",
+            "user_dn",
+            "vhost",
+            "resource",
+            "name",
+            "permission",
+            %% in_group_nested scopes
+            "subtree",
+            "singlelevel",
+            "single_level",
+            "onelevel",
+            "one_level",
+            %% the specific tags the accepted-query corpus references
+            "administrator",
+            "management"
+        ]
+    ],
+    ok.
 
 stop(Pid) ->
     unlink(Pid),

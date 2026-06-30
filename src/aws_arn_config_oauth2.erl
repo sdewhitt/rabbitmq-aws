@@ -15,6 +15,8 @@ run(_KeyStr, providers_https_cacertfile, OAuth2Map, State) when is_map(OAuth2Map
     % are whatever key is necessary to handle the content.
     % maps:fold threads the aws_state() through each ARN resolution so the
     % updated state (and any refreshed credentials) propagates across entries.
+    % The final state is returned to the caller (aws_arn_config:run_arn_handlers/2)
+    % so subsequent handlers see credentials this handler refreshed.
     F = fun(MapKey, Arn, StateAcc) ->
         case aws_arn_util:resolve_arn(Arn, StateAcc) of
             {ok, Content, StateAcc1} ->
@@ -22,21 +24,45 @@ run(_KeyStr, providers_https_cacertfile, OAuth2Map, State) when is_map(OAuth2Map
                     ok ->
                         StateAcc1;
                     Error ->
-                        throw({handle_content_error, Error})
+                        throw(apply_error(MapKey, Arn, Error))
                 end;
             Error ->
-                throw({arn_map_error, Error})
+                throw(resolve_error(MapKey, Arn, Error))
         end
     end,
     try
-        _FinalState = maps:fold(F, State, OAuth2Map),
-        ok
+        FinalState = maps:fold(F, State, OAuth2Map),
+        {ok, FinalState}
     catch
-        throw:{arn_map_error, Error} ->
-            Error;
-        throw:{handle_content_error, Error} ->
+        throw:{error, _} = Error ->
             Error
     end.
+
+%% Wrap a resolve failure for an oauth2 provider ARN with context, matching the
+%% {error, {BinaryMsg, OrigError}} shape aws_arn_config:get_resolve_arn_error/3
+%% produces for the regular handlers, so both paths report errors uniformly.
+resolve_error(ProviderKey, Arn, {error, E} = Error) ->
+    wrap_error(
+        io_lib:format(
+            "could not resolve ARN '~ts' for oauth2 provider '~ts', error: ~tp",
+            [Arn, ProviderKey, E]
+        ),
+        Error
+    ).
+
+%% Wrap a content-application failure: the ARN resolved, but decoding or storing
+%% the certificate failed.
+apply_error(ProviderKey, Arn, {error, E} = Error) ->
+    wrap_error(
+        io_lib:format(
+            "resolved ARN '~ts' for oauth2 provider '~ts' but could not apply it, error: ~tp",
+            [Arn, ProviderKey, E]
+        ),
+        Error
+    ).
+
+wrap_error(Msg, Error) ->
+    {error, {rabbit_data_coercion:to_utf8_binary(Msg), Error}}.
 
 %%--------------------------------------------------------------------------------------------------
 %% rabbitmq_auth_backend_oauth2 plugin

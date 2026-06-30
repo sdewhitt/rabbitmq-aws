@@ -130,21 +130,37 @@
 %% the app env only when an operator sets it explicitly.
 
 %% @doc Maximum HTTP request body size in bytes (effective default 65536).
+%% The 1..1048576 bound is enforced at runtime by
+%% aws_auth_validate_mgmt:max_body_size/0, which falls back to the default for
+%% an out-of-range value. The datatype is plain `integer' rather than an inline
+%% {integer, [{min, _}, {max, _}]}: the constrained form is rejected by older
+%% cuttlefish releases ("not a supported datatype"), and this plugin is loaded
+%% against a range of broker versions.
 {mapping, "aws.auth_validation.max_body_size", "aws.auth_validation_max_body_size",
     [{datatype, integer}]}.
 
 %% @doc Maximum concurrent outbound auth-validation connections (effective
-%% default 5; applied by aws_sup).
+%% default 5). The 1..100 bound is enforced at runtime by
+%% aws_sup:get_int_env/3, which falls back to the default for an out-of-range
+%% value. Plain `integer' datatype: see the max_body_size note above.
 {mapping, "aws.auth_validation.max_concurrent", "aws.auth_validation_max_concurrent",
     [{datatype, integer}]}.
 
-%% @doc Per-connection timeout in milliseconds for outbound calls
-%% (effective default 5000).
+%% @doc Per-connection timeout in milliseconds for outbound calls (effective
+%% default 5000). The 1..60000 bound is enforced at runtime by
+%% aws_auth_validate_ldap:connection_timeout_ms/0, which falls back to the
+%% default for an out-of-range value. Plain `integer' datatype: see the
+%% max_body_size note above.
 {mapping, "aws.auth_validation.connection_timeout_ms", "aws.auth_validation_connection_timeout_ms",
     [{datatype, integer}]}.
 
 %% @doc Required management user tag to access the endpoint (effective
-%% default administrator).
+%% default administrator). This endpoint makes outbound LDAP/network
+%% connections to operator-supplied targets, so any user with the configured
+%% tag can use it to probe reachability of hosts the broker can reach (an SSRF
+%% surface, mitigated by the SSRF filter in aws_auth_validate_ldap). Lowering
+%% this from administrator grants that capability to less-privileged users;
+%% keep it at administrator unless that trade-off is understood.
 {mapping, "aws.auth_validation.required_user_tag", "aws.auth_validation_required_user_tag",
     [{datatype, atom}]}.
 

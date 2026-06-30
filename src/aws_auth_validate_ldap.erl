@@ -118,8 +118,10 @@
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+-define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_BAD_DN_LOOKUP_BASE, <<"dn_lookup_base must be a non-empty string">>).
 -define(REASON_BAD_DN_LOOKUP_ATTR, <<"dn_lookup_attribute must be a non-empty string">>).
+-define(REASON_BAD_USERNAME, <<"username must be a non-empty string">>).
 -define(REASON_BAD_QUERIES, <<"queries must be an object of query strings">>).
 -define(REASON_BAD_QUERY_VALUE, <<"each query must be a non-empty string">>).
 -define(REASON_QUERY_PARSE, <<"one or more authorization queries are not valid">>).
@@ -128,6 +130,12 @@
 ).
 -define(REASON_AUTHZ_UNVERIFIED,
     <<"a DN referenced by an authorization query could not be verified">>
+).
+-define(REASON_NOT_MEMBER,
+    <<"the supplied username is not authorized by one or more authorization queries">>
+).
+-define(REASON_USERNAME_UNRESOLVED,
+    <<"the supplied username could not be resolved to a single directory entry">>
 ).
 
 method_name() ->
@@ -144,6 +152,7 @@ allowed_fields() ->
         <<"ssl_options">>,
         <<"dn_lookup_base">>,
         <<"dn_lookup_attribute">>,
+        <<"username">>,
         <<"queries">>
     ].
 
@@ -162,16 +171,67 @@ validate(Body) when is_map(Body) ->
                 {error, _, _} = Err ->
                     Err;
                 ok ->
-                    case resolve_password(Body, Params) of
+                    case resolve_request_state(Params) of
                         {error, _, _} = Err ->
                             Err;
-                        {ok, Params1} ->
-                            case resolve_cacert(Params1) of
-                                {error, _, _} = Err -> Err;
-                                {ok, Params2} -> do_ldap_validate(Params2)
+                        {ok, Params0} ->
+                            case resolve_password(Body, Params0) of
+                                {error, _, _} = Err ->
+                                    Err;
+                                {ok, Params1} ->
+                                    case resolve_cacert(Params1) of
+                                        {error, _, _} = Err -> Err;
+                                        {ok, Params2} -> do_ldap_validate(Params2)
+                                    end
                             end
                     end
             end
+    end.
+
+%% Build the per-request aws_lib state used for every ARN fetch in this request.
+%% Runs in the network phase, after all pure input validation has passed, so a
+%% malformed request never triggers an STS AssumeRole call.
+%%
+%% When the operator configured `aws.arns.assume_role_arn', assume that role
+%% into the request's aws_lib state -- the SAME role the plugin already assumes
+%% at boot to resolve every configured ARN (aws_arn_config:maybe_assume_role/1).
+%% Honoring it here closes a parity gap: without it the validate endpoint would
+%% resolve password_arn/cacertfile_arn with the broker's bare ambient (EC2
+%% instance) role even though the operator told the plugin to use a specific
+%% role for ARN resolution. This is operator config, not caller input, so it
+%% raises no confused-deputy concern. With no role configured, a default state
+%% is used and ARNs resolve with the ambient role -- the prior behavior.
+%%
+%% The state is request-local (aws_lib threads credentials per call -- there is
+%% no global singleton to clobber), so the assumed role's credentials are
+%% visible only to this request's ARN resolutions and are discarded when the
+%% request ends.
+resolve_request_state(Params) ->
+    case configured_assume_role_arn() of
+        none ->
+            {ok, Params#{aws_state => aws_lib:new()}};
+        RoleArn ->
+            case aws_iam:assume_role(RoleArn, aws_lib:new()) of
+                {ok, State} -> {ok, Params#{aws_state => State}};
+                {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
+            end
+    end.
+
+%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
+%% read from the same `aws, arn_config' env the boot sequence uses
+%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
+%% when unset.
+configured_assume_role_arn() ->
+    case application:get_env(aws, arn_config) of
+        {ok, ArnConfig} when is_list(ArnConfig) ->
+            case proplists:get_value(assume_role_arn, ArnConfig) of
+                undefined -> none;
+                Arn when is_list(Arn) -> Arn;
+                Arn when is_binary(Arn) -> binary_to_list(Arn);
+                _ -> none
+            end;
+        _ ->
+            none
     end.
 
 %%--------------------------------------------------------------------
@@ -190,6 +250,7 @@ parse_input(Body) ->
         fun parse_ssl_options/2,
         fun parse_dn_lookup_base/2,
         fun parse_dn_lookup_attribute/2,
+        fun parse_username/2,
         fun parse_queries/2
     ],
     parse_input(Steps, Body, #{timeout => connection_timeout_ms()}).
@@ -240,10 +301,10 @@ parse_user_dn(Body, Acc) ->
 %% fetch. The resolved password is added to the params map and never logged
 %% or returned. Validated for shape here (rather than in parse_input) so the
 %% network call stays out of the pure pipeline.
-resolve_password(Body, Params) ->
+resolve_password(Body, #{aws_state := State} = Params) ->
     case maps:get(<<"password_arn">>, Body, undefined) of
         Arn when is_binary(Arn), byte_size(Arn) > 0 ->
-            case resolve_arn(Arn) of
+            case resolve_arn(Arn, State) of
                 {ok, Password} -> {ok, Params#{password => Password}};
                 {error, _} -> {error, input_invalid, ?REASON_ARN_RESOLVE}
             end;
@@ -268,12 +329,12 @@ resolve_password(Body, Params) ->
 %% fetch and could reject an otherwise-valid plaintext config.
 resolve_cacert(#{use_ssl := false, use_starttls := false} = Params) ->
     {ok, Params};
-resolve_cacert(#{ssl_options := SslOpts} = Params) ->
+resolve_cacert(#{ssl_options := SslOpts, aws_state := State} = Params) ->
     case maps:get(<<"cacertfile_arn">>, SslOpts, undefined) of
         undefined ->
             {ok, Params};
         Arn when is_binary(Arn) ->
-            case resolve_arn(Arn) of
+            case resolve_arn(Arn, State) of
                 {ok, PemData} ->
                     %% pem_entry_decode/1 can raise on a malformed entry; an
                     %% empty/undecodable PEM returns `skip'. Both mean the ARN
@@ -384,6 +445,22 @@ parse_dn_lookup_attribute(Body, Acc) ->
             {error, input_invalid, ?REASON_BAD_DN_LOOKUP_ATTR}
     end.
 
+%% Optional principal to evaluate authorization queries against. When absent we
+%% store `none' and the authz check stays in its literal-DN reachability mode
+%% (exactly today's behavior). When present, the bound service connection
+%% resolves it to a user DN and the queries' ${username}/${user_dn} placeholders
+%% are filled so membership is actually evaluated. The username is an identifier,
+%% not a credential -- no principal password is accepted (see resolve_user_dn/2).
+parse_username(Body, Acc) ->
+    case maps:get(<<"username">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{username => none}};
+        Username when is_binary(Username), byte_size(Username) > 0 ->
+            {ok, Acc#{username => binary_to_list(Username)}};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_USERNAME}
+    end.
+
 %% `queries' is an optional object mapping query names (tags, vhost_access,
 %% resource_access, topic_access) to query-DSL strings. Each value is parsed
 %% with the broker-compatible grammar; unknown query names are ignored (the
@@ -458,13 +535,19 @@ check_server_ip(Server) ->
             end
     end.
 
-%% Block RFC 1918, loopback, link-local, and cloud metadata ranges.
+%% Block RFC 1918, loopback, link-local, CGNAT, and cloud metadata ranges.
+%%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space (second
+%%   octet 64..127); it can route to provider/internal infrastructure, so it is
+%%   denied alongside the RFC 1918 ranges.
 is_private_ip({127, _, _, _}) -> true;
 is_private_ip({10, _, _, _}) -> true;
 is_private_ip({172, B, _, _}) when B >= 16, B =< 31 -> true;
 is_private_ip({192, 168, _, _}) -> true;
 is_private_ip({169, 254, _, _}) -> true;
+is_private_ip({100, B, _, _}) when B >= 64, B =< 127 -> true;
 is_private_ip({0, _, _, _}) -> true;
+%% 240.0.0.0/4 (reserved/Class E, including 255.255.255.255 limited broadcast).
+is_private_ip({B, _, _, _}) when B >= 240 -> true;
 is_private_ip(_) -> false.
 
 %% Block the IPv6 ranges that correspond to the v4 blocks above, so the filter
@@ -474,14 +557,17 @@ is_private_ip(_) -> false.
 %%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
 %%                  address fd00:ec2::254 -- the whole point of this block.
 %%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
-%% IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses embed
-%% a v4 address in the low 32 bits; re-check those against the v4 ranges so e.g.
-%% ::ffff:169.254.169.254 cannot reach IMDS.
+%% IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), and NAT64
+%% (64:ff9b::a.b.c.d) addresses embed a v4 address in the low 32 bits; re-check
+%% those against the v4 ranges so e.g. ::ffff:169.254.169.254 (and the NAT64
+%% form 64:ff9b::169.254.169.254, which a host with a NAT64/DNS64 resolver would
+%% translate to IMDS) cannot reach IMDS.
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
 is_private_ip6({0, 0, 0, 0, 0, 16#ffff, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
+is_private_ip6({16#0064, 16#ff9b, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6({0, 0, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6(_) -> false.
 
@@ -603,13 +689,61 @@ peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 8 ->
 peer_allowed(_) ->
     blocked.
 
-%% After a successful bind, run the optional DN-lookup and authorization
-%% checks in sequence on the same bound handle. The first failure wins; if
-%% none are configured (or all pass) the request succeeds with `ok'.
+%% After a successful bind, run the optional DN-lookup, principal resolution,
+%% and authorization checks in sequence on the same bound handle. The first
+%% failure wins; if none are configured (or all pass) the request succeeds with
+%% `ok'. When a username was supplied we resolve it to a user DN here (between
+%% the dn_lookup-base reachability check and the query evaluation) so the authz
+%% queries can be evaluated for that principal rather than only reachability-
+%% checked.
 post_bind_checks(Handle, Params) ->
     case check_dn_lookup(Handle, Params) of
-        ok -> check_authz_queries(Handle, Params);
-        {error, _, _} = Err -> Err
+        ok ->
+            case resolve_principal_dn(Handle, Params) of
+                {ok, UserDn} ->
+                    check_authz_queries(Handle, Params#{resolved_user_dn => UserDn});
+                {error, _, _} = Err ->
+                    Err
+            end;
+        {error, _, _} = Err ->
+            Err
+    end.
+
+%% Resolve the request-supplied username to a single user DN, using the bound
+%% service connection -- the same equalityMatch(dn_lookup_attribute, username)
+%% search rabbit_auth_backend_ldap:dn_lookup/2 runs. This is a read over the
+%% admin's own credentials; no principal password is involved. We read the
+%% matched entry's object_name (its DN), not an attribute value. Unlike the
+%% broker -- which silently falls back to an escaped user_dn pattern on 0/many
+%% matches -- the endpoint treats anything other than exactly one match as
+%% authz_unverified, since at validation time an unresolvable username is
+%% precisely the misconfiguration the admin wants surfaced.
+%%
+%% `none' means no username was supplied (or no dn_lookup config to resolve it
+%% with): we return `unknown', and query evaluation falls back to the literal-DN
+%% reachability path -- exactly today's behavior.
+resolve_principal_dn(_Handle, #{username := none}) ->
+    {ok, unknown};
+resolve_principal_dn(_Handle, #{dn_lookup_base := none}) ->
+    {ok, unknown};
+resolve_principal_dn(_Handle, #{dn_lookup_attribute := none}) ->
+    {ok, unknown};
+resolve_principal_dn(Handle, #{
+    username := Username,
+    dn_lookup_base := Base,
+    dn_lookup_attribute := Attr
+}) ->
+    case
+        eldap:search(Handle, [
+            {base, Base},
+            {filter, eldap:equalityMatch(Attr, Username)},
+            {attributes, ["distinguishedName"]}
+        ])
+    of
+        {ok, #eldap_search_result{entries = [#eldap_entry{object_name = Dn}]}} ->
+            {ok, Dn};
+        _ ->
+            {error, authz_unverified, ?REASON_USERNAME_UNRESOLVED}
     end.
 
 %%--------------------------------------------------------------------
@@ -633,18 +767,35 @@ check_dn_lookup(Handle, #{dn_lookup_base := Base}) ->
 %% Authorization query validation
 %%--------------------------------------------------------------------
 
-%% For each parsed query, extract the fully-literal DNs (those with no
-%% ${...} runtime placeholder) and confirm each exists and is readable by
-%% the bound user. Queries that reference only runtime-filled DNs contribute
-%% no checks -- they were already validated for grammar at parse time.
-check_authz_queries(Handle, #{queries := Queries}) ->
+%% Two modes, selected by whether a principal was resolved:
+%%
+%%   * No principal (resolved_user_dn = unknown) -- today's behavior. For each
+%%     parsed query, extract the fully-literal DNs (no ${...} placeholder) and
+%%     confirm each exists and is readable. Queries that reference only
+%%     runtime-filled DNs contribute no checks (grammar-validated at parse time).
+%%
+%%   * With a principal -- fill each query's ${username}/${user_dn}/${ad_*}
+%%     placeholders for that user, then *evaluate* it against the bound handle
+%%     (membership, existence, attribute comparisons), mirroring how
+%%     rabbit_auth_backend_ldap evaluates the same query. A query that evaluates
+%%     false is the real misconfiguration signal (the user is not authorized);
+%%     a node still carrying an unfillable per-operation placeholder
+%%     (${vhost}/${resource}/...) is grammar-checked-only and degrades rather
+%%     than failing.
+check_authz_queries(Handle, #{queries := Queries, resolved_user_dn := unknown}) ->
     LiteralDns = lists:usort(
         lists:flatmap(
             fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
             Queries
         )
     ),
-    check_dns(Handle, LiteralDns).
+    check_dns(Handle, LiteralDns);
+check_authz_queries(Handle, #{queries := Queries, resolved_user_dn := UserDn} = Params) ->
+    Username = maps:get(username, Params),
+    Args =
+        [{username, Username}, {user_dn, UserDn}] ++
+            aws_auth_validate_ldap_query:ad_args(Username),
+    eval_queries(Handle, Queries, Args).
 
 check_dns(_Handle, []) ->
     ok;
@@ -653,6 +804,146 @@ check_dns(Handle, [DN | Rest]) ->
         true -> check_dns(Handle, Rest);
         _ -> {error, authz_unverified, ?REASON_AUTHZ_UNVERIFIED}
     end.
+
+%% Evaluate each query for the resolved principal. The first query that is
+%% conclusively false (the user is not authorized by it) wins and maps to
+%% authz_unverified; a query that cannot be evaluated (only unfillable
+%% per-operation placeholders) is skipped. All-pass/all-degrade -> ok.
+eval_queries(_Handle, [], _Args) ->
+    ok;
+eval_queries(Handle, [{_Name, Query} | Rest], Args) ->
+    Filled = aws_auth_validate_ldap_query:fill(Query, Args),
+    UserDn = proplists:get_value(user_dn, Args),
+    case eval_query(Handle, Filled, UserDn) of
+        skip -> eval_queries(Handle, Rest, Args);
+        true -> eval_queries(Handle, Rest, Args);
+        false -> {error, authz_unverified, ?REASON_NOT_MEMBER}
+    end.
+
+%% Evaluate one (already principal-filled) query against the bound handle,
+%% mirroring rabbit_auth_backend_ldap:evaluate0/4 minus the connection/creds
+%% machinery (the bind identity is fixed = the service account; the broker's
+%% as_user path is unreachable since no principal password exists). Returns
+%% `true' | `false' | `skip', where `skip' means the term could not be
+%% evaluated at validation time (an unfillable ${vhost}/${resource}/... DN, or a
+%% sub-result that itself degraded) and must not be treated as a failure.
+%% Composition guards against non-boolean (skipped) sub-results so `not'/`and'/
+%% `or' never badarg the way the broker's raw boolean ops could. UserDn is
+%% threaded through composition so nested membership terms can still evaluate.
+eval_query(_Handle, {constant, Bool}, _UserDn) when is_boolean(Bool) ->
+    Bool;
+eval_query(Handle, {exists, DN}, _UserDn) ->
+    eval_dn_probe(DN, fun(Dn) -> object_exists(Handle, Dn) end);
+eval_query(Handle, {in_group, DN}, UserDn) ->
+    eval_query(Handle, {in_group, DN, "member"}, UserDn);
+eval_query(Handle, {in_group, DN, Desc}, UserDn) ->
+    eval_membership(Handle, DN, Desc, UserDn);
+eval_query(Handle, {in_group_nested, DN}, UserDn) ->
+    eval_query(Handle, {in_group_nested, DN, "member"}, UserDn);
+eval_query(Handle, {in_group_nested, DN, Desc}, UserDn) ->
+    %% Nested membership needs a group-search base the endpoint does not model
+    %% (the broker's group_lookup_base). Rather than search a wrong base, fall
+    %% back to direct membership at the named group -- a safe subset that still
+    %% catches the common "is the user in THIS group" case; deeper nesting
+    %% degrades to that single hop.
+    eval_membership(Handle, DN, Desc, UserDn);
+eval_query(Handle, {in_group_nested, DN, Desc, _Scope}, UserDn) ->
+    eval_membership(Handle, DN, Desc, UserDn);
+eval_query(Handle, {'not', Sub}, UserDn) ->
+    %% Negate only a conclusive sub-result; a skipped sub-result stays skipped.
+    case eval_query(Handle, Sub, UserDn) of
+        skip -> skip;
+        Bool -> not Bool
+    end;
+eval_query(Handle, {'and', Subs}, UserDn) when is_list(Subs) ->
+    eval_and(Handle, Subs, UserDn);
+eval_query(Handle, {'or', Subs}, UserDn) when is_list(Subs) ->
+    eval_or(Handle, Subs, UserDn);
+eval_query(_Handle, _Other, _UserDn) ->
+    %% equals/match/for and any residual shape need per-operation context
+    %% (${vhost}/${resource}/...) or attribute reads the endpoint does not model
+    %% for validation; degrade rather than guess.
+    skip.
+
+%% Conjunction over true/false/skip: any conclusive false short-circuits to
+%% false; otherwise the result is true only if every conjunct is true, else skip
+%% (at least one conjunct degraded).
+eval_and(_Handle, [], _UserDn) ->
+    true;
+eval_and(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        false -> false;
+        skip -> eval_and_skip(Handle, Rest, UserDn);
+        true -> eval_and(Handle, Rest, UserDn)
+    end.
+
+%% After a conjunct degraded, a later conclusive false still makes the whole
+%% `and' false; otherwise it can only be skip (cannot prove all-true).
+eval_and_skip(_Handle, [], _UserDn) ->
+    skip;
+eval_and_skip(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        false -> false;
+        _ -> eval_and_skip(Handle, Rest, UserDn)
+    end.
+
+%% Disjunction over true/false/skip: any conclusive true short-circuits to true;
+%% otherwise false only if every disjunct is false, else skip.
+eval_or(_Handle, [], _UserDn) ->
+    false;
+eval_or(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        true -> true;
+        skip -> eval_or_skip(Handle, Rest, UserDn);
+        false -> eval_or(Handle, Rest, UserDn)
+    end.
+
+eval_or_skip(_Handle, [], _UserDn) ->
+    skip;
+eval_or_skip(Handle, [Sub | Rest], UserDn) ->
+    case eval_query(Handle, Sub, UserDn) of
+        true -> true;
+        _ -> eval_or_skip(Handle, Rest, UserDn)
+    end.
+
+%% Resolve a (filled) DN to a probe result, degrading when a placeholder
+%% survived (per-operation context we cannot supply).
+eval_dn_probe(DN, Probe) ->
+    case aws_auth_validate_ldap_query:is_evaluable(DN) of
+        true -> Probe(dn_str(DN));
+        false -> skip
+    end.
+
+%% Membership probe mirroring rabbit_auth_backend_ldap in_group/3: a base-scoped
+%% search at the group DN with an equalityMatch on the membership attribute
+%% (default "member") against the resolved user DN. A match means the user is a
+%% member. Distinct from object_exists/2, which only proves the group EXISTS;
+%% reusing that here would wrongly pass a real-but-non-member group. Any
+%% non-{ok,_} collapses to false (never raises -- R6).
+eval_membership(_Handle, _DN, _Desc, undefined) ->
+    %% No resolved principal in scope for this sub-result; degrade.
+    skip;
+eval_membership(Handle, DN, Desc, UserDn) ->
+    eval_dn_probe(DN, fun(GroupDn) -> member_exists(Handle, GroupDn, Desc, UserDn) end).
+
+member_exists(Handle, GroupDn, Desc, UserDn) ->
+    case
+        eldap:search(Handle, [
+            {base, GroupDn},
+            {filter, eldap:equalityMatch(Desc, UserDn)},
+            {attributes, ["objectClass"]},
+            {scope, eldap:baseObject()}
+        ])
+    of
+        {ok, #eldap_search_result{entries = Entries}} ->
+            length(Entries) > 0;
+        _ ->
+            false
+    end.
+
+dn_str({string, Pattern}) -> dn_str(Pattern);
+dn_str(DN) when is_binary(DN) -> binary_to_list(DN);
+dn_str(DN) when is_list(DN) -> DN.
 
 %% Base-scoped existence probe. Mirrors rabbit_auth_backend_ldap:object_exists/3
 %% (base object, present(objectClass) filter) so a DN this returns true for is
@@ -808,17 +1099,18 @@ decode_pem_cacerts(B) when is_binary(B) ->
 
 %%--------------------------------------------------------------------
 
-%% Each request builds its own aws_state(); region and credentials are
-%% threaded through that value rather than written to a shared singleton, so
-%% concurrent validations can no longer clobber each other's region and no
-%% lock is needed. R6 is preserved -- resolution runs in the caller process and
-%% the resolved secret is neither logged nor returned (only adapted to the
-%% caller's {ok, Binary} contract). R3 is preserved -- this still runs only
-%% after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
+%% Resolve an ARN using the request's threaded aws_state(). The state is built
+%% once per request by resolve_request_state/1 -- a default state (broker's
+%% ambient role) or one with the operator-configured assume_role assumed -- and
+%% passed to every ARN fetch in the request. Region and credentials live in that
+%% value, not a shared singleton, so concurrent validations cannot clobber each
+%% other. R6 is preserved -- resolution runs in the caller process and the
+%% resolved secret is neither logged nor returned (only adapted to the caller's
+%% {ok, Binary} contract). R3 is preserved -- this still runs only after the pure
+%% validation pipeline. The 3-tuple {ok, Data, State1} from
 %% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
-%% two callers expect; the threaded state is request-scoped and discarded here.
-resolve_arn(Arn) when is_binary(Arn) ->
-    State = aws_lib:new(),
+%% callers expect; the returned state is request-scoped and discarded here.
+resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
         {error, _} = Error -> Error

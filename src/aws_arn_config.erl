@@ -93,10 +93,13 @@ run_arn_handlers([], _State) ->
 run_arn_handlers([{Mod, undefined, _SchemaKey, Args} | Rest], State) ->
     %% Pure-sink / self-resolving handler. The only such handler is the oauth2
     %% providers map (aws_arn_config_oauth2:run/4), which resolves a map of ARNs
-    %% itself, so it needs the aws_state() threaded in as a trailing argument.
+    %% itself, so it needs the aws_state() threaded in as a trailing argument and
+    %% returns the updated state as {ok, State1}. Thread State1 forward so a
+    %% later handler sees any credentials this handler refreshed, mirroring the
+    %% resolved-ARN clause below.
     case erlang:apply(Mod, run, Args ++ [State]) of
-        ok ->
-            run_arn_handlers(Rest, State);
+        {ok, State1} ->
+            run_arn_handlers(Rest, State1);
         Error ->
             Error
     end;
