@@ -318,6 +318,30 @@ perform_request_test_() ->
                     ?assert(is_record(State1, aws_state)),
                     meck:validate(gun)
                 end
+            },
+            {
+                "await_body timeout is returned as a clean {error, timeout}",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                    meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                    meck:expect(gun, close, fun(_) -> ok end),
+                    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                    meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                    meck:expect(gun, await, fun(_Pid, _, _) ->
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    end),
+                    %% The headers arrive but the body read times out. This must
+                    %% surface as {error, timeout}, not {error, {badmatch, _}}.
+                    meck:expect(gun, await_body, fun(_Pid, _, _) -> {error, timeout} end),
+
+                    Result = aws_lib:request("ec2", get, "/", "", [], [], State),
+                    ?assertEqual({error, timeout, undefined}, Result),
+                    meck:validate(gun)
+                end
             }
         ]
     }.

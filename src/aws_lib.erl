@@ -886,8 +886,17 @@ direct_gun_request(GunPid, Method, Path, Headers, Body, Options) ->
                 {response, fin, Status, RespHeaders} ->
                     {ok, {{http_version, Status, status_text(Status)}, RespHeaders, <<>>}};
                 {response, nofin, Status, RespHeaders} ->
-                    {ok, RespBody} = gun:await_body(GunPid, StreamRef, Timeout),
-                    {ok, {{http_version, Status, status_text(Status)}, RespHeaders, RespBody}};
+                    %% await_body/3 can return {error, timeout} (and other
+                    %% {error, _} reasons); surface it cleanly rather than
+                    %% letting a hard match turn it into a {badmatch, _} term.
+                    case gun:await_body(GunPid, StreamRef, Timeout) of
+                        {ok, RespBody} ->
+                            {ok, {
+                                {http_version, Status, status_text(Status)}, RespHeaders, RespBody
+                            }};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
                 {error, Reason} ->
                     {error, Reason}
             end
