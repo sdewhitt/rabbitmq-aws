@@ -486,6 +486,38 @@ api_get_request_test_() ->
                 ?assertEqual([{"data", "value"}], Body),
                 ?assert(is_record(State1, aws_state)),
                 meck:validate(gun)
+            end},
+            {"gun:open failure re-enters the retry loop rather than raising", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                %% A connection that never opens must be retried and then
+                %% reported as the exhausted-retries error, not escape as a
+                %% {gun_open_failed, _} exception.
+                meck:expect(gun, open, fun(_, _, _) -> {error, econnrefused} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual({error, "AWS service is unavailable"}, Result),
+                meck:validate(gun)
+            end},
+            {"gun:await_up failure re-enters the retry loop rather than raising", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                %% The socket opens but the protocol never comes up; this too
+                %% must be retried, not raised as {gun_connection_failed, _}.
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {error, timeout} end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual({error, "AWS service is unavailable"}, Result),
+                meck:validate(gun)
             end}
         ]
     }.
