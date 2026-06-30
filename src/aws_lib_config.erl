@@ -765,8 +765,13 @@ perform_http_get_with_conn(ConnPid, Path, Config) ->
         {response, fin, Status, RespHeaders} ->
             {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, <<>>}, Config1};
         {response, nofin, Status, RespHeaders} ->
-            {ok, Body} = gun:await_body(ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT),
-            {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, Body}, Config1};
+            case gun:await_body(ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT) of
+                {ok, Body} ->
+                    {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, Body},
+                        Config1};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
@@ -867,16 +872,22 @@ perform_http_get_instance_metadata(URL, Config) ->
                                     },
                                     Config1};
                             {response, nofin, Status, RespHeaders} ->
-                                {ok, Body} = gun:await_body(
-                                    ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT
-                                ),
-                                {ok,
-                                    {
-                                        {http_version, Status, aws_lib:status_text(Status)},
-                                        RespHeaders,
-                                        Body
-                                    },
-                                    Config1};
+                                case
+                                    gun:await_body(
+                                        ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT
+                                    )
+                                of
+                                    {ok, Body} ->
+                                        {ok,
+                                            {
+                                                {http_version, Status, aws_lib:status_text(Status)},
+                                                RespHeaders,
+                                                Body
+                                            },
+                                            Config1};
+                                    {error, Reason} ->
+                                        {error, Reason}
+                                end;
                             {error, Reason} ->
                                 {error, Reason}
                         end,
@@ -968,11 +979,24 @@ load_imdsv2_token() ->
                                 % Empty body for fin response
                                 <<>>;
                             {response, nofin, 200, _RespHeaders} ->
-                                {ok, Body} = gun:await_body(
-                                    ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT
-                                ),
-                                ?LOG_DEBUG("Successfully obtained EC2 IMDSv2 token."),
-                                binary_to_list(Body);
+                                case
+                                    gun:await_body(
+                                        ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT
+                                    )
+                                of
+                                    {ok, Body} ->
+                                        ?LOG_DEBUG("Successfully obtained EC2 IMDSv2 token."),
+                                        binary_to_list(Body);
+                                    {error, Reason} ->
+                                        ?LOG_WARNING(
+                                            get_instruction_on_instance_metadata_error(
+                                                "Failed to read EC2 IMDSv2 token body: ~tp. "
+                                                "Falling back to EC2 IMDSv1 for now. It is recommended to use EC2 IMDSv2."
+                                            ),
+                                            [Reason]
+                                        ),
+                                        undefined
+                                end;
                             {response, _, 400, _RespHeaders} ->
                                 ?LOG_WARNING(
                                     "Failed to obtain EC2 IMDSv2 token: Missing or Invalid Parameters – The PUT request is not valid."
