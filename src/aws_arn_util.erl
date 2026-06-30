@@ -8,18 +8,19 @@
 -ifdef(TEST).
 -compile(export_all).
 -else.
--export([resolve_arn/1, parse_arn/1]).
+-export([resolve_arn/2, parse_arn/1]).
 -endif.
 
--spec resolve_arn(string()) -> {ok, binary()} | {error, term()}.
-resolve_arn(Arn) ->
+-spec resolve_arn(string(), aws_lib:aws_state()) ->
+    {ok, binary(), aws_lib:aws_state()} | {error, term()}.
+resolve_arn(Arn, State) ->
     case parse_arn(Arn) of
         {ok, #{service := "s3", resource := Resource}} ->
-            aws_s3:fetch_object(Resource);
+            aws_s3:fetch_object(Resource, State);
         {ok, #{service := "secretsmanager", region := Region}} ->
-            aws_sms:fetch_secret(Arn, Region);
+            aws_sms:fetch_secret(Arn, Region, State);
         {ok, #{service := "acm-pca", region := Region}} ->
-            aws_acm_pca:fetch_certificate(Arn, Region);
+            aws_acm_pca:fetch_certificate(Arn, Region, State);
         {ok, #{service := Service}} ->
             Reason = unsupported_service,
             {error, {Reason, Service}};

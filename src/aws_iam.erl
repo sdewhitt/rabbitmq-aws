@@ -5,18 +5,13 @@
 
 -module(aws_iam).
 
--export([assume_role/1]).
+-export([assume_role/2]).
 
-% TODO: remove after we fix the rabbitmq_aws:api_post_request's return type
--dialyzer([
-    {no_unused, parse_assume_role_response/1},
-    {no_match, make_request/2}
-]).
-
--spec assume_role(string() | binary()) -> ok | {error, term()}.
-assume_role(RoleArn) when is_binary(RoleArn) ->
-    assume_role(binary_to_list(RoleArn));
-assume_role(RoleArn) ->
+-spec assume_role(string() | binary(), aws_lib:aws_state()) ->
+    {ok, aws_lib:aws_state()} | {error, term()}.
+assume_role(RoleArn, State) when is_binary(RoleArn) ->
+    assume_role(binary_to_list(RoleArn), State);
+assume_role(RoleArn, State) ->
     SessionName = "rabbitmq-aws-" ++ integer_to_list(erlang:system_time(second)),
     Body =
         "Action=AssumeRole&RoleArn=" ++ uri_string:quote(RoleArn) ++
@@ -29,22 +24,24 @@ assume_role(RoleArn) ->
     ],
 
     Headers = aws_sts:add_custom_headers(BaseHeaders),
-    make_request(Body, Headers).
+    make_request(Body, Headers, State).
 
--spec parse_assume_role_response(any()) -> ok.
-parse_assume_role_response(Body) ->
+-spec parse_assume_role_response(any(), aws_lib:aws_state()) ->
+    {ok, aws_lib:aws_state()}.
+parse_assume_role_response(Body, State) ->
     [{"AssumeRoleResponse", ResponseData}] = Body,
     {"AssumeRoleResult", ResultData} = lists:keyfind("AssumeRoleResult", 1, ResponseData),
     {"Credentials", CredentialsData} = lists:keyfind("Credentials", 1, ResultData),
     {"AccessKeyId", AccessKey} = lists:keyfind("AccessKeyId", 1, CredentialsData),
     {"SecretAccessKey", SecretKey} = lists:keyfind("SecretAccessKey", 1, CredentialsData),
     {"SessionToken", SessionToken} = lists:keyfind("SessionToken", 1, CredentialsData),
-    ok = rabbitmq_aws:set_credentials(AccessKey, SecretKey, SessionToken).
+    {ok, State1} = aws_lib:set_credentials(AccessKey, SecretKey, SessionToken, State),
+    {ok, State1}.
 
-make_request(Body, Headers) ->
-    case rabbitmq_aws:api_post_request("sts", "/", Body, Headers) of
-        {ok, ResponseBody} ->
-            parse_assume_role_response(ResponseBody);
+make_request(Body, Headers, State) ->
+    case aws_lib:api_post_request("sts", "/", Body, Headers, State) of
+        {ok, ResponseBody, State1} ->
+            parse_assume_role_response(ResponseBody, State1);
         Error ->
             Error
     end.
