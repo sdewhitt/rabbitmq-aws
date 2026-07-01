@@ -31,6 +31,12 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("inets/include/httpd.hrl").
 
+%% Named public ETS set the stub's do/1 records the received "host" header into,
+%% keyed by request path (created in init_per_suite, deleted in end_per_suite).
+%% Lets a test prove the pin connected to the IP but preserved the original
+%% hostname in the Host header.
+-define(HOST_HEADER_TABLE, aws_auth_validate_http_SUITE_host_headers).
+
 all() ->
     [
         {group, http}
@@ -50,7 +56,9 @@ groups() ->
             self_signed_under_verify_none_returns_ok,
             custom_ca_under_verify_peer_returns_ok,
             mtls_client_cert_presented_returns_ok,
-            mtls_client_cert_missing_returns_tls_failed
+            mtls_client_cert_missing_returns_tls_failed,
+            hostname_pin_preserves_host_ok,
+            hostname_resolving_to_infra_denied
         ]}
     ].
 
@@ -276,6 +284,84 @@ mtls_client_cert_missing_returns_tls_failed(Config) ->
         meck:unload(aws_arn_util)
     end.
 
+%%--------------------------------------------------------------------
+%% Hostname resolve+pin+rewrite (DNS-rebinding defense)
+%%--------------------------------------------------------------------
+%%
+%% The 12 cases above all target the literal 127.0.0.1, which takes the
+%% literal-IP branch of resolve_and_pin/1. These two exercise the hostname
+%% branch (resolve_hostname_and_pin/2), the central SSRF/DNS-rebinding control:
+%% resolve to ALL A/AAAA, DENY if ANY resolved address is broker infra, else pin
+%% to the resolved IP while keeping the original hostname in the Host header/SNI.
+
+hostname_pin_preserves_host_ok(Config) ->
+    %% Positive: a HOSTNAME (localhost, not a literal IP) resolves to loopback,
+    %% which auth_validation_allow_private_networks (set for the group) permits,
+    %% so the probe reaches the plaintext stub on 127.0.0.1 and returns ok. We
+    %% meck inet:getaddrs/2 so localhost resolves DETERMINISTICALLY to the stub's
+    %% 127.0.0.1 (inet) with no AAAA (inet6 nxdomain) -- otherwise a host that
+    %% returned ::1 first could pin to a loopback the stub is not bound to. The
+    %% host stays a NAME, so resolve_hostname_and_pin/2 runs: it pins the connect
+    %% target to the IP but build_request/4 keeps "localhost" in the Host header.
+    %% We then assert the stub RECEIVED Host: localhost, proving the rewrite kept
+    %% the original hostname while connecting to the pinned IP.
+    Port = ?config(http_port, Config),
+    %% Own the capture table in THIS (test-case) process. A named_table created
+    %% in init_per_suite would not survive: CT runs init_per_suite in a separate
+    %% process that terminates on return, taking its ETS tables with it. The
+    %% stub's do/1 (a distinct httpd process) writes to it by name while this
+    %% process -- the owner -- is alive; public access permits the cross-process
+    %% write. Deleted in the `after' clause.
+    ?HOST_HEADER_TABLE = ets:new(?HOST_HEADER_TABLE, [named_table, public, set]),
+    ok = meck:new(inet, [passthrough, unstick]),
+    try
+        meck:expect(inet, getaddrs, fun
+            ("localhost", inet) -> {ok, [{127, 0, 0, 1}]};
+            ("localhost", inet6) -> {error, nxdomain};
+            (H, Family) -> meck:passthrough([H, Family])
+        end),
+        Url = iolist_to_binary(["http://localhost:", integer_to_list(Port), "/ok200"]),
+        Body = #{
+            <<"user_path">> => Url,
+            <<"http_method">> => <<"get">>
+        },
+        ?assertEqual(ok, validate(Body)),
+        %% The stub saw the original hostname in Host, not the pinned IP. Host is
+        %% carried without the port (build_request/4 sends the bare hostname).
+        ?assertEqual("localhost", ets:lookup_element(?HOST_HEADER_TABLE, "/ok200", 2))
+    after
+        meck:unload(inet),
+        catch ets:delete(?HOST_HEADER_TABLE)
+    end.
+
+hostname_resolving_to_infra_denied(_Config) ->
+    %% Negative (DNS-rebinding deny): a benign-looking hostname resolves to a
+    %% DENIED infra address (IMDS 169.254.169.254), so the "deny if ANY resolved
+    %% address is broker infra" branch must fire -- even with allow_private_
+    %% networks on, which relaxes ONLY loopback. We meck inet:getaddrs/2 for both
+    %% families: the denied v4 for inet, nxdomain for inet6, so resolve_all/1
+    %% yields exactly the denied address and the deny is deterministic. The host
+    %% is a NAME (not a literal IP) so it passes the pure url_allowed/1 check and
+    %% is only caught in the probe-layer resolve+classify.
+    ok = meck:new(inet, [passthrough, unstick]),
+    try
+        meck:expect(inet, getaddrs, fun
+            ("rebind.test", inet) -> {ok, [{169, 254, 169, 254}]};
+            ("rebind.test", inet6) -> {error, nxdomain};
+            (H, Family) -> meck:passthrough([H, Family])
+        end),
+        Body = #{
+            <<"user_path">> => <<"http://rebind.test/ok200">>,
+            <<"http_method">> => <<"get">>
+        },
+        ?assertEqual(
+            {error, input_invalid, <<"a configured path targets a disallowed address">>},
+            validate(Body)
+        )
+    after
+        meck:unload(inet)
+    end.
+
 %% Route a resolve_arn call to the right PEM by ARN. The validator passes the
 %% ARN as a string (binary_to_list); match on the resource portion. certfile is
 %% S3-hosted, keyfile is Secrets Manager, cacert is the CA bundle.
@@ -347,6 +433,18 @@ start_https_stub(PrivDir) ->
 %% auth backend -> auth_failed).
 do(Info) ->
     Path = hd(string:split(Info#mod.request_uri, "?")),
+    %% Record the received "host" header (parsed_header keys are lowercased) so a
+    %% test can assert the pin kept the original hostname in Host even though the
+    %% connect target was rewritten to the IP. Guarded by ets:info so the write
+    %% is a no-op if the table is absent -- keeps do/1 backward-compatible for
+    %% the existing cases (which never read it) and cannot alter the response.
+    case ets:info(?HOST_HEADER_TABLE) of
+        undefined ->
+            ok;
+        _ ->
+            HostHdr = proplists:get_value("host", Info#mod.parsed_header, undefined),
+            true = ets:insert(?HOST_HEADER_TABLE, {Path, HostHdr})
+    end,
     {Status, Body} =
         case Path of
             "/ok200" -> {200, "allow"};
