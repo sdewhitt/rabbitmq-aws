@@ -122,20 +122,6 @@
      [{list_to_binary(lists:last(Key)), Value} || {Key, Value} <- Settings]
  end}.
 
-%% @doc Whether the validate endpoint may fall back to the broker's ambient
-%% (EC2 instance) credentials to resolve ARNs when aws.arns.assume_role_arn is
-%% unset. The effective default is false: with no assume_role configured and
-%% this disabled, a validate request is refused rather than resolving the
-%% caller's password_arn/cacertfile_arn under the broker's instance role, which
-%% on Amazon MQ can be far more privileged than the role the customer would use.
-%% Enable only if you intend the endpoint to use the instance role. The default
-%% lives in code (aws_auth_validate_ldap reads this with a `false' fallback); it
-%% is intentionally NOT declared here so the key is only emitted into the
-%% generated config when an operator sets it.
-{mapping, "aws.auth_validation.allow_instance_role_fallback",
-    "aws.auth_validation_allow_instance_role_fallback",
-    [{datatype, {enum, [true, false]}}]}.
-
 %% Note: none of the settings below declare a schema {default, ...}. A
 %% defaulted mapping is emitted into every generated config, which breaks
 %% config_schema_SUITE's exact-match snippets. Effective defaults are
