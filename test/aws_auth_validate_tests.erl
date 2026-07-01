@@ -486,15 +486,22 @@ ldap_configured_assume_role_test_() ->
         end,
         fun(_) ->
             application:unset_env(aws, arn_config),
+            application:unset_env(aws, auth_validation_allow_instance_role_fallback),
             catch meck:unload(aws_arn_util),
             catch meck:unload(aws_iam),
             ok
         end,
         [
             {
-                "no configured role: assume_role is never called and the ambient "
-                "(credential-free) state reaches ARN resolution",
-                fun assume_role_not_configured_uses_ambient_state/0
+                "no configured role, fallback disabled (default): request is "
+                "refused with config_conflict before any assume_role or ARN resolve",
+                fun assume_role_not_configured_default_refuses/0
+            },
+            {
+                "no configured role, fallback explicitly enabled: assume_role is "
+                "never called and the ambient (credential-free) state reaches ARN "
+                "resolution",
+                fun assume_role_not_configured_fallback_enabled_uses_ambient_state/0
             },
             {"configured role: the assumed credentials reach ARN resolution",
                 fun assume_role_configured_threads_assumed_credentials/0},
@@ -517,8 +524,28 @@ assume_role_test_access_key(State) ->
         {error, undefined} -> undefined
     end.
 
-assume_role_not_configured_uses_ambient_state() ->
+%% Default posture: no assume_role configured and instance-role fallback left at
+%% its false default. The request must be refused with config_conflict before any
+%% assume_role attempt OR any ARN resolve -- the broker's powerful ambient EC2
+%% role is never used implicitly.
+assume_role_not_configured_default_refuses() ->
     application:unset_env(aws, arn_config),
+    application:unset_env(aws, auth_validation_allow_instance_role_fallback),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) ->
+        erlang:error(resolve_should_not_be_reached)
+    end),
+    ?assertMatch(
+        {error, config_conflict, _}, aws_auth_validate_ldap:validate(base_body(#{}))
+    ),
+    ?assertEqual(0, meck:num_calls(aws_iam, assume_role, '_')),
+    ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_')).
+
+%% Opt-in: with fallback explicitly enabled and no role configured, assume_role
+%% is not called and the credential-free ambient state reaches ARN resolution --
+%% the pre-flag behavior, now reachable only by explicit operator consent.
+assume_role_not_configured_fallback_enabled_uses_ambient_state() ->
+    application:unset_env(aws, arn_config),
+    application:set_env(aws, auth_validation_allow_instance_role_fallback, true),
     Self = self(),
     ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
         Self ! {resolve_key, assume_role_test_access_key(State)},
@@ -588,6 +615,10 @@ ldap_bind_raise_does_not_leak_password_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
+            %% No assume_role is configured here; allow the ambient-credential
+            %% fallback so the request reaches the (mocked) ARN resolve and bind
+            %% path this test exercises, rather than being refused up front.
+            application:set_env(aws, auth_validation_allow_instance_role_fallback, true),
             %% Resolve any ARN to our sentinel password. resolve_arn/2 threads
             %% the passed aws_lib:aws_state() back in the success 3-tuple.
             meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
@@ -602,6 +633,7 @@ ldap_bind_raise_does_not_leak_password_test_() ->
             ok
         end,
         fun(_) ->
+            application:unset_env(aws, auth_validation_allow_instance_role_fallback),
             meck:unload(eldap),
             meck:unload(aws_arn_util)
         end,
@@ -648,6 +680,10 @@ cacert_arn_resolution_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
+            %% No assume_role is configured; allow the ambient-credential fallback
+            %% so the request reaches the CA-cert resolve path under test instead
+            %% of being refused before any ARN resolution.
+            application:set_env(aws, auth_validation_allow_instance_role_fallback, true),
             %% Keep the suite hermetic: the TLS-off case reaches the connect
             %% path, so stub eldap:open to fail fast instead of dialling out.
             meck:expect(eldap, open, fun(_Servers, _Opts) -> {error, refused} end),
@@ -655,6 +691,7 @@ cacert_arn_resolution_test_() ->
             ok
         end,
         fun(_) ->
+            application:unset_env(aws, auth_validation_allow_instance_role_fallback),
             meck:unload(eldap),
             meck:unload(aws_arn_util)
         end,
