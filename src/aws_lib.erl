@@ -518,11 +518,14 @@ do_refresh_credentials(State0) ->
 %% structure. The response body will attempt to be decoded by invoking the
 %% maybe_decode_body/2 method.
 %% @end
-format_response({ok, {{_Version, 200, _Message}, Headers, Body}}) ->
+%% Any 2xx is a success. Every other status (3xx redirects we do not follow,
+%% 4xx, 5xx) is an error: gun is not configured to follow redirects, so a 3xx
+%% is a request we could not complete.
+format_response({ok, {{_Version, StatusCode, _Message}, Headers, Body}}) when
+    StatusCode >= 200, StatusCode < 300
+->
     {ok, {Headers, maybe_decode_body(get_content_type(Headers), Body)}};
-format_response({ok, {{_Version, 206, _Message}, Headers, Body}}) ->
-    {ok, {Headers, maybe_decode_body(get_content_type(Headers), Body)}};
-format_response({ok, {{_Version, StatusCode, Message}, Headers, Body}}) when StatusCode >= 400 ->
+format_response({ok, {{_Version, _StatusCode, Message}, Headers, Body}}) ->
     {error, Message, {Headers, maybe_decode_body(get_content_type(Headers), Body)}};
 format_response({error, Reason}) ->
     {error, Reason, undefined}.
