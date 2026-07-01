@@ -119,6 +119,11 @@
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
+-define(REASON_INSTANCE_ROLE_FALLBACK, <<
+    "no assume_role is configured and instance-role credential fallback is "
+    "disabled; set aws.arns.assume_role_arn or enable "
+    "aws.auth_validation.allow_instance_role_fallback"
+>>).
 -define(REASON_BAD_DN_LOOKUP_BASE, <<"dn_lookup_base must be a non-empty string">>).
 -define(REASON_BAD_DN_LOOKUP_ATTR, <<"dn_lookup_attribute must be a non-empty string">>).
 -define(REASON_BAD_USERNAME, <<"username must be a non-empty string">>).
@@ -206,16 +211,36 @@ validate(Body) when is_map(Body) ->
 %% no global singleton to clobber), so the assumed role's credentials are
 %% visible only to this request's ARN resolutions and are discarded when the
 %% request ends.
+%%
+%% When NO assume_role is configured, resolving with a default aws_lib state
+%% falls back to the broker's ambient (EC2 instance) credentials. On Amazon MQ
+%% that instance role can be far more privileged than the role a customer would
+%% attach to their own secret/bucket, so a validate request could resolve ARNs
+%% the caller's intended role never could -- a latent least-privilege pitfall
+%% (the resolved secret is never returned to the caller today, but the capability
+%% is a hazard for future development). The fallback is therefore gated behind
+%% `aws.auth_validation.allow_instance_role_fallback', which defaults to false:
+%% with no role configured and the fallback disabled we refuse before any secret
+%% fetch or outbound connection, rather than silently using the instance role.
 resolve_request_state(Params) ->
     case configured_assume_role_arn() of
         none ->
-            {ok, Params#{aws_state => aws_lib:new()}};
+            case allow_instance_role_fallback() of
+                true -> {ok, Params#{aws_state => aws_lib:new()}};
+                false -> {error, config_conflict, ?REASON_INSTANCE_ROLE_FALLBACK}
+            end;
         RoleArn ->
             case aws_iam:assume_role(RoleArn, aws_lib:new()) of
                 {ok, State} -> {ok, Params#{aws_state => State}};
                 {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
             end
     end.
+
+%% Whether the validate endpoint may fall back to the broker's ambient (EC2
+%% instance) credentials when no assume_role is configured. Defaults to false so
+%% the powerful instance role is never used implicitly; an operator must opt in.
+allow_instance_role_fallback() ->
+    application:get_env(aws, auth_validation_allow_instance_role_fallback, false) =:= true.
 
 %% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
 %% read from the same `aws, arn_config' env the boot sequence uses
