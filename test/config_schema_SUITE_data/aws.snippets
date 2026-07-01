@@ -430,15 +430,5 @@
     {aws_auth_validation_enabled_methods,
         "aws.auth_validation.enabled_methods.ldap = true",
         [{aws, [{auth_validation_enabled_methods, [{<<"ldap">>, true}]}]}],
-        [aws_auth_validation_enabled_methods]},
-
-    {aws_auth_validation_allow_instance_role_fallback,
-        "aws.auth_validation.allow_instance_role_fallback = true",
-        [{aws, [{auth_validation_allow_instance_role_fallback, true}]}],
-        [aws_auth_validation_allow_instance_role_fallback]},
-
-    {aws_auth_validation_disallow_instance_role_fallback,
-        "aws.auth_validation.allow_instance_role_fallback = false",
-        [{aws, [{auth_validation_allow_instance_role_fallback, false}]}],
-        [aws_auth_validation_disallow_instance_role_fallback]}
+        [aws_auth_validation_enabled_methods]}
 ].
