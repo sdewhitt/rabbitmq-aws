@@ -119,6 +119,12 @@ http_bad_url_input_test_() ->
         ?_assertMatch(
             {error, input_invalid, <<"a configured path is not a valid http(s) URL">>},
             aws_auth_validate_http:validate(body_with_user_path(<<"https://8.8.8.8:70000/x">>))
+        ),
+        %% URL fragment (#frag) is rejected -- a configured path must not carry a
+        %% fragment component.
+        ?_assertMatch(
+            {error, input_invalid, <<"a configured path is not a valid http(s) URL">>},
+            aws_auth_validate_http:validate(body_with_user_path(<<"https://example.com/auth#frag">>))
         )
     ].
 
@@ -607,9 +613,6 @@ http_response_contract_test_() ->
 %% next thing reached. Uses a public literal IP host so classify_ip/1 returns
 %% allow in the pure phase (mirrors base_body/0 in aws_auth_validate_tests,
 %% which used 8.8.8.8 for the same reason). https so ssl_options/ARNs matter.
-base_body() ->
-    base_body(#{}).
-
 base_body(Overrides) when is_map(Overrides) ->
     Base = #{<<"user_path">> => <<"https://8.8.8.8/auth/user">>},
     maps:merge(Base, Overrides).

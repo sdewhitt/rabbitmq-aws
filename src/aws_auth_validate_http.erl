@@ -155,11 +155,10 @@
 -define(AUTH_RESPONSE_CODES, [200, 201]).
 
 %% SSRF guard toggles (see the SSRF guard section below for the full rationale).
-%% ?ENFORCE_ADDRESS_POLICY gates BOTH the per-URL address check (url_allowed/1,
-%% via classify_address/1) and the probe-layer DNS resolve+classify, and the
-%% fail-closed guard in validate/1 (ssrf_policy_ready/0) is bound to it too --
-%% so enforcement and probing turn on together. It is now TRUE: the address
-%% policy (classify_ip/1 + the probe-layer resolve+pin) is implemented.
+%% The address policy (classify_ip/1 + the probe-layer resolve+pin) is now live,
+%% so ?ENFORCE_ADDRESS_POLICY is TRUE. It is retained as a defined marker of that
+%% state; enforcement itself runs unconditionally via url_allowed/1 and the
+%% probe-layer resolve+classify.
 %% NOTE: AppSec review + pen test are still pending (parent FAQ 2.1); the method
 %% remains opt-in (aws_auth_validate_registry ?OPT_IN_METHODS) so it is not live
 %% until an operator explicitly enables it.
@@ -210,35 +209,18 @@ allowed_fields() ->
 
 -spec validate(map()) -> aws_auth_validate_backend:result().
 validate(Body) when is_map(Body) ->
-    %% FAIL-CLOSED until the SSRF address policy is live. The probe issues
-    %% outbound requests to customer-supplied URLs from the broker's network
-    %% position; until classify_address/1 denies IMDS/link-local/loopback/
-    %% private targets (?ENFORCE_ADDRESS_POLICY = true) and AppSec has signed
-    %% off, no probe may run -- otherwise this is an SSRF vector (e.g. to
-    %% 169.254.169.254). Report method_disabled so an operator who turned the
-    %% method on still gets a safe, fixed-category 404 rather than a live
-    %% unrestricted probe. This guard lifts automatically when the policy lands.
-    case ssrf_policy_ready() of
-        false ->
-            {error, method_disabled};
-        true ->
-            %% Same ARN-first ordering as the LDAP backend: all pure,
-            %% network-free validation (URL shape, method, ssl_options values,
-            %% and the SSRF guard) runs before any cacertfile_arn is resolved
-            %% or any request is made.
-            case parse_input(Body) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, Params} ->
-                    do_http_validate(Params)
-            end
+    %% Whether the method may run is gated by the opt-in registry
+    %% (aws_auth_validate_registry ?OPT_IN_METHODS), not a compile-time switch:
+    %% the SSRF address policy is live, so no fail-closed guard is needed here.
+    %% Same ARN-first ordering as the LDAP backend: all pure, network-free
+    %% validation (URL shape, method, ssl_options values, and the SSRF guard)
+    %% runs before any cacertfile_arn is resolved or any request is made.
+    case parse_input(Body) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, Params} ->
+            do_http_validate(Params)
     end.
-
-%% The probe is only allowed to run once the SSRF address policy is enforced.
-%% Tied to the same compile-time toggle the guard uses, so the backend cannot
-%% issue outbound requests while classify_address/1 is still a no-op.
-ssrf_policy_ready() ->
-    ?ENFORCE_ADDRESS_POLICY.
 
 %%--------------------------------------------------------------------
 %% Input parsing (pure, no network)
@@ -304,16 +286,21 @@ parse_url(Bin) when is_binary(Bin) ->
             %%  * an out-of-range port (else httpc crashes at request time),
             %%  * userinfo (user:pass@host) -- embedded credentials httpc would
             %%    turn into an Authorization header,
-            %%  * a pre-existing query string -- the broker's auth_http.*_path
-            %%    config is query-less and the probe appends its own ?username=
-            %%    params; a path that already carried a query would be mangled
-            %%    into a double-? URL and spuriously fail.
+            %%  * a pre-existing query string OR a #fragment -- the broker's
+            %%    auth_http.*_path config is query- and fragment-less and the
+            %%    probe appends its own ?username= params. A path that already
+            %%    carried a query would be mangled into a double-? URL; a path
+            %%    with a fragment would have the probe's ?query appended AFTER
+            %%    the fragment, so httpc drops the query (fragments are not sent)
+            %%    and the probe misfires. Either way it would spuriously fail.
             Port = maps:get(port, Parsed, undefined),
             HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
+            HasFragment =
+                maps:is_key(fragment, Parsed) andalso maps:get(fragment, Parsed) =/= [],
             case Port of
                 P when is_integer(P), (P < 1 orelse P > 65535) ->
                     {error, bad_url};
-                _ when HasQuery ->
+                _ when HasQuery orelse HasFragment ->
                     {error, bad_url};
                 _ ->
                     case maps:is_key(userinfo, Parsed) of
@@ -601,14 +588,14 @@ ip_to_int(Tuple) ->
 %% violation). A fresh profile has no sessions to reuse, and stopping it tears
 %% down anything opened, so each validation is hermetic.
 do_http_validate(Params) ->
-    Profile = probe_profile_name(),
-    case start_probe_profile(Profile) of
-        false ->
+    case claim_probe_profile() of
+        none ->
             %% Could not obtain an isolated profile; fail safe rather than fall
             %% back to the shared default profile (which would reintroduce the
-            %% session-reuse hazard).
+            %% session-reuse hazard). Unreachable in practice -- the semaphore
+            %% caps concurrency below the pool size -- but must be handled.
             {error, connection_failed, ?REASON_CONNECTION};
-        true ->
+        {ok, Profile} ->
             try
                 case build_client_ssl_opts(Params) of
                     {error, _, _} = Err ->
@@ -620,6 +607,7 @@ do_http_validate(Params) ->
                 _Class:_Reason:_Stack ->
                     {error, connection_failed, ?REASON_CONNECTION}
             after
+                %% Only ever stop the profile THIS request started (claimed).
                 stop_probe_profile(Profile)
             end
     end.
@@ -627,39 +615,47 @@ do_http_validate(Params) ->
 %% Profile names are drawn from a FIXED pool (?PROFILE_POOL_SIZE atoms, created
 %% once and reused forever) rather than a fresh unique atom per request --
 %% generating a new atom per validation would leak the atom table unboundedly
-%% (atoms are never GC'd) and eventually crash the node. The pool is sized well
-%% above auth_validation_max_concurrent's cap (100), so concurrently-running
-%% validations almost never collide on a slot; the slot is picked from a
-%% per-request ref so two simultaneous calls are very unlikely to share one.
+%% (atoms are never GC'd) and eventually crash the node. The pool is sized
+%% strictly ABOVE the concurrency hard cap (auth_validation_max_concurrent = 100),
+%% so a linear probe starting from a per-request hash always finds a FREE slot.
+%% Each in-flight probe OWNS a distinct started profile: a slot is claimed only
+%% by successfully starting it, so two simultaneous calls never share a profile
+%% and none is ever stolen from an actively-probing peer. The atom set stays
+%% bounded at exactly ?PROFILE_POOL_SIZE interned names.
 -define(PROFILE_POOL_SIZE, 128).
 
-probe_profile_name() ->
-    Slot = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+profile_atom(Slot) ->
     list_to_atom("aws_auth_validate_http_" ++ integer_to_list(Slot)).
 
-%% Start the ephemeral profile and disable connection/session reuse on it
-%% (no keep-alive, no session cache) so nothing is pooled even within the call.
-%% If the chosen pool slot is already in use by a concurrent validation,
-%% reclaim it (stop+start): the worst case from a rare collision is that the
-%% other validation's probe errors out to a safe connection_failed -- never a
-%% false success or a leaked authenticated session. Returns whether we now own
-%% a started profile so `after' only stops what exists.
-start_probe_profile(Profile) ->
+%% Claim a profile by scanning the fixed pool for a FREE slot: start at a
+%% per-request hashed slot and try to inets:start it. Starting succeeds only if
+%% no concurrent validation already owns that slot, so success means we own it.
+%% On {already_started,_} advance to the next slot (never stop a slot in use by
+%% a peer -- that would tear down its in-flight request). Bounded to one full
+%% pass over the pool; if every slot is busy, fail closed. Returns {ok, Profile}
+%% | none.
+claim_probe_profile() ->
+    Start = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+    claim_probe_profile(Start, ?PROFILE_POOL_SIZE).
+
+claim_probe_profile(_Slot, 0) ->
+    %% Every slot busy: unreachable while the semaphore caps concurrency below
+    %% ?PROFILE_POOL_SIZE, but fail closed rather than reuse a shared profile.
+    none;
+claim_probe_profile(Slot, Remaining) ->
+    Profile = profile_atom(Slot),
     case inets:start(httpc, [{profile, Profile}]) of
         {ok, _Pid} ->
+            %% We started (own) this profile; disable reuse and take it.
             set_probe_profile_opts(Profile),
-            true;
+            {ok, Profile};
         {error, {already_started, _}} ->
-            _ = inets:stop(httpc, Profile),
-            case inets:start(httpc, [{profile, Profile}]) of
-                {ok, _Pid} ->
-                    set_probe_profile_opts(Profile),
-                    true;
-                _ ->
-                    false
-            end;
+            %% Slot in use by a concurrent validation -- do NOT steal it; advance.
+            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
         _ ->
-            false
+            %% Any other start error: fail closed rather than risk the shared
+            %% default profile's session-reuse hazard.
+            none
     end.
 
 set_probe_profile_opts(Profile) ->
@@ -1078,7 +1074,7 @@ apply_verify_default(Opts, VerifyExplicit) ->
             %% explicit verify_none (already validated) -- leave it
             {ok, Opts};
         false ->
-            case trust_source(Opts) of
+            case ensure_trust_anchor(Opts) of
                 {ok, Opts1} -> {ok, [{verify, verify_peer} | Opts1]};
                 none -> {ok, Opts}
             end
@@ -1087,17 +1083,6 @@ apply_verify_default(Opts, VerifyExplicit) ->
 %% Opts contain {verify, verify_peer}. Return {ok, OptsWithAnchor} when a trust
 %% anchor is present or can be sourced from the OS store, else `none'.
 ensure_trust_anchor(Opts) ->
-    case lists:keymember(cacerts, 1, Opts) of
-        true ->
-            {ok, Opts};
-        false ->
-            case os_cacerts() of
-                [] -> none;
-                Certs -> {ok, [{cacerts, Certs} | Opts]}
-            end
-    end.
-
-trust_source(Opts) ->
     case lists:keymember(cacerts, 1, Opts) of
         true ->
             {ok, Opts};
