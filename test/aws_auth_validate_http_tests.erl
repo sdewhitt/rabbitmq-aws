@@ -124,7 +124,9 @@ http_bad_url_input_test_() ->
         %% fragment component.
         ?_assertMatch(
             {error, input_invalid, <<"a configured path is not a valid http(s) URL">>},
-            aws_auth_validate_http:validate(body_with_user_path(<<"https://example.com/auth#frag">>))
+            aws_auth_validate_http:validate(
+                body_with_user_path(<<"https://example.com/auth#frag">>)
+            )
         )
     ].
 
