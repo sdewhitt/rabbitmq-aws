@@ -1,130 +1,111 @@
-%% ====================================================================
-%% @author Gavin M. Roy <gavinmroy@gmail.com>
-%% @copyright 2016
-%% @doc urilib is a RFC-3986 URI Library for Erlang
-%%      https://github.com/gmr/urilib
-%% @end
-%% ====================================================================
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
+%% Thin wrappers over the OTP stdlib uri_string module -- the plugin's single
+%% URI parser. parse/1 returns an OPAQUE uri() (backed by uri_string:uri_map/1);
+%% callers never touch the underlying representation, they read components
+%% through the accessors (host/1, port/1, path/1, query/1, target/1). This keeps
+%% every URI concern -- RFC 3986 parsing, scheme port defaulting, the never-crash
+%% guard, and request-target assembly -- in one place, built on OTP rather than
+%% hand-rolled string splitting.
 -module(aws_lib_uri).
 
 -export([
-    build/1,
-    build_query_string/1,
     parse/1,
-    parse_userinfo/1,
-    parse_userinfo_result/1
+    host/1,
+    port/1,
+    path/1,
+    query/1,
+    target/1,
+    compose_query/1
 ]).
 
-%% Export all for unit tests
--ifdef(TEST).
--compile(export_all).
--endif.
+-export_type([uri/0]).
 
--include("aws_lib.hrl").
+%% Opaque URI handle. Backed by uri_string:uri_map/1, but that is an
+%% implementation detail: outside this module a uri() is only ever produced by
+%% parse/1 and read through the accessors below.
+-opaque uri() :: uri_string:uri_map().
 
--spec build(#uri{}) -> string().
-%% @doc Build a URI string
-%% @end
-build(URI) ->
-    {UserInfo, Host, Port} = URI#uri.authority,
-    UriMap = #{
-        scheme => to_list(URI#uri.scheme),
-        host => Host
-    },
-    UriMap1 = maybe_put_userinfo(UserInfo, UriMap),
-    UriMap2 = maybe_put_port(Port, UriMap1),
-    UriMap3 = put_path(URI#uri.path, UriMap2),
-    UriMap4 = maybe_put_query(URI#uri.query, UriMap3),
-    UriMap5 = maybe_put_fragment(URI#uri.fragment, UriMap4),
-    uri_string:recompose(UriMap5).
-
-maybe_put_userinfo(undefined, Map) -> Map;
-maybe_put_userinfo({User, undefined}, Map) -> Map#{userinfo => User};
-maybe_put_userinfo({User, Password}, Map) -> Map#{userinfo => User ++ ":" ++ Password}.
-
-maybe_put_port(undefined, Map) -> Map;
-maybe_put_port(Port, Map) -> Map#{port => Port}.
-
-%% The path is always set (an absent path becomes ""), so this is an
-%% unconditional put rather than a maybe_put.
-put_path(undefined, Map) -> Map#{path => ""};
-put_path(Path, Map) -> Map#{path => prefix_path(Path)}.
-
-%% uri_string:recompose/1 needs an absolute path; ensure a leading "/".
-prefix_path([$/ | _] = Path) -> Path;
-prefix_path(Path) -> "/" ++ Path.
-
-maybe_put_query(undefined, Map) -> Map;
-maybe_put_query("", Map) -> Map;
-maybe_put_query(Query, Map) -> Map#{query => build_query_string(Query)}.
-
-maybe_put_fragment(undefined, Map) -> Map;
-maybe_put_fragment(Fragment, Map) -> Map#{fragment => Fragment}.
-
--spec parse(string()) -> #uri{} | {error, {malformed_uri, string()}}.
-%% @doc Parse a URI string into a #uri{} record. This is the single URI parser
-%% for the plugin -- every other component that needs URI components (the AWS
-%% request signer, the EC2 instance-metadata client, and so on) goes through
-%% here rather than splitting strings by hand. It is built on the RFC 3986
-%% compliant uri_string:parse/1, so a scheme-less, relative, or otherwise
-%% malformed input returns {error, {malformed_uri, _}} instead of crashing.
+-spec parse(string()) -> uri() | {error, {malformed_uri, string()}}.
+%% @doc Parse a URI string into an opaque uri(). Built on the RFC 3986 compliant
+%% uri_string:parse/1, so a scheme-less, relative, or otherwise malformed input
+%% (no host component, or a uri_string parse error) returns
+%% {error, {malformed_uri, _}} instead of crashing.
 %% @end
 parse(Value) ->
     case uri_string:parse(Value) of
-        #{host := Host} = UriMap ->
-            Scheme = maps:get(scheme, UriMap, "https"),
-            DefaultPort =
-                case Scheme of
-                    "http" -> 80;
-                    "https" -> 443;
-                    _ -> undefined
-                end,
-            Port = maps:get(port, UriMap, DefaultPort),
-            UserInfo = parse_userinfo(maps:get(userinfo, UriMap, undefined)),
-            Path = maps:get(path, UriMap),
-            Query = maps:get(query, UriMap, ""),
-            #uri{
-                scheme = Scheme,
-                authority = {parse_userinfo(UserInfo), Host, Port},
-                path = Path,
-                query = uri_string:dissect_query(Query),
-                fragment = maps:get(fragment, UriMap, undefined)
-            };
+        #{host := _} = UriMap ->
+            UriMap;
         %% No host component (scheme-less or relative input), or uri_string
         %% reported a parse error. Either way the input is not a usable
-        %% absolute URI, so report it rather than crash.
+        %% absolute URI, so report it rather than hand back a partial map.
         _ ->
             {error, {malformed_uri, Value}}
     end.
 
--spec parse_userinfo(string() | undefined) ->
-    {username() | undefined, password() | undefined} | undefined.
-parse_userinfo(undefined) -> undefined;
-parse_userinfo([]) -> undefined;
-parse_userinfo({User, undefined}) -> {User, undefined};
-parse_userinfo({User, Password}) -> {User, Password};
-parse_userinfo(Value) -> parse_userinfo_result(string:tokens(Value, ":")).
-
--spec parse_userinfo_result(list()) ->
-    {username() | undefined, password() | undefined} | undefined.
-parse_userinfo_result([User, Password]) -> {User, Password};
-parse_userinfo_result([User]) -> {User, undefined};
-parse_userinfo_result({User, undefined}) -> {User, undefined};
-parse_userinfo_result([]) -> undefined;
-parse_userinfo_result(User) -> {User, undefined}.
-
-%% @spec build_query(proplist()) -> string()
-%% @doc Build the query parameters string from a proplist
+-spec host(uri()) -> string().
+%% @doc The host component as a list string.
 %% @end
-%%
+host(#{host := Host}) ->
+    unicode:characters_to_list(Host).
 
--spec build_query_string([{any(), any()}]) -> string().
+-spec port(uri()) -> inet:port_number().
+%% @doc The port, defaulted by scheme (http -> 80, https -> 443) when the URI
+%% does not state one explicitly. uri_string only reports a port when present.
+%% @end
+port(#{port := Port}) when is_integer(Port) ->
+    Port;
+port(#{scheme := Scheme}) ->
+    default_port(unicode:characters_to_list(Scheme)).
 
-build_query_string(Args) when is_list(Args) ->
+default_port("https") -> 443;
+default_port("http") -> 80;
+%% Fall back to HTTPS for any other scheme, matching the plugin's HTTPS default.
+default_port(_) -> 443.
+
+-spec path(uri()) -> string().
+%% @doc The path component as a list string, with an empty path normalized to
+%% "/" so it is always a usable request target on its own. The query is NOT
+%% included; use target/1 for the path-with-query request line.
+%% @end
+path(UriMap) ->
+    case unicode:characters_to_list(maps:get(path, UriMap, "")) of
+        "" -> "/";
+        Path -> Path
+    end.
+
+-spec query(uri()) -> [{string(), string()}].
+%% @doc The query component dissected into a key/value proplist (empty list when
+%% there is no query). This is the shape the request signer canonicalizes.
+%% @end
+query(UriMap) ->
+    uri_string:dissect_query(maps:get(query, UriMap, "")).
+
+-spec target(uri()) -> string().
+%% @doc The request target: path with the raw query reattached (path?query), or
+%% just the path when there is no query. Used directly as the Gun request line.
+%% The RAW query from uri_string is used (not the dissected/recomposed form) so
+%% the target is byte-for-byte what was parsed, matching what the signer signs.
+%% @end
+target(UriMap) ->
+    Path = path(UriMap),
+    case unicode:characters_to_list(maps:get(query, UriMap, "")) of
+        "" -> Path;
+        Query -> Path ++ "?" ++ Query
+    end.
+
+-spec compose_query([{term(), term()}]) -> string().
+%% @doc Compose a key/value proplist into a query string, coercing non-string
+%% keys and values to strings first. Wraps uri_string:compose_query/1.
+%% @end
+compose_query(Args) when is_list(Args) ->
     Normalized = [{to_list(K), to_list(V)} || {K, V} <- Args],
     uri_string:compose_query(Normalized).
 
--spec to_list(Val :: integer() | list() | binary() | atom() | map()) -> list().
+-spec to_list(integer() | list() | binary() | atom() | map()) -> list().
 to_list(Val) when is_list(Val) -> Val;
 to_list(Val) when is_map(Val) -> maps:to_list(Val);
 to_list(Val) when is_atom(Val) -> atom_to_list(Val);

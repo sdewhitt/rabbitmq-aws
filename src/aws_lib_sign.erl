@@ -31,7 +31,7 @@ headers(Request, undefined) ->
 headers(Request, PayloadHash) ->
     RequestTimestamp = local_time(),
     URI = aws_lib_uri:parse(Request#request.uri),
-    {_, Host, _} = URI#uri.authority,
+    Host = aws_lib_uri:host(URI),
 
     Headers = append_headers(
         RequestTimestamp,
@@ -43,8 +43,8 @@ headers(Request, PayloadHash) ->
     ),
     RequestHash = request_hash(
         Request#request.method,
-        URI#uri.path,
-        URI#uri.query,
+        aws_lib_uri:path(URI),
+        aws_lib_uri:query(URI),
         Headers,
         PayloadHash
     ),
@@ -200,7 +200,7 @@ local_time({{Y, M, D}, {HH, MM, SS}}) ->
 %% @doc Return the sorted query string for the specified arguments.
 %% @end
 query_string(undefined) -> "";
-query_string(QueryArgs) -> aws_lib_uri:build_query_string(lists:keysort(1, QueryArgs)).
+query_string(QueryArgs) -> aws_lib_uri:compose_query(lists:keysort(1, QueryArgs)).
 
 -spec request_hash(
     Method :: method(),

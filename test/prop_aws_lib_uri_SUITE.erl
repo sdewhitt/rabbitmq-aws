@@ -4,11 +4,10 @@
 %% -*- mode: erlang; -*-
 
 %% Property-based tests for the plugin's single URI parser, aws_lib_uri:parse/1,
-%% and the aws_lib:parse_uri/1 adapter built on it. These complement the
-%% example-based cases in aws_lib_uri_tests / aws_lib_tests. The central
-%% property, motivating issue #100, is that NO input -- however malformed --
-%% makes either function crash: it returns a #uri{} (or {Host, Port, Path}) for
-%% a usable absolute URI, and {error, {malformed_uri, _}} otherwise.
+%% and its accessors. These complement the example-based cases in
+%% aws_lib_uri_tests. The central property, motivating issue #100, is that NO
+%% input -- however malformed -- makes parse/1 crash: it returns a usable uri()
+%% for an absolute URI, and {error, {malformed_uri, _}} otherwise.
 -module(prop_aws_lib_uri_SUITE).
 
 -compile(nowarn_export_all).
@@ -17,17 +16,14 @@
 -include_lib("proper/include/proper.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--include("aws_lib.hrl").
-
 -define(ITERATIONS, 1000).
 
 all() ->
     [
         prop_parse_never_crashes,
-        prop_parse_uri_never_crashes,
         prop_wellformed_roundtrips,
-        prop_parse_uri_path_starts_with_slash,
-        prop_parse_uri_preserves_query
+        prop_path_starts_with_slash,
+        prop_target_preserves_query
     ].
 
 %%--------------------------------------------------------------------
@@ -81,7 +77,7 @@ port_parts(_Scheme, Port) ->
 default_port("http") -> 80;
 default_port("https") -> 443.
 
-%% Arbitrary junk: any unicode string. Most values are NOT valid absolute URIs.
+%% Arbitrary junk: any 7-bit string. Most values are NOT valid absolute URIs.
 any_string() ->
     ?LET(Chars, list(choose(0, 127)), Chars).
 
@@ -89,8 +85,8 @@ any_string() ->
 %% Properties
 %%--------------------------------------------------------------------
 
-%% Issue #100: parsing arbitrary input never raises. It either yields a #uri{}
-%% record or a {error, {malformed_uri, _}} tuple.
+%% Issue #100: parsing arbitrary input never raises. It either yields a usable
+%% uri() (host/1 returns a string) or a {error, {malformed_uri, _}} tuple.
 prop_parse_never_crashes(_Config) ->
     rabbit_ct_proper_helpers:run_proper(
         fun() ->
@@ -98,8 +94,44 @@ prop_parse_never_crashes(_Config) ->
                 S,
                 any_string(),
                 case aws_lib_uri:parse(S) of
-                    #uri{} -> true;
                     {error, {malformed_uri, _}} -> true;
+                    Uri -> is_list(aws_lib_uri:host(Uri))
+                end
+            )
+        end,
+        [],
+        ?ITERATIONS
+    ).
+
+%% A well-formed scheme://host[:port]/path recovers its host and port (defaulted
+%% by scheme when absent) through the accessors.
+prop_wellformed_roundtrips(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun() ->
+            ?FORALL(
+                {URI, _Scheme, Host, ExpectedPort, _Path},
+                wellformed_uri(),
+                begin
+                    Uri = aws_lib_uri:parse(URI),
+                    aws_lib_uri:host(Uri) =:= Host andalso
+                        aws_lib_uri:port(Uri) =:= ExpectedPort
+                end
+            )
+        end,
+        [],
+        ?ITERATIONS
+    ).
+
+%% path/1 always begins with "/", so it is a usable request target regardless of
+%% the input path.
+prop_path_starts_with_slash(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun() ->
+            ?FORALL(
+                {URI, _Scheme, _Host, _Port, _Path},
+                wellformed_uri(),
+                case aws_lib_uri:path(aws_lib_uri:parse(URI)) of
+                    [$/ | _] -> true;
                     _ -> false
                 end
             )
@@ -108,72 +140,9 @@ prop_parse_never_crashes(_Config) ->
         ?ITERATIONS
     ).
 
-%% The adapter shares the never-crash guarantee: {Host, Port, Path} or an error.
-prop_parse_uri_never_crashes(_Config) ->
-    rabbit_ct_proper_helpers:run_proper(
-        fun() ->
-            ?FORALL(
-                S,
-                any_string(),
-                case aws_lib:parse_uri(S) of
-                    {Host, Port, Path} when
-                        is_list(Host), is_integer(Port), is_list(Path)
-                    ->
-                        true;
-                    {error, {malformed_uri, _}} ->
-                        true;
-                    _ ->
-                        false
-                end
-            )
-        end,
-        [],
-        ?ITERATIONS
-    ).
-
-%% A well-formed scheme://host[:port]/path recovers its scheme, host, and port
-%% (defaulted by scheme when absent) through the canonical parser.
-prop_wellformed_roundtrips(_Config) ->
-    rabbit_ct_proper_helpers:run_proper(
-        fun() ->
-            ?FORALL(
-                {URI, Scheme, Host, ExpectedPort, _Path},
-                wellformed_uri(),
-                begin
-                    #uri{scheme = S, authority = {_UserInfo, H, P}} =
-                        aws_lib_uri:parse(URI),
-                    S =:= Scheme andalso H =:= Host andalso P =:= ExpectedPort
-                end
-            )
-        end,
-        [],
-        ?ITERATIONS
-    ).
-
-%% The adapter always returns a Path beginning with "/", so it is a usable Gun
-%% request target regardless of the input path.
-prop_parse_uri_path_starts_with_slash(_Config) ->
-    rabbit_ct_proper_helpers:run_proper(
-        fun() ->
-            ?FORALL(
-                {URI, _Scheme, _Host, _Port, _Path},
-                wellformed_uri(),
-                begin
-                    {_H, _P, Path} = aws_lib:parse_uri(URI),
-                    case Path of
-                        [$/ | _] -> true;
-                        _ -> false
-                    end
-                end
-            )
-        end,
-        [],
-        ?ITERATIONS
-    ).
-
-%% A query string on a well-formed URI is reattached to the adapter's Path (it
-%% is used directly as the Gun request target, so the query must survive).
-prop_parse_uri_preserves_query(_Config) ->
+%% target/1 reattaches the query to the path (it is used directly as the Gun
+%% request line, so the query must survive).
+prop_target_preserves_query(_Config) ->
     rabbit_ct_proper_helpers:run_proper(
         fun() ->
             ?FORALL(
@@ -181,9 +150,8 @@ prop_parse_uri_preserves_query(_Config) ->
                 {wellformed_uri(), segment(), segment()},
                 begin
                     Query = Key ++ "=" ++ Value,
-                    {_H, _P, Path} = aws_lib:parse_uri(URI ++ "?" ++ Query),
-                    %% The path retains its base and the query is present.
-                    Path =:= BasePath ++ "?" ++ Query
+                    Target = aws_lib_uri:target(aws_lib_uri:parse(URI ++ "?" ++ Query)),
+                    Target =:= BasePath ++ "?" ++ Query
                 end
             )
         end,

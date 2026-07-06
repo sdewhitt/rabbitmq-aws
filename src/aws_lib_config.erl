@@ -456,12 +456,7 @@ instance_credentials_url(Role) ->
 %% @doc Build the Instance Metadata service URL for the specified path
 %% @end
 instance_metadata_url(Path) ->
-    aws_lib_uri:build(#uri{
-        scheme = http,
-        authority = {undefined, ?INSTANCE_HOST, undefined},
-        path = Path,
-        query = []
-    }).
+    uri_string:recompose(#{scheme => "http", host => ?INSTANCE_HOST, path => Path}).
 
 -spec instance_role_url() -> string().
 %% @doc Return the URL for querying the role associated with the current
@@ -627,7 +622,9 @@ lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
 %% @doc Execute a function with a shared metadata service connection
 %% @end
 with_metadata_connection(Fun) ->
-    {Host, Port, _} = aws_lib:parse_uri(instance_metadata_url("")),
+    Uri = aws_lib_uri:parse(instance_metadata_url("")),
+    Host = aws_lib_uri:host(Uri),
+    Port = aws_lib_uri:port(Uri),
     Opts = #{transport => tcp, protocols => [http]},
     case gun:open(Host, Port, Opts) of
         {ok, ConnPid} ->
@@ -723,7 +720,7 @@ maybe_convert_number(Value) ->
 %% @end
 maybe_get_credentials_from_instance_metadata_with_conn(ConnPid, Role, Config) ->
     URL = instance_credentials_url(Role),
-    {_, _, Path} = aws_lib:parse_uri(URL),
+    Path = aws_lib_uri:target(aws_lib_uri:parse(URL)),
     case perform_http_get_with_conn(ConnPid, Path, Config) of
         {ok, Result, Config1} ->
             case parse_credentials_response({ok, Result}) of
@@ -783,7 +780,7 @@ perform_http_get_with_conn(ConnPid, Path, Config) ->
     {ok, string(), aws_config()} | error().
 maybe_get_role_from_instance_metadata_with_conn(ConnPid, Config) ->
     URL = instance_role_url(),
-    {_, _, Path} = aws_lib:parse_uri(URL),
+    Path = aws_lib_uri:target(aws_lib_uri:parse(URL)),
     case perform_http_get_with_conn(ConnPid, Path, Config) of
         {ok, Result, Config1} ->
             case parse_body_response({ok, Result}) of
@@ -850,7 +847,10 @@ parse_credentials_response({ok, {{_, 200, _}, _, Body}}) ->
 perform_http_get_instance_metadata(URL, Config) ->
     ?LOG_DEBUG("Querying instance metadata service: ~tp", [URL]),
     % Parse metadata service URL
-    {Host, Port, Path} = aws_lib:parse_uri(URL),
+    Uri = aws_lib_uri:parse(URL),
+    Host = aws_lib_uri:host(Uri),
+    Port = aws_lib_uri:port(Uri),
+    Path = aws_lib_uri:target(Uri),
     % Simple Gun connection for metadata service
 
     % HTTP only, no TLS
@@ -958,7 +958,10 @@ load_imdsv2_token() ->
     TokenUrl = imdsv2_token_url(),
     ?LOG_INFO("Attempting to obtain EC2 IMDSv2 token from ~tp ...", [TokenUrl]),
     % Parse metadata service URL
-    {Host, Port, Path} = aws_lib:parse_uri(TokenUrl),
+    Uri = aws_lib_uri:parse(TokenUrl),
+    Host = aws_lib_uri:host(Uri),
+    Port = aws_lib_uri:port(Uri),
+    Path = aws_lib_uri:target(Uri),
     % Simple Gun connection for metadata service
 
     % HTTP only, no TLS

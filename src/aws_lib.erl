@@ -20,7 +20,6 @@
     set_credentials/3,
     set_credentials/4,
     has_credentials/1,
-    parse_uri/1,
     ensure_credentials_valid/1,
     ensure_imdsv2_token_valid/1,
     expired_imdsv2_token/1,
@@ -758,7 +757,11 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
 
 %% Gun HTTP client functions
 gun_request(Method, URI, Headers, Body, Options) ->
-    {Host, Port, Path} = parse_uri(URI),
+    Uri = aws_lib_uri:parse(URI),
+    Host = aws_lib_uri:host(Uri),
+    Port = aws_lib_uri:port(Uri),
+    %% target/1 carries the query: Path is used directly as the Gun request line.
+    Path = aws_lib_uri:target(Uri),
     %% A connection failure is returned as {error, Reason} (not raised) so it
     %% flows through format_response/1 into the {error, _, _} shape the retry
     %% loop in api_request_with_retries/8 matches, rather than escaping it.
@@ -825,40 +828,6 @@ create_uri(Host, Path) when is_list(Path) ->
     "https://" ++ Host ++ Path;
 create_uri(Host, {Bucket, Key}) ->
     "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
-
--spec parse_uri(string()) ->
-    {Host :: string(), Port :: integer(), Path :: string()}
-    | {error, {malformed_uri, string()}}.
-%% @doc Split a URI into the {Host, Port, PathWithQuery} triple the Gun request
-%% and instance-metadata paths need. A thin adapter over aws_lib_uri:parse/1 --
-%% the plugin's single, uri_string:parse/1-based URI parser -- rather than a
-%% second hand-rolled parser. The port defaults by scheme (uri_string only
-%% reports it when explicit) and an empty path becomes "/". The query is
-%% reattached to the path because Path is used directly as the Gun request
-%% target (gun:get/gun:put), which must carry the query string. A malformed URI
-%% is reported as {error, {malformed_uri, _}} instead of crashing.
-%% @end
-parse_uri(URI) ->
-    case aws_lib_uri:parse(URI) of
-        #uri{authority = {_UserInfo, Host, Port}, path = Path, query = Query} ->
-            {Host, Port, path_with_query(normalize_path(Path), Query)};
-        {error, _} = Error ->
-            Error
-    end.
-
-%% uri_string:parse/1 always populates a path (empty string when absent), so a
-%% parsed #uri{} never carries path = undefined; only "" needs defaulting to "/".
-normalize_path("") -> "/";
-normalize_path(Path) -> Path.
-
-%% Reattach the query string to the path. aws_lib_uri:parse/1 dissects the query
-%% into a proplist; rebuild it with the same helper the request signer uses
-%% (aws_lib_uri:build_query_string/1) so the request target and the SigV4
-%% canonical query derive from one representation and cannot drift apart.
-path_with_query(Path, Query) when Query =:= undefined; Query =:= []; Query =:= "" ->
-    Path;
-path_with_query(Path, Query) ->
-    Path ++ "?" ++ aws_lib_uri:build_query_string(Query).
 
 status_text(200) -> "OK";
 status_text(206) -> "Partial Content";
