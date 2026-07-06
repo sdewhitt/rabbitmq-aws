@@ -167,6 +167,36 @@ format_response_test_() ->
                 {error, "Internal Server Error",
                     {[{"Content-Type", "text/xml"}], [{"error", "Boom"}]}},
             ?assertEqual(Expectation, aws_lib:format_response(Response))
+        end},
+        {"201 Created is a success", fun() ->
+            Response =
+                {ok, {
+                    {"HTTP/1.1", 201, "Created"},
+                    [{<<"Content-Type">>, <<"text/xml">>}],
+                    "<test>Value</test>"
+                }},
+            Expectation = {ok, {[{<<"Content-Type">>, <<"text/xml">>}], [{"test", "Value"}]}},
+            ?assertEqual(Expectation, aws_lib:format_response(Response))
+        end},
+        {"204 No Content is a success", fun() ->
+            Response =
+                {ok, {
+                    {"HTTP/1.1", 204, "No Content"},
+                    [],
+                    <<>>
+                }},
+            Expectation = {ok, {[], <<>>}},
+            ?assertEqual(Expectation, aws_lib:format_response(Response))
+        end},
+        {"3xx redirect is an error (gun does not follow redirects)", fun() ->
+            Response =
+                {ok, {
+                    {"HTTP/1.1", 302, "Found"},
+                    [{<<"content-type">>, <<"text/plain">>}],
+                    <<"moved">>
+                }},
+            Expectation = {error, "Found", {[{<<"content-type">>, <<"text/plain">>}], <<"moved">>}},
+            ?assertEqual(Expectation, aws_lib:format_response(Response))
         end}
     ].
 
