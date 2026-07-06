@@ -688,3 +688,48 @@ expired_imdsv2_token_test_() ->
             ?assertEqual(true, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end}
     ].
+
+parse_uri_test_() ->
+    [
+        {"https host with path defaults the port to 443", fun() ->
+            ?assertEqual(
+                {"s3.amazonaws.com", 443, "/bucket/key"},
+                aws_lib:parse_uri("https://s3.amazonaws.com/bucket/key")
+            )
+        end},
+        {"http host with an explicit port", fun() ->
+            ?assertEqual(
+                {"169.254.169.254", 8080, "/latest/meta-data/"},
+                aws_lib:parse_uri("http://169.254.169.254:8080/latest/meta-data/")
+            )
+        end},
+        {"an empty path becomes /", fun() ->
+            ?assertEqual(
+                {"example.com", 443, "/"},
+                aws_lib:parse_uri("https://example.com")
+            )
+        end},
+        %% The query string must be reattached to the path: Path is used directly
+        %% as the Gun request target, so dropping the query would send the wrong
+        %% request (and diverge from the signed URI).
+        {"the query string is reattached to the path", fun() ->
+            ?assertEqual(
+                {"ec2.us-east-1.amazonaws.com", 443,
+                    "/?Action=DescribeTags&Version=2015-10-01"},
+                aws_lib:parse_uri(
+                    "https://ec2.us-east-1.amazonaws.com/?Action=DescribeTags&Version=2015-10-01"
+                )
+            )
+        end},
+        %% Issue #100: malformed input returns an error tuple rather than
+        %% crashing with a case_clause.
+        {"a scheme-less URI is reported, not crashed", fun() ->
+            ?assertEqual(
+                {error, {malformed_uri, "ec2.amazonaws.com/path"}},
+                aws_lib:parse_uri("ec2.amazonaws.com/path")
+            )
+        end},
+        {"an empty string is reported, not crashed", fun() ->
+            ?assertEqual({error, {malformed_uri, ""}}, aws_lib:parse_uri(""))
+        end}
+    ].

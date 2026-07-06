@@ -31,67 +31,71 @@ build(URI) ->
         scheme => to_list(URI#uri.scheme),
         host => Host
     },
-    UriMap1 =
-        case UserInfo of
-            undefined -> UriMap;
-            {User, undefined} -> maps:put(userinfo, User, UriMap);
-            {User, Password} -> maps:put(userinfo, User ++ ":" ++ Password, UriMap)
-        end,
-    UriMap2 =
-        case Port of
-            undefined -> UriMap1;
-            Value1 -> maps:put(port, Value1, UriMap1)
-        end,
-    UriMap3 =
-        case URI#uri.path of
-            undefined ->
-                maps:put(path, "", UriMap2);
-            Value2 ->
-                PrefixedPath =
-                    case string:slice(Value2, 0, 1) of
-                        "/" -> Value2;
-                        _ -> "/" ++ Value2
-                    end,
-                maps:put(path, PrefixedPath, UriMap2)
-        end,
-    UriMap4 =
-        case URI#uri.query of
-            undefined -> UriMap3;
-            "" -> UriMap3;
-            Value3 -> maps:put(query, build_query_string(Value3), UriMap3)
-        end,
-    UriMap5 =
-        case URI#uri.fragment of
-            undefined -> UriMap4;
-            Value4 -> maps:put(fragment, Value4, UriMap4)
-        end,
+    UriMap1 = maybe_put_userinfo(UserInfo, UriMap),
+    UriMap2 = maybe_put_port(Port, UriMap1),
+    UriMap3 = put_path(URI#uri.path, UriMap2),
+    UriMap4 = maybe_put_query(URI#uri.query, UriMap3),
+    UriMap5 = maybe_put_fragment(URI#uri.fragment, UriMap4),
     uri_string:recompose(UriMap5).
 
--spec parse(string()) -> #uri{} | {error, any()}.
-%% @doc Parse a URI string returning a record with the parsed results
+maybe_put_userinfo(undefined, Map) -> Map;
+maybe_put_userinfo({User, undefined}, Map) -> Map#{userinfo => User};
+maybe_put_userinfo({User, Password}, Map) -> Map#{userinfo => User ++ ":" ++ Password}.
+
+maybe_put_port(undefined, Map) -> Map;
+maybe_put_port(Port, Map) -> Map#{port => Port}.
+
+%% The path is always set (an absent path becomes ""), so this is an
+%% unconditional put rather than a maybe_put.
+put_path(undefined, Map) -> Map#{path => ""};
+put_path(Path, Map) -> Map#{path => prefix_path(Path)}.
+
+%% uri_string:recompose/1 needs an absolute path; ensure a leading "/".
+prefix_path([$/ | _] = Path) -> Path;
+prefix_path(Path) -> "/" ++ Path.
+
+maybe_put_query(undefined, Map) -> Map;
+maybe_put_query("", Map) -> Map;
+maybe_put_query(Query, Map) -> Map#{query => build_query_string(Query)}.
+
+maybe_put_fragment(undefined, Map) -> Map;
+maybe_put_fragment(Fragment, Map) -> Map#{fragment => Fragment}.
+
+-spec parse(string()) -> #uri{} | {error, {malformed_uri, string()}}.
+%% @doc Parse a URI string into a #uri{} record. This is the single URI parser
+%% for the plugin -- every other component that needs URI components (the AWS
+%% request signer, the EC2 instance-metadata client, and so on) goes through
+%% here rather than splitting strings by hand. It is built on the RFC 3986
+%% compliant uri_string:parse/1, so a scheme-less, relative, or otherwise
+%% malformed input returns {error, {malformed_uri, _}} instead of crashing.
 %% @end
 parse(Value) ->
-    UriMap = uri_string:parse(Value),
-    Scheme = maps:get(scheme, UriMap, "https"),
-    Host = maps:get(host, UriMap),
-
-    DefaultPort =
-        case Scheme of
-            "http" -> 80;
-            "https" -> 443;
-            _ -> undefined
-        end,
-    Port = maps:get(port, UriMap, DefaultPort),
-    UserInfo = parse_userinfo(maps:get(userinfo, UriMap, undefined)),
-    Path = maps:get(path, UriMap),
-    Query = maps:get(query, UriMap, ""),
-    #uri{
-        scheme = Scheme,
-        authority = {parse_userinfo(UserInfo), Host, Port},
-        path = Path,
-        query = uri_string:dissect_query(Query),
-        fragment = maps:get(fragment, UriMap, undefined)
-    }.
+    case uri_string:parse(Value) of
+        #{host := Host} = UriMap ->
+            Scheme = maps:get(scheme, UriMap, "https"),
+            DefaultPort =
+                case Scheme of
+                    "http" -> 80;
+                    "https" -> 443;
+                    _ -> undefined
+                end,
+            Port = maps:get(port, UriMap, DefaultPort),
+            UserInfo = parse_userinfo(maps:get(userinfo, UriMap, undefined)),
+            Path = maps:get(path, UriMap),
+            Query = maps:get(query, UriMap, ""),
+            #uri{
+                scheme = Scheme,
+                authority = {parse_userinfo(UserInfo), Host, Port},
+                path = Path,
+                query = uri_string:dissect_query(Query),
+                fragment = maps:get(fragment, UriMap, undefined)
+            };
+        %% No host component (scheme-less or relative input), or uri_string
+        %% reported a parse error. Either way the input is not a usable
+        %% absolute URI, so report it rather than crash.
+        _ ->
+            {error, {malformed_uri, Value}}
+    end.
 
 -spec parse_userinfo(string() | undefined) ->
     {username() | undefined, password() | undefined} | undefined.

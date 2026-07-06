@@ -826,33 +826,39 @@ create_uri(Host, Path) when is_list(Path) ->
 create_uri(Host, {Bucket, Key}) ->
     "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
 
+-spec parse_uri(string()) ->
+    {Host :: string(), Port :: integer(), Path :: string()}
+    | {error, {malformed_uri, string()}}.
+%% @doc Split a URI into the {Host, Port, PathWithQuery} triple the Gun request
+%% and instance-metadata paths need. A thin adapter over aws_lib_uri:parse/1 --
+%% the plugin's single, uri_string:parse/1-based URI parser -- rather than a
+%% second hand-rolled parser. The port defaults by scheme (uri_string only
+%% reports it when explicit) and an empty path becomes "/". The query is
+%% reattached to the path because Path is used directly as the Gun request
+%% target (gun:get/gun:put), which must carry the query string. A malformed URI
+%% is reported as {error, {malformed_uri, _}} instead of crashing.
+%% @end
 parse_uri(URI) ->
-    case string:split(URI, "://", leading) of
-        [Scheme, Rest] ->
-            case string:split(Rest, "/", leading) of
-                [HostPort] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/"};
-                [HostPort, Path] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/" ++ Path}
-            end
+    case aws_lib_uri:parse(URI) of
+        #uri{authority = {_UserInfo, Host, Port}, path = Path, query = Query} ->
+            {Host, Port, path_with_query(normalize_path(Path), Query)};
+        {error, _} = Error ->
+            Error
     end.
 
-parse_host_port(HostPort, Scheme) ->
-    DefaultPort =
-        case Scheme of
-            "https" -> 443;
-            "http" -> 80;
-            % Fallback to HTTPS
-            _ -> 443
-        end,
-    case string:split(HostPort, ":", trailing) of
-        [Host] ->
-            {Host, DefaultPort};
-        [Host, PortStr] ->
-            {Host, list_to_integer(PortStr)}
-    end.
+%% uri_string:parse/1 always populates a path (empty string when absent), so a
+%% parsed #uri{} never carries path = undefined; only "" needs defaulting to "/".
+normalize_path("") -> "/";
+normalize_path(Path) -> Path.
+
+%% Reattach the query string to the path. aws_lib_uri:parse/1 dissects the query
+%% into a proplist; rebuild it with the same helper the request signer uses
+%% (aws_lib_uri:build_query_string/1) so the request target and the SigV4
+%% canonical query derive from one representation and cannot drift apart.
+path_with_query(Path, Query) when Query =:= undefined; Query =:= []; Query =:= "" ->
+    Path;
+path_with_query(Path, Query) ->
+    Path ++ "?" ++ aws_lib_uri:build_query_string(Query).
 
 status_text(200) -> "OK";
 status_text(206) -> "Partial Content";

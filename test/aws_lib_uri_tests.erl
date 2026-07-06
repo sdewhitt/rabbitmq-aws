@@ -181,5 +181,21 @@ parse_test_() ->
                 fragment = undefined
             },
             ?assertEqual(Expect, aws_lib_uri:parse(URI))
+        end},
+        %% Malformed input must return an error tuple, never crash (issue #100).
+        {"scheme-less input is rejected", fun() ->
+            ?assertEqual(
+                {error, {malformed_uri, "www.google.com/search"}},
+                aws_lib_uri:parse("www.google.com/search")
+            )
+        end},
+        {"relative path is rejected", fun() ->
+            ?assertEqual(
+                {error, {malformed_uri, "/just/a/path"}},
+                aws_lib_uri:parse("/just/a/path")
+            )
+        end},
+        {"empty string is rejected", fun() ->
+            ?assertEqual({error, {malformed_uri, ""}}, aws_lib_uri:parse(""))
         end}
     ].
