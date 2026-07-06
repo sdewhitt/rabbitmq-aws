@@ -570,6 +570,62 @@ http_probe_raise_does_not_leak_test_() ->
             ]
         end}.
 
+%% claim_probe_profile/2 must ADVANCE past a slot that inets:start reports as
+%% already_present, not fail the request closed. already_present arises when a
+%% concurrent validation is mid-teardown: inets:stop/2 runs terminate_child then
+%% delete_child as two supervisor calls, and a permanent httpc-profile child
+%% keeps its spec (pid=undefined) between them, so a start landing in that window
+%% sees already_present rather than already_started. We mock inets:start to
+%% return already_present on the FIRST slot and {ok, _} on the SECOND, and assert
+%% validate/1 still reaches the (mocked) probe and returns its ok -- proving the
+%% loop advanced. Without the already_present clause this would fall through to
+%% the fail-closed catch-all and return connection_failed.
+http_claim_profile_advances_on_already_present_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(httpc, [unstick, passthrough]),
+            ok = meck:new(inets, [unstick, passthrough]),
+            ok = meck:new(inet, [unstick, passthrough]),
+            %% First inets:start -> already_present (slot mid-teardown); the
+            %% next -> a started profile. seq/1 repeats its last element, so any
+            %% further starts also succeed.
+            meck:expect(
+                inets,
+                start,
+                [httpc, '_'],
+                meck:seq([{error, already_present}, {ok, self()}])
+            ),
+            meck:expect(inets, stop, fun(httpc, _) -> ok end),
+            meck:expect(httpc, set_options, fun(_, _) -> ok end),
+            %% The probe reaches a well-formed auth response so the outcome is ok
+            %% (proving execution got past claim_probe_profile).
+            meck:expect(httpc, request, fun(_M, _R, _H, _O, _P) ->
+                {ok, {{"HTTP/1.1", 200, "OK"}, [], <<"allow">>}}
+            end),
+            %% Literal-IP URL still resolves through resolve_and_pin -> getaddrs
+            %% is not hit, but mock defensively.
+            meck:expect(inet, getaddrs, fun(_, _) -> {ok, [{8, 8, 8, 8}]} end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(inet),
+            meck:unload(inets),
+            meck:unload(httpc)
+        end,
+        fun(_) ->
+            Body = base_body(#{
+                <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
+            }),
+            Result = aws_auth_validate_http:validate(Body),
+            [
+                %% Advanced past already_present and completed the probe.
+                ?_assertEqual(ok, Result),
+                %% Exactly two inets:start calls: the already_present slot, then
+                %% the one we claimed.
+                ?_assertEqual(2, meck:num_calls(inets, start, [httpc, '_']))
+            ]
+        end}.
+
 %% Response-contract grammar (classify_response/2). The status code is checked
 %% by the probe; this checks the body shape that gates a 2xx onto `ok'. A `deny'
 %% (or allow-with-tags on user_path) is a SUCCESS -- we validate the shape, not

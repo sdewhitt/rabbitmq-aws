@@ -648,10 +648,10 @@ profile_atom(Slot) ->
 %% Claim a profile by scanning the fixed pool for a FREE slot: start at a
 %% per-request hashed slot and try to inets:start it. Starting succeeds only if
 %% no concurrent validation already owns that slot, so success means we own it.
-%% On {already_started,_} advance to the next slot (never stop a slot in use by
-%% a peer -- that would tear down its in-flight request). Bounded to one full
-%% pass over the pool; if every slot is busy, fail closed. Returns {ok, Profile}
-%% | none.
+%% On {already_started,_} (slot running) or already_present (slot mid-teardown)
+%% advance to the next slot -- never stop a slot in use by a peer, that would
+%% tear down its in-flight request. Bounded to one full pass over the pool; if
+%% every slot is busy, fail closed. Returns {ok, Profile} | none.
 claim_probe_profile() ->
     Start = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
     claim_probe_profile(Start, ?PROFILE_POOL_SIZE).
@@ -669,6 +669,16 @@ claim_probe_profile(Slot, Remaining) ->
             {ok, Profile};
         {error, {already_started, _}} ->
             %% Slot in use by a concurrent validation -- do NOT steal it; advance.
+            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
+        {error, already_present} ->
+            %% Slot mid-teardown by a concurrent validation. inets:stop/2 runs
+            %% terminate_child THEN delete_child as two separate supervisor
+            %% calls; a permanent child (the httpc profile) keeps its spec with
+            %% pid=undefined between them, so a start landing in that window sees
+            %% already_present rather than already_started. Not cleanly free --
+            %% advance like the already_started case rather than fail this
+            %% request closed. The pool size exceeds the concurrency cap, so the
+            %% scan still lands on a genuinely free slot within one pass.
             claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
         _ ->
             %% Any other start error: fail closed rather than risk the shared
