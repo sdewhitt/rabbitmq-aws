@@ -160,6 +160,11 @@
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_ENDPOINT, <<"HTTP auth server did not return a usable response">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+-define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
+-define(REASON_NO_ASSUME_ROLE, <<
+    "auth validation requires an assume_role to be configured; "
+    "set aws.arns.assume_role_arn"
+>>).
 
 %% HTTP status codes rabbit_auth_backend_http treats as a usable auth response
 %% (it accepts 200 and 201). We accept the same set as "the endpoint answered
@@ -233,7 +238,79 @@ validate(Body) when is_map(Body) ->
         {error, _, _} = Err ->
             Err;
         {ok, Params} ->
-            do_http_validate(Params)
+            case resolve_request_state(Params) of
+                {error, _, _} = Err -> Err;
+                {ok, Params1} -> do_http_validate(Params1)
+            end
+    end.
+
+%% Build the per-request aws_lib state used for every ARN fetch in this request
+%% (cacertfile_arn / certfile_arn / keyfile_arn), and thread it into Params.
+%% Runs after all pure input validation has passed, so a malformed request never
+%% triggers an STS AssumeRole call (ARN-first ordering).
+%%
+%% Mirrors the LDAP backend's guardrail (resolve_request_state/1 there): when the
+%% request resolves ANY ARN, a configured `aws.arns.assume_role_arn' is
+%% MANDATORY. We assume that role -- the SAME role the plugin already assumes at
+%% boot to resolve every configured ARN (aws_arn_config:maybe_assume_role/1) --
+%% into a request-local aws_lib state and resolve the TLS-material ARNs under it.
+%% This is operator config, not caller input, so it raises no confused-deputy
+%% concern.
+%%
+%% When NO role is configured we do NOT fall back to a default aws_lib state:
+%% that would resolve ARNs with the broker's ambient (EC2 instance) credentials,
+%% which on Amazon MQ can be far more privileged than the role a customer would
+%% attach to their own secret/bucket, so a validate request could resolve ARNs
+%% the caller's intended role never could -- a least-privilege pitfall. We never
+%% use the instance role: with an ARN referenced and no assume_role configured,
+%% refuse with config_conflict before any secret fetch or outbound connection.
+%%
+%% Unlike LDAP (where password_arn is mandatory, so every request resolves an
+%% ARN), the HTTP backend resolves ARNs only when the request supplies TLS
+%% material. A plain reachability / (m)TLS probe that references no ARN performs
+%% no AWS call, so it needs no role and gets a default state that is never used
+%% to resolve an ARN -- preserving the credential-free reachability check.
+resolve_request_state(Params) ->
+    case request_references_arn(Params) of
+        false ->
+            {ok, Params#{aws_state => aws_lib:new()}};
+        true ->
+            case configured_assume_role_arn() of
+                none ->
+                    {error, config_conflict, ?REASON_NO_ASSUME_ROLE};
+                RoleArn ->
+                    case aws_iam:assume_role(RoleArn, aws_lib:new()) of
+                        {ok, State} -> {ok, Params#{aws_state => State}};
+                        {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
+                    end
+            end
+    end.
+
+%% True when the request references any ARN-backed TLS material, i.e. resolving
+%% the request will make at least one AWS call. The ARN keys live under
+%% ssl_options (cacertfile_arn / certfile_arn / keyfile_arn); parse_ssl_options
+%% guaranteed cert/key are supplied together, so any one key means an AWS fetch.
+request_references_arn(#{ssl_options := Map}) ->
+    lists:any(
+        fun(K) -> maps:is_key(K, Map) end,
+        [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>]
+    ).
+
+%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
+%% read from the same `aws, arn_config' env the boot sequence uses
+%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
+%% when unset. Mirrors aws_auth_validate_ldap:configured_assume_role_arn/0.
+configured_assume_role_arn() ->
+    case application:get_env(aws, arn_config) of
+        {ok, ArnConfig} when is_list(ArnConfig) ->
+            case proplists:get_value(assume_role_arn, ArnConfig) of
+                undefined -> none;
+                Arn when is_list(Arn) -> Arn;
+                Arn when is_binary(Arn) -> binary_to_list(Arn);
+                _ -> none
+            end;
+        _ ->
+            none
     end.
 
 %%--------------------------------------------------------------------
@@ -959,12 +1036,17 @@ params_for(<<"topic_path">>) ->
 %% proplist for httpc. ARN resolution happens here, in the network phase, after
 %% all pure validation has passed (ARN-first ordering). Any resolution failure
 %% maps to input_invalid, matching the LDAP backend.
-build_client_ssl_opts(#{ssl_options := Map}) ->
-    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined)) of
+build_client_ssl_opts(#{ssl_options := Map} = Params) ->
+    %% aws_state was built once per request by resolve_request_state/1 (under the
+    %% configured assume_role when any ARN is referenced) and is threaded into
+    %% every ARN fetch here. A request that references no ARN carries a default
+    %% state that is never used to resolve one.
+    State = maps:get(aws_state, Params, undefined),
+    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State) of
         {error, _, _} = Err ->
             Err;
         {ok, CacertOpts} ->
-            case resolve_client_cert(Map) of
+            case resolve_client_cert(Map, State) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, ClientOpts} ->
@@ -976,10 +1058,10 @@ build_client_ssl_opts(#{ssl_options := Map}) ->
             end
     end.
 
-resolve_cacerts(undefined) ->
+resolve_cacerts(undefined, _State) ->
     {ok, []};
-resolve_cacerts(Arn) when is_binary(Arn) ->
-    case resolve_arn(Arn) of
+resolve_cacerts(Arn, State) when is_binary(Arn) ->
+    case resolve_arn(Arn, State) of
         {ok, Pem} ->
             case decode_pem_cacerts(Pem) of
                 skip -> {ok, []};
@@ -992,16 +1074,16 @@ resolve_cacerts(Arn) when is_binary(Arn) ->
 %% Resolve the client certificate + private key for mutual TLS. parse_ssl_options
 %% already guaranteed both are present or both absent, so here we either resolve
 %% the pair or return no client-auth options.
-resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}) when
+resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}, State) when
     is_binary(CertArn), is_binary(KeyArn)
 ->
-    case resolve_arn(CertArn) of
+    case resolve_arn(CertArn, State) of
         {ok, CertPem} ->
             case decode_client_cert(CertPem) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, CertOpt} ->
-                    case resolve_arn(KeyArn) of
+                    case resolve_arn(KeyArn, State) of
                         {ok, KeyPem} ->
                             case decode_client_key(KeyPem) of
                                 {error, _, _} = Err -> Err;
@@ -1014,7 +1096,7 @@ resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn
         {error, _} ->
             {error, input_invalid, ?REASON_ARN_RESOLVE}
     end;
-resolve_client_cert(_Map) ->
+resolve_client_cert(_Map, _State) ->
     {ok, []}.
 
 %% Decode a client-certificate PEM into an ssl {cert, DER} option. The first
@@ -1168,17 +1250,21 @@ to_version(<<"tlsv1">>) -> tlsv1.
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
-%% aws_lib threads AWS state per call instead of mutating a global singleton,
-%% so concurrent validations no longer share mutable region/credential state and
-%% no ARN lock is needed. R6 is preserved -- resolution runs in the caller
-%% process and the resolved secret is neither logged nor returned (only adapted
-%% to the caller's {ok, Binary} contract). R3 is preserved -- this still runs
-%% only after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
+%% Resolve an ARN using the request's threaded aws_state(). The state is built
+%% once per request by resolve_request_state/1 -- under the operator-configured
+%% assume_role (a request that references an ARN with no role configured is
+%% refused before reaching here) -- and passed to every ARN fetch in the
+%% request. This is the guardrail: aws_lib threads credentials per call, so the
+%% assumed role's credentials are visible only to this request's resolutions and
+%% the endpoint never resolves an ARN under the broker's ambient EC2 instance
+%% role. R6 is preserved -- resolution runs in the caller process and the
+%% resolved secret is neither logged nor returned (only adapted to the caller's
+%% {ok, Binary} contract). R3 is preserved -- this still runs only after the pure
+%% validation pipeline. The 3-tuple {ok, Data, State1} from
 %% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
 %% callers expect; the threaded state is request-scoped and discarded here.
--spec resolve_arn(binary()) -> {ok, binary()} | {error, term()}.
-resolve_arn(Arn) when is_binary(Arn) ->
-    State = aws_lib:new(),
+-spec resolve_arn(binary(), aws_lib:aws_state()) -> {ok, binary()} | {error, term()}.
+resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
         {error, _} = Error -> Error
