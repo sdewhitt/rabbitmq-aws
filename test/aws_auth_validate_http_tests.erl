@@ -444,8 +444,16 @@ http_arn_resolved_after_pure_pass_test_() ->
     {setup,
         fun() ->
             ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(aws_iam, [no_link]),
             ok = meck:new(httpc, [unstick, passthrough]),
             ok = meck:new(inets, [unstick, passthrough]),
+            %% Resolving a cacertfile_arn now requires a configured assume_role
+            %% (the instance-role fallback is refused). Configure one and stub the
+            %% STS call so resolution proceeds under the assumed state.
+            application:set_env(aws, arn_config, [
+                {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+            ]),
+            meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
             meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
             %% Let the ephemeral probe profile start/stop so execution reaches
             %% build_client_ssl_opts (which resolves the ARN) -- otherwise an
@@ -460,8 +468,10 @@ http_arn_resolved_after_pure_pass_test_() ->
             ok
         end,
         fun(_) ->
+            application:unset_env(aws, arn_config),
             meck:unload(inets),
             meck:unload(httpc),
+            catch meck:unload(aws_iam),
             meck:unload(aws_arn_util)
         end,
         fun(_) ->
@@ -493,7 +503,13 @@ http_cacert_resolution_does_not_leak_test_() ->
     {setup,
         fun() ->
             ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(aws_iam, [no_link]),
             ok = meck:new(httpc, [unstick, passthrough]),
+            %% cacertfile_arn resolution requires a configured assume_role.
+            application:set_env(aws, arn_config, [
+                {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+            ]),
+            meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
             meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
             meck:expect(httpc, request, fun(_M, _R, _H, _O, _P) ->
                 {error, {failed_connect, []}}
@@ -501,7 +517,9 @@ http_cacert_resolution_does_not_leak_test_() ->
             ok
         end,
         fun(_) ->
+            application:unset_env(aws, arn_config),
             meck:unload(httpc),
+            catch meck:unload(aws_iam),
             meck:unload(aws_arn_util)
         end,
         fun(_) ->

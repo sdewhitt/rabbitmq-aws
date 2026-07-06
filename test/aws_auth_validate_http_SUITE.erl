@@ -125,10 +125,22 @@ init_per_group(_Group, Config) ->
     %% auth_validation_allow_private_networks relaxes ONLY loopback in
     %% classify_ip -- the HTTP analogue of the LDAP suite's local-slapd flag.
     application:set_env(aws, auth_validation_allow_private_networks, true),
+    %% Resolving any ARN (cacertfile_arn / certfile_arn / keyfile_arn) now
+    %% requires a configured assume_role -- the instance-role fallback is refused
+    %% with config_conflict. Configure one for the whole group and stub the STS
+    %% call so it threads through unchanged (resolve_arn is itself mecked per
+    %% case). The no-ARN reachability cases are unaffected (they never resolve).
+    application:set_env(aws, arn_config, [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/validation"}
+    ]),
+    ok = meck:new(aws_iam, [no_link]),
+    ok = meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
     Config.
 
 end_per_group(_Group, Config) ->
     application:unset_env(aws, auth_validation_allow_private_networks),
+    application:unset_env(aws, arn_config),
+    catch meck:unload(aws_iam),
     Config.
 
 init_per_testcase(TC, Config) ->
