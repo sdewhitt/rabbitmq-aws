@@ -12,14 +12,32 @@
 %% category so the response leaks no target URL, response body, or raw httpc
 %% error.
 %%
+%% HTTP client: this backend uses httpc/inets, NOT gun (which aws_lib uses for
+%% AWS API calls). That is deliberate. The point of a config validator is to
+%% reproduce the REAL code path, and rabbit_auth_backend_http -- the backend
+%% this endpoint validates -- issues its auth requests via httpc:request/4
+%% (rabbit_auth_backend_http:do_http_req/2, in deps/rabbitmq_auth_backend_http).
+%% Probing with the same client the broker uses means a green result here
+%% reflects how the broker will actually behave: the same TLS option handling,
+%% redirect policy, header shaping, and timeout semantics. A different client
+%% (e.g. gun) could pass here yet fail in production, or vice versa. This
+%% mirrors the LDAP backend, which uses eldap because rabbit_auth_backend_ldap
+%% does. The cost of httpc is its global-profile model (see the profile-pool
+%% section below); that complexity is the price of fidelity, not an arbitrary
+%% choice.
+%%
 %% Scope: REACHABILITY-ONLY (deliberate first cut). An HTTP auth server, by
 %% contract, answers `allow'/`deny' for a specific {user, vhost, resource}
 %% tuple -- a `deny' is a correctly-working server, not a misconfiguration. So
 %% we do NOT assert that any particular principal is authorized. Instead we
 %% confirm each configured `*_path' is reachable over (m)TLS and answers like
-%% an auth server (a well-formed HTTP response). That catches the actual pain
-%% (wrong URL, TLS/CA misconfig, unreachable host) without needing a real test
-%% credential or an authz-semantics judgement.
+%% an auth server -- a usable HTTP status (200/201) AND a body matching
+%% rabbit_auth_backend_http's allow/deny grammar. That catches the actual pain
+%% (wrong URL, TLS/CA misconfig, unreachable host, path pointing at a service
+%% that is not an auth backend) without needing a real test credential or an
+%% authz-semantics judgement. We check the SHAPE of the response, not its
+%% verdict: a `deny' for our synthetic probe principal is a success, since a
+%% well-formed deny still proves the endpoint speaks the auth protocol.
 %%
 %% A future credentialed-probe mode (assert user_path returns `allow' for a
 %% supplied username + password_arn) is intentionally out of scope here; see
@@ -41,6 +59,28 @@
 -behaviour(aws_auth_validate_backend).
 
 -export([method_name/0, validate/1, allowed_fields/0]).
+
+-ifdef(TEST).
+%% Exposed for unit tests: the SSRF address policy (classify_ip/1 and the
+%% CIDR primitives), the URL parser, the per-URL pure guard, the network-phase
+%% resolve+pin, the TLS-option builder, and the httpc error classifier. All are
+%% otherwise internal. Mirrors aws_auth_validate_ldap's TEST export block.
+-export([
+    parse_url/1,
+    parse_paths/2,
+    url_allowed/1,
+    classify_address/1,
+    classify_ip/1,
+    in_cidr/2,
+    in_any_cidr/2,
+    resolve_and_pin/1,
+    pin_url/2,
+    build_client_ssl_opts/1,
+    classify_http_error/1,
+    is_tls_error/1,
+    classify_response/2
+]).
+-endif.
 
 %% Default per-request timeout (ms) when auth_validation_connection_timeout_ms
 %% is unset. Matches the LDAP backend's default.
@@ -120,6 +160,11 @@
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_ENDPOINT, <<"HTTP auth server did not return a usable response">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+-define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
+-define(REASON_NO_ASSUME_ROLE, <<
+    "auth validation requires an assume_role to be configured; "
+    "set aws.arns.assume_role_arn"
+>>).
 
 %% HTTP status codes rabbit_auth_backend_http treats as a usable auth response
 %% (it accepts 200 and 201). We accept the same set as "the endpoint answered
@@ -129,11 +174,10 @@
 -define(AUTH_RESPONSE_CODES, [200, 201]).
 
 %% SSRF guard toggles (see the SSRF guard section below for the full rationale).
-%% ?ENFORCE_ADDRESS_POLICY gates BOTH the per-URL address check (url_allowed/1,
-%% via classify_address/1) and the probe-layer DNS resolve+classify, and the
-%% fail-closed guard in validate/1 (ssrf_policy_ready/0) is bound to it too --
-%% so enforcement and probing turn on together. It is now TRUE: the address
-%% policy (classify_ip/1 + the probe-layer resolve+pin) is implemented.
+%% The address policy (classify_ip/1 + the probe-layer resolve+pin) is now live,
+%% so ?ENFORCE_ADDRESS_POLICY is TRUE. It is retained as a defined marker of that
+%% state; enforcement itself runs unconditionally via url_allowed/1 and the
+%% probe-layer resolve+classify.
 %% NOTE: AppSec review + pen test are still pending (parent FAQ 2.1); the method
 %% remains opt-in (aws_auth_validate_registry ?OPT_IN_METHODS) so it is not live
 %% until an operator explicitly enables it.
@@ -184,35 +228,90 @@ allowed_fields() ->
 
 -spec validate(map()) -> aws_auth_validate_backend:result().
 validate(Body) when is_map(Body) ->
-    %% FAIL-CLOSED until the SSRF address policy is live. The probe issues
-    %% outbound requests to customer-supplied URLs from the broker's network
-    %% position; until classify_address/1 denies IMDS/link-local/loopback/
-    %% private targets (?ENFORCE_ADDRESS_POLICY = true) and AppSec has signed
-    %% off, no probe may run -- otherwise this is an SSRF vector (e.g. to
-    %% 169.254.169.254). Report method_disabled so an operator who turned the
-    %% method on still gets a safe, fixed-category 404 rather than a live
-    %% unrestricted probe. This guard lifts automatically when the policy lands.
-    case ssrf_policy_ready() of
-        false ->
-            {error, method_disabled};
-        true ->
-            %% Same ARN-first ordering as the LDAP backend: all pure,
-            %% network-free validation (URL shape, method, ssl_options values,
-            %% and the SSRF guard) runs before any cacertfile_arn is resolved
-            %% or any request is made.
-            case parse_input(Body) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, Params} ->
-                    do_http_validate(Params)
+    %% Whether the method may run is gated by the opt-in registry
+    %% (aws_auth_validate_registry ?OPT_IN_METHODS), not a compile-time switch:
+    %% the SSRF address policy is live, so no fail-closed guard is needed here.
+    %% Same ARN-first ordering as the LDAP backend: all pure, network-free
+    %% validation (URL shape, method, ssl_options values, and the SSRF guard)
+    %% runs before any cacertfile_arn is resolved or any request is made.
+    case parse_input(Body) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, Params} ->
+            case resolve_request_state(Params) of
+                {error, _, _} = Err -> Err;
+                {ok, Params1} -> do_http_validate(Params1)
             end
     end.
 
-%% The probe is only allowed to run once the SSRF address policy is enforced.
-%% Tied to the same compile-time toggle the guard uses, so the backend cannot
-%% issue outbound requests while classify_address/1 is still a no-op.
-ssrf_policy_ready() ->
-    ?ENFORCE_ADDRESS_POLICY.
+%% Build the per-request aws_lib state used for every ARN fetch in this request
+%% (cacertfile_arn / certfile_arn / keyfile_arn), and thread it into Params.
+%% Runs after all pure input validation has passed, so a malformed request never
+%% triggers an STS AssumeRole call (ARN-first ordering).
+%%
+%% Mirrors the LDAP backend's guardrail (resolve_request_state/1 there): when the
+%% request resolves ANY ARN, a configured `aws.arns.assume_role_arn' is
+%% MANDATORY. We assume that role -- the SAME role the plugin already assumes at
+%% boot to resolve every configured ARN (aws_arn_config:maybe_assume_role/1) --
+%% into a request-local aws_lib state and resolve the TLS-material ARNs under it.
+%% This is operator config, not caller input, so it raises no confused-deputy
+%% concern.
+%%
+%% When NO role is configured we do NOT fall back to a default aws_lib state:
+%% that would resolve ARNs with the broker's ambient (EC2 instance) credentials,
+%% which on Amazon MQ can be far more privileged than the role a customer would
+%% attach to their own secret/bucket, so a validate request could resolve ARNs
+%% the caller's intended role never could -- a least-privilege pitfall. We never
+%% use the instance role: with an ARN referenced and no assume_role configured,
+%% refuse with config_conflict before any secret fetch or outbound connection.
+%%
+%% Unlike LDAP (where password_arn is mandatory, so every request resolves an
+%% ARN), the HTTP backend resolves ARNs only when the request supplies TLS
+%% material. A plain reachability / (m)TLS probe that references no ARN performs
+%% no AWS call, so it needs no role and gets a default state that is never used
+%% to resolve an ARN -- preserving the credential-free reachability check.
+resolve_request_state(Params) ->
+    case request_references_arn(Params) of
+        false ->
+            {ok, Params#{aws_state => aws_lib:new()}};
+        true ->
+            case configured_assume_role_arn() of
+                none ->
+                    {error, config_conflict, ?REASON_NO_ASSUME_ROLE};
+                RoleArn ->
+                    case aws_iam:assume_role(RoleArn, aws_lib:new()) of
+                        {ok, State} -> {ok, Params#{aws_state => State}};
+                        {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
+                    end
+            end
+    end.
+
+%% True when the request references any ARN-backed TLS material, i.e. resolving
+%% the request will make at least one AWS call. The ARN keys live under
+%% ssl_options (cacertfile_arn / certfile_arn / keyfile_arn); parse_ssl_options
+%% guaranteed cert/key are supplied together, so any one key means an AWS fetch.
+request_references_arn(#{ssl_options := Map}) ->
+    lists:any(
+        fun(K) -> maps:is_key(K, Map) end,
+        [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>]
+    ).
+
+%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
+%% read from the same `aws, arn_config' env the boot sequence uses
+%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
+%% when unset. Mirrors aws_auth_validate_ldap:configured_assume_role_arn/0.
+configured_assume_role_arn() ->
+    case application:get_env(aws, arn_config) of
+        {ok, ArnConfig} when is_list(ArnConfig) ->
+            case proplists:get_value(assume_role_arn, ArnConfig) of
+                undefined -> none;
+                Arn when is_list(Arn) -> Arn;
+                Arn when is_binary(Arn) -> binary_to_list(Arn);
+                _ -> none
+            end;
+        _ ->
+            none
+    end.
 
 %%--------------------------------------------------------------------
 %% Input parsing (pure, no network)
@@ -278,16 +377,21 @@ parse_url(Bin) when is_binary(Bin) ->
             %%  * an out-of-range port (else httpc crashes at request time),
             %%  * userinfo (user:pass@host) -- embedded credentials httpc would
             %%    turn into an Authorization header,
-            %%  * a pre-existing query string -- the broker's auth_http.*_path
-            %%    config is query-less and the probe appends its own ?username=
-            %%    params; a path that already carried a query would be mangled
-            %%    into a double-? URL and spuriously fail.
+            %%  * a pre-existing query string OR a #fragment -- the broker's
+            %%    auth_http.*_path config is query- and fragment-less and the
+            %%    probe appends its own ?username= params. A path that already
+            %%    carried a query would be mangled into a double-? URL; a path
+            %%    with a fragment would have the probe's ?query appended AFTER
+            %%    the fragment, so httpc drops the query (fragments are not sent)
+            %%    and the probe misfires. Either way it would spuriously fail.
             Port = maps:get(port, Parsed, undefined),
             HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
+            HasFragment =
+                maps:is_key(fragment, Parsed) andalso maps:get(fragment, Parsed) =/= [],
             case Port of
                 P when is_integer(P), (P < 1 orelse P > 65535) ->
                     {error, bad_url};
-                _ when HasQuery ->
+                _ when HasQuery orelse HasFragment ->
                     {error, bad_url};
                 _ ->
                     case maps:is_key(userinfo, Parsed) of
@@ -474,14 +578,34 @@ classify_ip({16#2002, W1, W2, _, _, _, _, _}) ->
     classify_ip(v4_from_words(W1, W2));
 classify_ip({_, _, _, _} = V4) ->
     case in_any_cidr(V4, ?DENIED_V4_CIDRS) of
-        true -> deny;
+        true -> classify_denied(V4);
         false -> allow
     end;
 classify_ip({_, _, _, _, _, _, _, _} = V6) ->
     case in_any_cidr(V6, ?DENIED_V6_CIDRS) of
-        true -> deny;
+        true -> classify_denied(V6);
         false -> allow
     end.
+
+%% A denied address is normally `deny'. The ONE exception is loopback when
+%% auth_validation_allow_private_networks is set: that flag (default false, off
+%% in production) lets the HTTP integration suite probe a local stub server on
+%% 127.0.0.1/::1. It is the HTTP analogue of the same flag the LDAP backend
+%% honours for local-slapd tests. It relaxes ONLY loopback -- IMDS, link-local,
+%% and unspecified stay denied even with the flag on, so it cannot be used to
+%% reach instance metadata.
+classify_denied(IP) ->
+    case is_loopback(IP) andalso allow_private_networks() of
+        true -> allow;
+        false -> deny
+    end.
+
+is_loopback({127, _, _, _}) -> true;
+is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_loopback(_) -> false.
+
+allow_private_networks() ->
+    application:get_env(aws, auth_validation_allow_private_networks, false) =:= true.
 
 %% Two 16-bit words -> a v4 4-tuple {a,b,c,d}.
 v4_from_words(W1, W2) ->
@@ -529,14 +653,19 @@ ip_to_int(Tuple) ->
 %% Reachability-only: confirm each configured path is reachable over (m)TLS and
 %% answers like an auth server. We send a representative request with a clearly
 %% SYNTHETIC username (never a real credential) and treat:
-%%   * a 2xx the real backend accepts (200/201)  -> reachable + auth-shaped (ok)
+%%   * a 2xx the real backend accepts (200/201) AND a body matching the
+%%       allow/deny grammar                       -> reachable + auth-shaped (ok)
+%%   * a 2xx whose body is neither allow nor deny  -> reached a server, but it is
+%%       not an auth backend (auth_failed) -- catches a path pointing at a health
+%%       check, HTML page, or proxy that returns 200 for everything
 %%   * any other well-formed HTTP status          -> reachable but the path is
 %%       likely wrong (auth_failed) -- catches user_path pointing at the wrong
 %%       endpoint, the most common config mistake after TLS/connectivity
 %%   * connection refused / DNS / timeout         -> connection_failed
 %%   * TLS handshake / cert verification failure  -> tls_failed
-%% We do NOT interpret allow vs deny: both are 2xx and both mean "the server is
-%% working", so a deny for the synthetic user is a success, not a failure.
+%% We check the SHAPE of the response, not its verdict: allow and deny are both
+%% successes (a deny for the synthetic user still proves the endpoint speaks the
+%% auth protocol). Only a body matching NEITHER is a failure.
 %%
 %% The whole probe runs inside a try/catch that collapses any raise to
 %% connection_failed, so a resolved secret can never reach a crash report (R6).
@@ -550,14 +679,14 @@ ip_to_int(Tuple) ->
 %% violation). A fresh profile has no sessions to reuse, and stopping it tears
 %% down anything opened, so each validation is hermetic.
 do_http_validate(Params) ->
-    Profile = probe_profile_name(),
-    case start_probe_profile(Profile) of
-        false ->
+    case claim_probe_profile() of
+        none ->
             %% Could not obtain an isolated profile; fail safe rather than fall
             %% back to the shared default profile (which would reintroduce the
-            %% session-reuse hazard).
+            %% session-reuse hazard). Unreachable in practice -- the semaphore
+            %% caps concurrency below the pool size -- but must be handled.
             {error, connection_failed, ?REASON_CONNECTION};
-        true ->
+        {ok, Profile} ->
             try
                 case build_client_ssl_opts(Params) of
                     {error, _, _} = Err ->
@@ -569,46 +698,69 @@ do_http_validate(Params) ->
                 _Class:_Reason:_Stack ->
                     {error, connection_failed, ?REASON_CONNECTION}
             after
+                %% Only ever stop the profile THIS request started (claimed).
                 stop_probe_profile(Profile)
             end
     end.
 
+%% This profile machinery exists ONLY because httpc pools sessions on a global,
+%% named-profile basis; see the HTTP client rationale in the module header for
+%% why httpc is nonetheless the right client here.
+%%
 %% Profile names are drawn from a FIXED pool (?PROFILE_POOL_SIZE atoms, created
 %% once and reused forever) rather than a fresh unique atom per request --
 %% generating a new atom per validation would leak the atom table unboundedly
-%% (atoms are never GC'd) and eventually crash the node. The pool is sized well
-%% above auth_validation_max_concurrent's cap (100), so concurrently-running
-%% validations almost never collide on a slot; the slot is picked from a
-%% per-request ref so two simultaneous calls are very unlikely to share one.
+%% (atoms are never GC'd) and eventually crash the node. The pool is sized
+%% strictly ABOVE the concurrency hard cap (auth_validation_max_concurrent = 100),
+%% so a linear probe starting from a per-request hash always finds a FREE slot.
+%% Each in-flight probe OWNS a distinct started profile: a slot is claimed only
+%% by successfully starting it, so two simultaneous calls never share a profile
+%% and none is ever stolen from an actively-probing peer. The atom set stays
+%% bounded at exactly ?PROFILE_POOL_SIZE interned names.
 -define(PROFILE_POOL_SIZE, 128).
 
-probe_profile_name() ->
-    Slot = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+profile_atom(Slot) ->
     list_to_atom("aws_auth_validate_http_" ++ integer_to_list(Slot)).
 
-%% Start the ephemeral profile and disable connection/session reuse on it
-%% (no keep-alive, no session cache) so nothing is pooled even within the call.
-%% If the chosen pool slot is already in use by a concurrent validation,
-%% reclaim it (stop+start): the worst case from a rare collision is that the
-%% other validation's probe errors out to a safe connection_failed -- never a
-%% false success or a leaked authenticated session. Returns whether we now own
-%% a started profile so `after' only stops what exists.
-start_probe_profile(Profile) ->
+%% Claim a profile by scanning the fixed pool for a FREE slot: start at a
+%% per-request hashed slot and try to inets:start it. Starting succeeds only if
+%% no concurrent validation already owns that slot, so success means we own it.
+%% On {already_started,_} (slot running) or already_present (slot mid-teardown)
+%% advance to the next slot -- never stop a slot in use by a peer, that would
+%% tear down its in-flight request. Bounded to one full pass over the pool; if
+%% every slot is busy, fail closed. Returns {ok, Profile} | none.
+claim_probe_profile() ->
+    Start = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+    claim_probe_profile(Start, ?PROFILE_POOL_SIZE).
+
+claim_probe_profile(_Slot, 0) ->
+    %% Every slot busy: unreachable while the semaphore caps concurrency below
+    %% ?PROFILE_POOL_SIZE, but fail closed rather than reuse a shared profile.
+    none;
+claim_probe_profile(Slot, Remaining) ->
+    Profile = profile_atom(Slot),
     case inets:start(httpc, [{profile, Profile}]) of
         {ok, _Pid} ->
+            %% We started (own) this profile; disable reuse and take it.
             set_probe_profile_opts(Profile),
-            true;
+            {ok, Profile};
         {error, {already_started, _}} ->
-            _ = inets:stop(httpc, Profile),
-            case inets:start(httpc, [{profile, Profile}]) of
-                {ok, _Pid} ->
-                    set_probe_profile_opts(Profile),
-                    true;
-                _ ->
-                    false
-            end;
+            %% Slot in use by a concurrent validation -- do NOT steal it; advance.
+            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
+        {error, already_present} ->
+            %% Slot mid-teardown by a concurrent validation. inets:stop/2 runs
+            %% terminate_child THEN delete_child as two separate supervisor
+            %% calls; a permanent child (the httpc profile) keeps its spec with
+            %% pid=undefined between them, so a start landing in that window sees
+            %% already_present rather than already_started. Not cleanly free --
+            %% advance like the already_started case rather than fail this
+            %% request closed. The pool size exceeds the concurrency cap, so the
+            %% scan still lands on a genuinely free slot within one pass.
+            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
         _ ->
-            false
+            %% Any other start error: fail closed rather than risk the shared
+            %% default profile's session-reuse hazard.
+            none
     end.
 
 set_probe_profile_opts(Profile) ->
@@ -654,9 +806,14 @@ probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts, Profi
                     {autoredirect, false}
                 ] ++ ssl_http_opt(Url, Host, SslOpts),
             case httpc:request(Method, Request, HttpOpts, [{body_format, binary}], Profile) of
-                {ok, {{_Vsn, Code, _Phrase}, _Headers, _Body}} ->
+                {ok, {{_Vsn, Code, _Phrase}, _Headers, Body}} ->
                     case lists:member(Code, ?AUTH_RESPONSE_CODES) of
-                        true -> ok;
+                        %% A usable status is necessary but not sufficient: the
+                        %% body must also match rabbit_auth_backend_http's
+                        %% allow/deny grammar, or any 200-returning service
+                        %% (health check, HTML page, proxy) would pass as an
+                        %% auth backend. See classify_response/2.
+                        true -> classify_response(Key, Body);
                         false -> {error, auth_failed, ?REASON_ENDPOINT}
                     end;
                 {error, Reason} ->
@@ -759,6 +916,53 @@ is_tls_atom(A) ->
         no_peercert
     ]).
 
+%% Response-contract check: the status code proved the server answered, this
+%% proves it answered like rabbit_auth_backend_http. A `deny' (or a `deny'-
+%% shaped response) is a SUCCESS here -- the probe uses a synthetic principal
+%% the server is expected to reject, and a well-formed deny still proves the
+%% endpoint speaks the auth protocol. We only fail when the body matches
+%% NEITHER allow nor deny, which means the configured path points at something
+%% that is not an auth backend (the false-pass this guard closes). We never
+%% echo the body (R4): a mismatch returns the fixed ?REASON_ENDPOINT.
+%%
+%% Grammar (mirrors rabbit_auth_backend_http:parse_resp/1, which does
+%% string:to_lower(string:strip(Body)) then matches):
+%%   * user_path (authn): exactly `deny', or anything beginning with `allow'
+%%     (an `allow' optionally followed by space-separated tags).
+%%   * vhost/resource/topic_path (authz): exactly `allow' or `deny'.
+classify_response(Key, Body) ->
+    case response_matches_contract(Key, normalize_resp(Body)) of
+        true -> ok;
+        false -> {error, auth_failed, ?REASON_ENDPOINT}
+    end.
+
+%% Normalize exactly as rabbit_auth_backend_http does: strip leading/trailing
+%% whitespace, then lowercase. Tolerates a non-binary/oversized body defensively
+%% (an auth response is tiny; anything else is not auth-shaped).
+normalize_resp(Body) when is_binary(Body) ->
+    string:lowercase(string:trim(Body));
+normalize_resp(_) ->
+    <<>>.
+
+%% user_path authenticates, so it accepts allow-with-tags (prefix match), the
+%% same as the real backend's `"allow" ++ Rest' clause. The authz paths only
+%% ever return a bare allow/deny.
+response_matches_contract(<<"user_path">>, Resp) ->
+    Resp =:= <<"deny">> orelse is_allow_prefix(Resp);
+response_matches_contract(_AuthzPath, Resp) ->
+    Resp =:= <<"allow">> orelse Resp =:= <<"deny">>.
+
+%% True when Resp is `allow' or `allow' followed by a whitespace-delimited tag
+%% list (e.g. `allow administrator management'). A bare `allowxyz' is rejected:
+%% the real backend tolerates it, but for a config-validation signal we want the
+%% canonical separator so a near-miss body is flagged rather than waved through.
+is_allow_prefix(<<"allow">>) ->
+    true;
+is_allow_prefix(<<"allow", Sep, _/binary>>) ->
+    Sep =:= $\s orelse Sep =:= $\t;
+is_allow_prefix(_) ->
+    false.
+
 %% Build the httpc Request tuple for the configured method. For GET the query
 %% goes in the URL; for POST it is a form-encoded body, matching
 %% rabbit_auth_backend_http's request shape (R12 request-shape parity). The
@@ -832,12 +1036,17 @@ params_for(<<"topic_path">>) ->
 %% proplist for httpc. ARN resolution happens here, in the network phase, after
 %% all pure validation has passed (ARN-first ordering). Any resolution failure
 %% maps to input_invalid, matching the LDAP backend.
-build_client_ssl_opts(#{ssl_options := Map}) ->
-    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined)) of
+build_client_ssl_opts(#{ssl_options := Map} = Params) ->
+    %% aws_state was built once per request by resolve_request_state/1 (under the
+    %% configured assume_role when any ARN is referenced) and is threaded into
+    %% every ARN fetch here. A request that references no ARN carries a default
+    %% state that is never used to resolve one.
+    State = maps:get(aws_state, Params, undefined),
+    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State) of
         {error, _, _} = Err ->
             Err;
         {ok, CacertOpts} ->
-            case resolve_client_cert(Map) of
+            case resolve_client_cert(Map, State) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, ClientOpts} ->
@@ -849,10 +1058,10 @@ build_client_ssl_opts(#{ssl_options := Map}) ->
             end
     end.
 
-resolve_cacerts(undefined) ->
+resolve_cacerts(undefined, _State) ->
     {ok, []};
-resolve_cacerts(Arn) when is_binary(Arn) ->
-    case resolve_arn(Arn) of
+resolve_cacerts(Arn, State) when is_binary(Arn) ->
+    case resolve_arn(Arn, State) of
         {ok, Pem} ->
             case decode_pem_cacerts(Pem) of
                 skip -> {ok, []};
@@ -865,16 +1074,16 @@ resolve_cacerts(Arn) when is_binary(Arn) ->
 %% Resolve the client certificate + private key for mutual TLS. parse_ssl_options
 %% already guaranteed both are present or both absent, so here we either resolve
 %% the pair or return no client-auth options.
-resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}) when
+resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}, State) when
     is_binary(CertArn), is_binary(KeyArn)
 ->
-    case resolve_arn(CertArn) of
+    case resolve_arn(CertArn, State) of
         {ok, CertPem} ->
             case decode_client_cert(CertPem) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, CertOpt} ->
-                    case resolve_arn(KeyArn) of
+                    case resolve_arn(KeyArn, State) of
                         {ok, KeyPem} ->
                             case decode_client_key(KeyPem) of
                                 {error, _, _} = Err -> Err;
@@ -887,7 +1096,7 @@ resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn
         {error, _} ->
             {error, input_invalid, ?REASON_ARN_RESOLVE}
     end;
-resolve_client_cert(_Map) ->
+resolve_client_cert(_Map, _State) ->
     {ok, []}.
 
 %% Decode a client-certificate PEM into an ssl {cert, DER} option. The first
@@ -975,7 +1184,7 @@ apply_verify_default(Opts, VerifyExplicit) ->
             %% explicit verify_none (already validated) -- leave it
             {ok, Opts};
         false ->
-            case trust_source(Opts) of
+            case ensure_trust_anchor(Opts) of
                 {ok, Opts1} -> {ok, [{verify, verify_peer} | Opts1]};
                 none -> {ok, Opts}
             end
@@ -994,17 +1203,6 @@ ensure_trust_anchor(Opts) ->
             end
     end.
 
-trust_source(Opts) ->
-    case lists:keymember(cacerts, 1, Opts) of
-        true ->
-            {ok, Opts};
-        false ->
-            case os_cacerts() of
-                [] -> none;
-                Certs -> {ok, [{cacerts, Certs} | Opts]}
-            end
-    end.
-
 os_cacerts() ->
     try
         public_key:cacerts_get()
@@ -1012,10 +1210,18 @@ os_cacerts() ->
         _:_ -> []
     end.
 
+%% Decode a CA-bundle PEM into the raw DER binaries ssl's {cacerts, _} option
+%% expects. Passing decoded #'OTPCertificate'{} records (pem_entry_decode/1
+%% output) makes ssl silently ignore the trust anchor -> unknown_ca -> a
+%% spurious tls_failed (see the custom_ca_under_verify_peer_returns_ok
+%% regression guard). Mirror decode_client_cert/1: take only the 'Certificate'
+%% entries, as raw DER. A PEM with no certificate entry yields no anchor (skip),
+%% same as an empty bundle. The LDAP backend's identically named helper does the
+%% same thing for the same reason -- eldap forwards sslopts to this same ssl.
 decode_pem_cacerts(B) when is_binary(B) ->
-    case public_key:pem_decode(B) of
+    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
         [] -> skip;
-        Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
+        Ders -> Ders
     end.
 
 to_list(B) when is_binary(B) -> binary_to_list(B);
@@ -1044,17 +1250,21 @@ to_version(<<"tlsv1">>) -> tlsv1.
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
-%% aws_lib threads AWS state per call instead of mutating a global singleton,
-%% so concurrent validations no longer share mutable region/credential state and
-%% no ARN lock is needed. R6 is preserved -- resolution runs in the caller
-%% process and the resolved secret is neither logged nor returned (only adapted
-%% to the caller's {ok, Binary} contract). R3 is preserved -- this still runs
-%% only after the pure validation pipeline. The 3-tuple {ok, Data, State1} from
+%% Resolve an ARN using the request's threaded aws_state(). The state is built
+%% once per request by resolve_request_state/1 -- under the operator-configured
+%% assume_role (a request that references an ARN with no role configured is
+%% refused before reaching here) -- and passed to every ARN fetch in the
+%% request. This is the guardrail: aws_lib threads credentials per call, so the
+%% assumed role's credentials are visible only to this request's resolutions and
+%% the endpoint never resolves an ARN under the broker's ambient EC2 instance
+%% role. R6 is preserved -- resolution runs in the caller process and the
+%% resolved secret is neither logged nor returned (only adapted to the caller's
+%% {ok, Binary} contract). R3 is preserved -- this still runs only after the pure
+%% validation pipeline. The 3-tuple {ok, Data, State1} from
 %% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
 %% callers expect; the threaded state is request-scoped and discarded here.
--spec resolve_arn(binary()) -> {ok, binary()} | {error, term()}.
-resolve_arn(Arn) when is_binary(Arn) ->
-    State = aws_lib:new(),
+-spec resolve_arn(binary(), aws_lib:aws_state()) -> {ok, binary()} | {error, term()}.
+resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
         {error, _} = Error -> Error
