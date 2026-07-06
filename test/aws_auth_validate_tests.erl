@@ -492,9 +492,10 @@ ldap_configured_assume_role_test_() ->
         end,
         [
             {
-                "no configured role: assume_role is never called and the ambient "
-                "(credential-free) state reaches ARN resolution",
-                fun assume_role_not_configured_uses_ambient_state/0
+                "no configured role: request is refused with config_conflict "
+                "before any assume_role or ARN resolve -- the broker's ambient "
+                "EC2 role is never used",
+                fun assume_role_not_configured_refuses/0
             },
             {"configured role: the assumed credentials reach ARN resolution",
                 fun assume_role_configured_threads_assumed_credentials/0},
@@ -517,20 +518,19 @@ assume_role_test_access_key(State) ->
         {error, undefined} -> undefined
     end.
 
-assume_role_not_configured_uses_ambient_state() ->
+%% A configured assume_role is mandatory. With none set, the request must be
+%% refused with config_conflict before any assume_role attempt OR any ARN
+%% resolve -- the broker's powerful ambient EC2 role is never used.
+assume_role_not_configured_refuses() ->
     application:unset_env(aws, arn_config),
-    Self = self(),
-    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
-        Self ! {resolve_key, assume_role_test_access_key(State)},
-        {error, stop_here}
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) ->
+        erlang:error(resolve_should_not_be_reached)
     end),
-    %% resolve fails -> input_invalid, but we only care which state was threaded.
-    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(base_body(#{}))),
+    ?assertMatch(
+        {error, config_conflict, _}, aws_auth_validate_ldap:validate(base_body(#{}))
+    ),
     ?assertEqual(0, meck:num_calls(aws_iam, assume_role, '_')),
-    receive
-        {resolve_key, Key} -> ?assertEqual(undefined, Key)
-    after 1_000 -> ?assert(false)
-    end.
+    ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_')).
 
 assume_role_configured_threads_assumed_credentials() ->
     application:set_env(aws, arn_config, [
@@ -588,6 +588,14 @@ ldap_bind_raise_does_not_leak_password_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(aws_iam, [no_link]),
+            %% A configured assume_role is mandatory to reach the resolve/bind
+            %% path this test exercises; set one and stub the assume so no real
+            %% STS call is made.
+            application:set_env(aws, arn_config, [
+                {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+            ]),
+            meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
             %% Resolve any ARN to our sentinel password. resolve_arn/2 threads
             %% the passed aws_lib:aws_state() back in the success 3-tuple.
             meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
@@ -602,8 +610,10 @@ ldap_bind_raise_does_not_leak_password_test_() ->
             ok
         end,
         fun(_) ->
+            application:unset_env(aws, arn_config),
             meck:unload(eldap),
-            meck:unload(aws_arn_util)
+            meck:unload(aws_arn_util),
+            meck:unload(aws_iam)
         end,
         fun(_) ->
             Body = bind_body(),
@@ -648,6 +658,14 @@ cacert_arn_resolution_test_() ->
         fun() ->
             ok = meck:new(eldap, [unstick, non_strict]),
             ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(aws_iam, [no_link]),
+            %% A configured assume_role is mandatory to reach the CA-cert resolve
+            %% path under test; set one and stub the assume so no real STS call is
+            %% made.
+            application:set_env(aws, arn_config, [
+                {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+            ]),
+            meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
             %% Keep the suite hermetic: the TLS-off case reaches the connect
             %% path, so stub eldap:open to fail fast instead of dialling out.
             meck:expect(eldap, open, fun(_Servers, _Opts) -> {error, refused} end),
@@ -655,8 +673,10 @@ cacert_arn_resolution_test_() ->
             ok
         end,
         fun(_) ->
+            application:unset_env(aws, arn_config),
             meck:unload(eldap),
-            meck:unload(aws_arn_util)
+            meck:unload(aws_arn_util),
+            meck:unload(aws_iam)
         end,
         [
             {"unresolvable CA-cert ARN -> input_invalid (no silent verify_none)", fun() ->

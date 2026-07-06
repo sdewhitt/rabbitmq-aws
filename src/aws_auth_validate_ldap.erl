@@ -119,6 +119,10 @@
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
+-define(REASON_NO_ASSUME_ROLE, <<
+    "auth validation requires an assume_role to be configured; "
+    "set aws.arns.assume_role_arn"
+>>).
 -define(REASON_BAD_DN_LOOKUP_BASE, <<"dn_lookup_base must be a non-empty string">>).
 -define(REASON_BAD_DN_LOOKUP_ATTR, <<"dn_lookup_attribute must be a non-empty string">>).
 -define(REASON_BAD_USERNAME, <<"username must be a non-empty string">>).
@@ -192,15 +196,23 @@ validate(Body) when is_map(Body) ->
 %% Runs in the network phase, after all pure input validation has passed, so a
 %% malformed request never triggers an STS AssumeRole call.
 %%
-%% When the operator configured `aws.arns.assume_role_arn', assume that role
-%% into the request's aws_lib state -- the SAME role the plugin already assumes
-%% at boot to resolve every configured ARN (aws_arn_config:maybe_assume_role/1).
-%% Honoring it here closes a parity gap: without it the validate endpoint would
-%% resolve password_arn/cacertfile_arn with the broker's bare ambient (EC2
-%% instance) role even though the operator told the plugin to use a specific
-%% role for ARN resolution. This is operator config, not caller input, so it
-%% raises no confused-deputy concern. With no role configured, a default state
-%% is used and ARNs resolve with the ambient role -- the prior behavior.
+%% A configured `aws.arns.assume_role_arn' is MANDATORY. When set, we assume
+%% that role into the request's aws_lib state -- the SAME role the plugin
+%% already assumes at boot to resolve every configured ARN
+%% (aws_arn_config:maybe_assume_role/1) -- and resolve password_arn/cacertfile_arn
+%% under it. This is operator config, not caller input, so it raises no
+%% confused-deputy concern.
+%%
+%% When NO role is configured we do NOT fall back to a default aws_lib state:
+%% that would resolve ARNs with the broker's ambient (EC2 instance) credentials,
+%% which on Amazon MQ can be far more privileged than the role a customer would
+%% attach to their own secret/bucket, so a validate request could resolve ARNs
+%% the caller's intended role never could -- a least-privilege pitfall that is
+%% hard to spot without an appsec review (the resolved secret is never returned
+%% to the caller today, but the capability is a hazard for future development).
+%% We therefore never use the instance role: with no assume_role configured we
+%% refuse the request with config_conflict before any secret fetch or outbound
+%% connection.
 %%
 %% The state is request-local (aws_lib threads credentials per call -- there is
 %% no global singleton to clobber), so the assumed role's credentials are
@@ -209,7 +221,7 @@ validate(Body) when is_map(Body) ->
 resolve_request_state(Params) ->
     case configured_assume_role_arn() of
         none ->
-            {ok, Params#{aws_state => aws_lib:new()}};
+            {error, config_conflict, ?REASON_NO_ASSUME_ROLE};
         RoleArn ->
             case aws_iam:assume_role(RoleArn, aws_lib:new()) of
                 {ok, State} -> {ok, Params#{aws_state => State}};
@@ -336,10 +348,10 @@ resolve_cacert(#{ssl_options := SslOpts, aws_state := State} = Params) ->
         Arn when is_binary(Arn) ->
             case resolve_arn(Arn, State) of
                 {ok, PemData} ->
-                    %% pem_entry_decode/1 can raise on a malformed entry; an
-                    %% empty/undecodable PEM returns `skip'. Both mean the ARN
-                    %% does not hold a usable CA cert -- report input_invalid
-                    %% rather than degrading the trust anchor.
+                    %% A malformed PEM can raise during decode; an empty/
+                    %% certless PEM returns `skip'. Both mean the ARN does not
+                    %% hold a usable CA cert -- report input_invalid rather than
+                    %% degrading the trust anchor.
                     try decode_pem_cacerts(PemData) of
                         skip -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID};
                         Certs -> {ok, Params#{ssl_options => SslOpts#{cacerts => Certs}}}
@@ -1088,23 +1100,30 @@ to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
 to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
 to_version(<<"tlsv1">>) -> tlsv1.
 
-%% Decode PEM data into the decoded cert terms eldap expects under `cacerts'.
-%% Returns `skip' when the data holds no decodable PEM entries (so resolve_cacert/1
-%% can reject it as input_invalid rather than proceeding with an empty trust set).
+%% Decode a CA-bundle PEM into the raw DER binaries ssl's `cacerts' option
+%% expects. eldap has NO special cacerts contract: build_ssl_opts/1's proplist
+%% is handed to eldap:open/2 as {sslopts, _} and to eldap:start_tls/3, both of
+%% which forward it straight to the `ssl' module -- the same ssl httpc uses. ssl
+%% silently ignores decoded #'OTPCertificate'{} records (pem_entry_decode/1
+%% output) as a trust anchor -> unknown_ca -> a spurious tls_failed. So pass raw
+%% DER, exactly as the HTTP backend's decode_pem_cacerts/1 now does. Returns
+%% `skip' when the data holds no certificate entries (so resolve_cacert/1 can
+%% reject it as input_invalid rather than proceeding with an empty trust set).
 decode_pem_cacerts(B) when is_binary(B) ->
-    case public_key:pem_decode(B) of
+    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
         [] -> skip;
-        Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
+        Ders -> Ders
     end.
 
 %%--------------------------------------------------------------------
 
 %% Resolve an ARN using the request's threaded aws_state(). The state is built
-%% once per request by resolve_request_state/1 -- a default state (broker's
-%% ambient role) or one with the operator-configured assume_role assumed -- and
-%% passed to every ARN fetch in the request. Region and credentials live in that
-%% value, not a shared singleton, so concurrent validations cannot clobber each
-%% other. R6 is preserved -- resolution runs in the caller process and the
+%% once per request by resolve_request_state/1 with the operator-configured
+%% assume_role assumed (a request with no configured role is refused before
+%% reaching here) and passed to every ARN fetch in the request. Region and
+%% credentials live in that value, not a shared singleton, so concurrent
+%% validations cannot clobber each other. R6 is preserved -- resolution runs in
+%% the caller process and the
 %% resolved secret is neither logged nor returned (only adapted to the caller's
 %% {ok, Binary} contract). R3 is preserved -- this still runs only after the pure
 %% validation pipeline. The 3-tuple {ok, Data, State1} from

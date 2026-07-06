@@ -379,6 +379,19 @@ credentials_test_() ->
                     ]
                 ),
                 ?assertEqual({error, undefined}, aws_lib_config:credentials(S))
+            end},
+            {"with instance metadata body read timeout", fun() ->
+                %% Headers arrive (200) but the body read times out. This must
+                %% surface as {error, timeout}, not crash with a badmatch.
+                S = #aws_config{},
+                meck:expect(aws_lib, ensure_imdsv2_token_valid, 1, {ok, undefined, S}),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_, _, _) -> stream_ref end),
+                meck:expect(gun, await, fun(_, _, _) -> {response, nofin, 200, headers} end),
+                meck:expect(gun, await_body, fun(_, _, _) -> {error, timeout} end),
+                ?assertEqual({error, timeout}, aws_lib_config:credentials(S))
             end}
         ]
     }.
@@ -643,6 +656,17 @@ load_imdsv2_token_test_() ->
                 meck:expect(gun, await_body, fun(_, _, _) ->
                     {ok, <<"Missing or Invalid Parameters – The PUT request is not valid.">>}
                 end),
+                ?assertEqual(undefined, aws_lib_config:load_imdsv2_token())
+            end},
+            {"fail to get imdsv2 token - body read timeout", fun() ->
+                %% The 200 response headers arrive but the body read times out;
+                %% this must fall back to undefined, not crash with a badmatch.
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, put, fun(_, _, _, _) -> stream_ref end),
+                meck:expect(gun, await, fun(_, _, _) -> {response, nofin, 200, headers} end),
+                meck:expect(gun, await_body, fun(_, _, _) -> {error, timeout} end),
                 ?assertEqual(undefined, aws_lib_config:load_imdsv2_token())
             end},
             {"successfully get imdsv2 token from instance metadata service", fun() ->

@@ -159,10 +159,19 @@ end_per_suite(Config) ->
 init_per_group(_Group, Config) ->
     %% Allow private/loopback addresses for testing against local slapd.
     application:set_env(aws, auth_validation_allow_private_networks, true),
+    %% Auth validation requires a configured assume_role
+    %% (aws.arns.assume_role_arn); the endpoint refuses with config_conflict when
+    %% none is set, and never falls back to the broker's ambient credentials.
+    %% Configure one so the request reaches the bind path; aws_iam:assume_role is
+    %% mocked per testcase so no real STS call is made.
+    application:set_env(aws, arn_config, [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/validation"}
+    ]),
     Config.
 
 end_per_group(_Group, Config) ->
     application:unset_env(aws, auth_validation_allow_private_networks),
+    application:unset_env(aws, arn_config),
     Config.
 
 init_per_testcase(TC, Config) ->
@@ -174,9 +183,15 @@ init_per_testcase(TC, Config) ->
     %% under state threading), so there is nothing else to mock.
     ok = meck:new(aws_arn_util, [passthrough, no_link]),
     ok = meck:expect(aws_arn_util, resolve_arn, fun mock_resolve_arn/2),
+    %% The configured assume_role (see init_per_group) is assumed before ARN
+    %% resolution; stub it to thread the passed state straight back so no real
+    %% STS call is made and the mocked resolve_arn/2 sees an unchanged state.
+    ok = meck:new(aws_iam, [passthrough, no_link]),
+    ok = meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
     rabbit_ct_helpers:testcase_started(Config, TC).
 
 end_per_testcase(TC, Config) ->
+    catch meck:unload(aws_iam),
     catch meck:unload(aws_arn_util),
     rabbit_ct_helpers:testcase_finished(Config, TC).
 
