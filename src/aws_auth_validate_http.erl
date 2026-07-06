@@ -12,6 +12,20 @@
 %% category so the response leaks no target URL, response body, or raw httpc
 %% error.
 %%
+%% HTTP client: this backend uses httpc/inets, NOT gun (which aws_lib uses for
+%% AWS API calls). That is deliberate. The point of a config validator is to
+%% reproduce the REAL code path, and rabbit_auth_backend_http -- the backend
+%% this endpoint validates -- issues its auth requests via httpc:request/4
+%% (rabbit_auth_backend_http:do_http_req/2, in deps/rabbitmq_auth_backend_http).
+%% Probing with the same client the broker uses means a green result here
+%% reflects how the broker will actually behave: the same TLS option handling,
+%% redirect policy, header shaping, and timeout semantics. A different client
+%% (e.g. gun) could pass here yet fail in production, or vice versa. This
+%% mirrors the LDAP backend, which uses eldap because rabbit_auth_backend_ldap
+%% does. The cost of httpc is its global-profile model (see the profile-pool
+%% section below); that complexity is the price of fidelity, not an arbitrary
+%% choice.
+%%
 %% Scope: REACHABILITY-ONLY (deliberate first cut). An HTTP auth server, by
 %% contract, answers `allow'/`deny' for a specific {user, vhost, resource}
 %% tuple -- a `deny' is a correctly-working server, not a misconfiguration. So
@@ -612,6 +626,10 @@ do_http_validate(Params) ->
             end
     end.
 
+%% This profile machinery exists ONLY because httpc pools sessions on a global,
+%% named-profile basis; see the HTTP client rationale in the module header for
+%% why httpc is nonetheless the right client here.
+%%
 %% Profile names are drawn from a FIXED pool (?PROFILE_POOL_SIZE atoms, created
 %% once and reused forever) rather than a fresh unique atom per request --
 %% generating a new atom per validation would leak the atom table unboundedly
