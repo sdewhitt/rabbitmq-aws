@@ -136,6 +136,27 @@ ssrf_issuer_imds_test() ->
     Body = #{<<"issuer">> => <<"https://169.254.169.254">>},
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
 
+%% The auth_validation_allow_private_networks flag (test-only, default false)
+%% relaxes ONLY loopback so a local integration stub is reachable. With the flag
+%% on, 127.0.0.1 passes the pure SSRF guard (classify_ip -> allow); IMDS stays
+%% denied even with the flag on.
+loopback_allowed_with_private_networks_flag_test() ->
+    application:set_env(aws, auth_validation_allow_private_networks, true),
+    try
+        ?assertEqual(allow, aws_auth_validate_oauth:classify_ip({127, 0, 0, 1})),
+        ?assertEqual(allow, aws_auth_validate_oauth:classify_ip({0, 0, 0, 0, 0, 0, 0, 1})),
+        %% IMDS is NOT relaxed by the flag.
+        ?assertEqual(deny, aws_auth_validate_oauth:classify_ip({169, 254, 169, 254}))
+    after
+        application:unset_env(aws, auth_validation_allow_private_networks)
+    end.
+
+%% With the flag OFF (production default), loopback stays denied.
+loopback_denied_without_flag_test() ->
+    application:unset_env(aws, auth_validation_allow_private_networks),
+    ?assertEqual(deny, aws_auth_validate_oauth:classify_ip({127, 0, 0, 1})),
+    ?assertEqual(deny, aws_auth_validate_oauth:classify_ip({0, 0, 0, 0, 0, 0, 0, 1})).
+
 %%--------------------------------------------------------------------
 %% Pure phase: resource_server_id validation
 %%--------------------------------------------------------------------
@@ -357,6 +378,97 @@ no_secret_in_error_test_() ->
         [
             ?_assertMatch({error, tls_failed, _}, Result),
             ?_assertEqual(nomatch, string:find(Rendered, "SECRET-PEM-DATA"))
+        ]
+    end}.
+
+%%--------------------------------------------------------------------
+%% assume_role gating: resolving an ssl_options ARN requires a configured
+%% aws.arns.assume_role_arn; the broker instance role is never used.
+%%--------------------------------------------------------------------
+
+%% A request that references a cacertfile_arn with NO configured assume_role is
+%% refused with config_conflict BEFORE any ARN resolve or outbound request.
+arn_without_assume_role_is_config_conflict_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        %% Ensure no assume_role is configured.
+        application:unset_env(aws, arn_config),
+        %% resolve_arn must NOT be reached; make it fail loudly if it is.
+        catch meck:unload(aws_arn_util),
+        ok = meck:new(aws_arn_util, [passthrough]),
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) ->
+            erlang:error(arn_resolved_without_assume_role)
+        end),
+        Body = #{
+            <<"jwks_uri">> => <<"https://idp.example.com/jwks">>,
+            <<"ssl_options">> => #{
+                <<"cacertfile_arn">> => <<"arn:aws:s3:::bucket/ca.pem">>,
+                <<"verify">> => <<"verify_peer">>
+            }
+        },
+        Result = aws_auth_validate_oauth:validate(Body),
+        [
+            ?_assertMatch({error, config_conflict, _}, Result),
+            ?_assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+        ]
+    end}.
+
+%% A request that references a cacertfile_arn WITH a configured assume_role
+%% assumes the role and resolves the ARN under it; a valid JWKS then yields ok.
+arn_with_assume_role_resolves_and_succeeds_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        application:set_env(aws, arn_config, [
+            {assume_role_arn, "arn:aws:iam::123456789012:role/r"}
+        ]),
+        ok = meck:new(aws_iam, [no_link]),
+        meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
+        %% Resolve the CA ARN to a real (empty-decode) PEM sentinel; decode_pem
+        %% returns skip on a non-PEM binary, so no bogus cacerts enter the opts.
+        catch meck:unload(aws_arn_util),
+        ok = meck:new(aws_arn_util, [passthrough]),
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+            {ok, <<"not-a-pem">>, State}
+        end),
+        JwksBody = rabbit_json:encode(#{
+            <<"keys">> => [#{<<"kty">> => <<"RSA">>, <<"kid">> => <<"k1">>}]
+        }),
+        mock_httpc_response(200, JwksBody),
+        Body = #{
+            <<"jwks_uri">> => <<"https://idp.example.com/jwks">>,
+            <<"ssl_options">> => #{
+                <<"cacertfile_arn">> => <<"arn:aws:s3:::bucket/ca.pem">>
+            }
+        },
+        Result = aws_auth_validate_oauth:validate(Body),
+        Assumed = meck:num_calls(aws_iam, assume_role, '_'),
+        Resolved = meck:num_calls(aws_arn_util, resolve_arn, '_'),
+        catch meck:unload(aws_iam),
+        application:unset_env(aws, arn_config),
+        [
+            ?_assertEqual(ok, Result),
+            ?_assert(Assumed >= 1),
+            ?_assert(Resolved >= 1)
+        ]
+    end}.
+
+%% A pure reachability request that references NO ARN must still succeed with no
+%% assume_role configured (the credential-free JWKS reachability check).
+no_arn_needs_no_assume_role_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        application:unset_env(aws, arn_config),
+        ok = meck:new(aws_iam, [no_link]),
+        meck:expect(aws_iam, assume_role, fun(_RoleArn, _State) ->
+            erlang:error(assume_role_called_without_arn)
+        end),
+        JwksBody = rabbit_json:encode(#{
+            <<"keys">> => [#{<<"kty">> => <<"RSA">>, <<"kid">> => <<"k1">>}]
+        }),
+        mock_httpc_response(200, JwksBody),
+        Result = aws_auth_validate_oauth:validate(jwks_body()),
+        Assumed = meck:num_calls(aws_iam, assume_role, '_'),
+        catch meck:unload(aws_iam),
+        [
+            ?_assertEqual(ok, Result),
+            ?_assertEqual(0, Assumed)
         ]
     end}.
 

@@ -114,6 +114,11 @@
 -define(REASON_ENDPOINT, <<"endpoint did not return a valid JWKS document">>).
 -define(REASON_DISCOVERY, <<"issuer discovery did not return a valid OpenID configuration">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+-define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
+-define(REASON_NO_ASSUME_ROLE, <<
+    "auth validation requires an assume_role to be configured; "
+    "set aws.arns.assume_role_arn"
+>>).
 
 %% SSRF: https-only scheme allowlist (stricter than the HTTP backend's http+https).
 -define(ALLOWED_SCHEMES, ["https"]).
@@ -167,7 +172,76 @@ validate(Body) when is_map(Body) ->
         {error, _, _} = Err ->
             Err;
         {ok, Params} ->
-            do_oauth_validate(Params)
+            case resolve_request_state(Params) of
+                {error, _, _} = Err -> Err;
+                {ok, Params1} -> do_oauth_validate(Params1)
+            end
+    end.
+
+%% Build the per-request aws_lib state used for every ARN fetch in this request
+%% (ssl_options.cacertfile_arn / certfile_arn / keyfile_arn), and thread it into
+%% Params. Resolving an ARN triggers an STS AssumeRole call (ARN-first ordering).
+%%
+%% Mirrors the LDAP/HTTP backends' guardrail (resolve_request_state/1 there):
+%% when the request resolves ANY ARN, a configured `aws.arns.assume_role_arn' is
+%% MANDATORY. We assume that role -- the SAME role the plugin already assumes at
+%% boot to resolve every configured ARN (aws_arn_config:maybe_assume_role/1) --
+%% into a request-local aws_lib state and resolve the TLS-material ARNs under it.
+%% This is operator config, not caller input, so it raises no confused-deputy
+%% concern.
+%%
+%% When NO role is configured we do NOT fall back to a default aws_lib state:
+%% that would resolve ARNs with the broker's ambient (EC2 instance) credentials,
+%% which on Amazon MQ can be far more privileged than the role a customer would
+%% attach to their own secret/bucket, so a validate request could resolve ARNs
+%% the caller's intended role never could -- a least-privilege pitfall. We never
+%% use the instance role: with an ARN referenced and no assume_role configured,
+%% refuse with config_conflict before any secret fetch or outbound connection.
+%%
+%% A plain reachability probe that references no ARN performs no AWS call, so it
+%% needs no role and gets a default state that is never used to resolve an ARN --
+%% preserving the credential-free JWKS reachability check.
+resolve_request_state(Params) ->
+    case request_references_arn(Params) of
+        false ->
+            {ok, Params#{aws_state => aws_lib:new()}};
+        true ->
+            case configured_assume_role_arn() of
+                none ->
+                    {error, config_conflict, ?REASON_NO_ASSUME_ROLE};
+                RoleArn ->
+                    case aws_iam:assume_role(RoleArn, aws_lib:new()) of
+                        {ok, State} -> {ok, Params#{aws_state => State}};
+                        {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
+                    end
+            end
+    end.
+
+%% True when the request references any ARN-backed TLS material, i.e. resolving
+%% the request will make at least one AWS call. The ARN keys live under
+%% ssl_options (cacertfile_arn / certfile_arn / keyfile_arn); parse_ssl_options
+%% guaranteed cert/key are supplied together, so any one key means an AWS fetch.
+request_references_arn(#{ssl_options := Map}) ->
+    lists:any(
+        fun(K) -> maps:is_key(K, Map) end,
+        [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>]
+    ).
+
+%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
+%% read from the same `aws, arn_config' env the boot sequence uses
+%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
+%% when unset. Mirrors aws_auth_validate_http:configured_assume_role_arn/0.
+configured_assume_role_arn() ->
+    case application:get_env(aws, arn_config) of
+        {ok, ArnConfig} when is_list(ArnConfig) ->
+            case proplists:get_value(assume_role_arn, ArnConfig) of
+                undefined -> none;
+                Arn when is_list(Arn) -> Arn;
+                Arn when is_binary(Arn) -> binary_to_list(Arn);
+                _ -> none
+            end;
+        _ ->
+            none
     end.
 
 %%--------------------------------------------------------------------
@@ -410,14 +484,34 @@ classify_ip({16#2002, W1, W2, _, _, _, _, _}) ->
     classify_ip(v4_from_words(W1, W2));
 classify_ip({_, _, _, _} = V4) ->
     case in_any_cidr(V4, ?DENIED_V4_CIDRS) of
-        true -> deny;
+        true -> classify_denied(V4);
         false -> allow
     end;
 classify_ip({_, _, _, _, _, _, _, _} = V6) ->
     case in_any_cidr(V6, ?DENIED_V6_CIDRS) of
-        true -> deny;
+        true -> classify_denied(V6);
         false -> allow
     end.
+
+%% A denied address is normally `deny'. The ONE exception is loopback when
+%% auth_validation_allow_private_networks is set: that flag (default false, off
+%% in production) lets the OAuth integration suite probe a local stub IdP on
+%% 127.0.0.1/::1. It is the OAuth analogue of the same flag the LDAP and HTTP
+%% backends honour for local-server tests. It relaxes ONLY loopback -- IMDS,
+%% link-local, and unspecified stay denied even with the flag on, so it cannot
+%% be used to reach instance metadata.
+classify_denied(IP) ->
+    case is_loopback(IP) andalso allow_private_networks() of
+        true -> allow;
+        false -> deny
+    end.
+
+is_loopback({127, _, _, _}) -> true;
+is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_loopback(_) -> false.
+
+allow_private_networks() ->
+    application:get_env(aws, auth_validation_allow_private_networks, false) =:= true.
 
 %% Two 16-bit words -> a v4 4-tuple {a,b,c,d}.
 v4_from_words(W1, W2) ->
@@ -463,11 +557,14 @@ ip_to_int(Tuple) ->
 %% All probe requests run on a dedicated ephemeral httpc profile (R3).
 
 do_oauth_validate(Params) ->
-    Profile = probe_profile_name(),
-    case start_probe_profile(Profile) of
-        false ->
+    case claim_probe_profile() of
+        none ->
+            %% Could not obtain an isolated profile; fail safe rather than fall
+            %% back to the shared default profile (which would reintroduce the
+            %% session-reuse hazard). Unreachable in practice -- the semaphore
+            %% caps concurrency below the pool size -- but must be handled.
             {error, connection_failed, ?REASON_CONNECTION};
-        true ->
+        {ok, Profile} ->
             try
                 case build_client_ssl_opts(Params) of
                     {error, _, _} = Err ->
@@ -479,6 +576,7 @@ do_oauth_validate(Params) ->
                 _Class:_Reason:_Stack ->
                     {error, connection_failed, ?REASON_CONNECTION}
             after
+                %% Only ever stop the profile THIS request started (claimed).
                 stop_probe_profile(Profile)
             end
     end.
@@ -694,26 +792,53 @@ is_tls_atom(A) ->
 %% Ephemeral httpc profile management
 %%--------------------------------------------------------------------
 
-probe_profile_name() ->
-    Slot = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+%% Each in-flight probe OWNS a distinct started profile: a slot is claimed only
+%% by successfully starting it, so two simultaneous calls never share a profile
+%% and none is ever stolen from an actively-probing peer. The atom set stays
+%% bounded at exactly ?PROFILE_POOL_SIZE interned names. The "oauth" prefix keeps
+%% these names disjoint from the HTTP backend's pool so the two never collide.
+profile_atom(Slot) ->
     list_to_atom("aws_auth_validate_oauth_" ++ integer_to_list(Slot)).
 
-start_probe_profile(Profile) ->
+%% Claim a profile by scanning the fixed pool for a FREE slot: start at a
+%% per-request hashed slot and try to inets:start it. Starting succeeds only if
+%% no concurrent validation already owns that slot, so success means we own it.
+%% On {already_started,_} (slot running) or already_present (slot mid-teardown)
+%% advance to the next slot -- never stop a slot in use by a peer, that would
+%% tear down its in-flight request. Bounded to one full pass over the pool; if
+%% every slot is busy, fail closed. Returns {ok, Profile} | none.
+claim_probe_profile() ->
+    Start = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
+    claim_probe_profile(Start, ?PROFILE_POOL_SIZE).
+
+claim_probe_profile(_Slot, 0) ->
+    %% Every slot busy: unreachable while the semaphore caps concurrency below
+    %% ?PROFILE_POOL_SIZE, but fail closed rather than reuse a shared profile.
+    none;
+claim_probe_profile(Slot, Remaining) ->
+    Profile = profile_atom(Slot),
     case inets:start(httpc, [{profile, Profile}]) of
         {ok, _Pid} ->
+            %% We started (own) this profile; disable reuse and take it.
             set_probe_profile_opts(Profile),
-            true;
+            {ok, Profile};
         {error, {already_started, _}} ->
-            _ = inets:stop(httpc, Profile),
-            case inets:start(httpc, [{profile, Profile}]) of
-                {ok, _Pid} ->
-                    set_probe_profile_opts(Profile),
-                    true;
-                _ ->
-                    false
-            end;
+            %% Slot in use by a concurrent validation -- do NOT steal it; advance.
+            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
+        {error, already_present} ->
+            %% Slot mid-teardown by a concurrent validation. inets:stop/2 runs
+            %% terminate_child THEN delete_child as two separate supervisor
+            %% calls; a permanent child (the httpc profile) keeps its spec with
+            %% pid=undefined between them, so a start landing in that window sees
+            %% already_present rather than already_started. Not cleanly free --
+            %% advance like the already_started case rather than fail this
+            %% request closed. The pool size exceeds the concurrency cap, so the
+            %% scan still lands on a genuinely free slot within one pass.
+            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
         _ ->
-            false
+            %% Any other start error: fail closed rather than risk the shared
+            %% default profile's session-reuse hazard.
+            none
     end.
 
 set_probe_profile_opts(Profile) ->
@@ -748,12 +873,17 @@ with_default_sni(SslOpts, Host) ->
 %% mTLS) and translate the validated ssl_options map into an Erlang ssl
 %% proplist for httpc. ARN resolution happens here, in the network phase, after
 %% all pure validation has passed (ARN-first ordering).
-build_client_ssl_opts(#{ssl_options := Map}) ->
-    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined)) of
+build_client_ssl_opts(#{ssl_options := Map} = Params) ->
+    %% aws_state was built once per request by resolve_request_state/1 (under the
+    %% configured assume_role when any ARN is referenced) and is threaded into
+    %% every ARN fetch here. A request that references no ARN carries a default
+    %% state that is never used to resolve one.
+    State = maps:get(aws_state, Params, undefined),
+    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State) of
         {error, _, _} = Err ->
             Err;
         {ok, CacertOpts} ->
-            case resolve_client_cert(Map) of
+            case resolve_client_cert(Map, State) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, ClientOpts} ->
@@ -763,10 +893,10 @@ build_client_ssl_opts(#{ssl_options := Map}) ->
             end
     end.
 
-resolve_cacerts(undefined) ->
+resolve_cacerts(undefined, _State) ->
     {ok, []};
-resolve_cacerts(Arn) when is_binary(Arn) ->
-    case resolve_arn(Arn) of
+resolve_cacerts(Arn, State) when is_binary(Arn) ->
+    case resolve_arn(Arn, State) of
         {ok, Pem} ->
             case decode_pem_cacerts(Pem) of
                 skip -> {ok, []};
@@ -776,16 +906,16 @@ resolve_cacerts(Arn) when is_binary(Arn) ->
             {error, input_invalid, ?REASON_ARN_RESOLVE}
     end.
 
-resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}) when
+resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}, State) when
     is_binary(CertArn), is_binary(KeyArn)
 ->
-    case resolve_arn(CertArn) of
+    case resolve_arn(CertArn, State) of
         {ok, CertPem} ->
             case decode_client_cert(CertPem) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, CertOpt} ->
-                    case resolve_arn(KeyArn) of
+                    case resolve_arn(KeyArn, State) of
                         {ok, KeyPem} ->
                             case decode_client_key(KeyPem) of
                                 {error, _, _} = Err -> Err;
@@ -798,7 +928,7 @@ resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn
         {error, _} ->
             {error, input_invalid, ?REASON_ARN_RESOLVE}
     end;
-resolve_client_cert(_Map) ->
+resolve_client_cert(_Map, _State) ->
     {ok, []}.
 
 decode_client_cert(Pem) when is_binary(Pem) ->
@@ -893,10 +1023,14 @@ os_cacerts() ->
         _:_ -> []
     end.
 
+%% Return raw 'Certificate' DER binaries, NOT pem_entry_decode/1 records: ssl
+%% silently ignores #'OTPCertificate'{} records under {cacerts, _}, which
+%% surfaces as unknown_ca -> a spurious tls_failed on the verify_peer +
+%% cacertfile_arn path. Matches the HTTP/LDAP backends' decode_pem_cacerts/1.
 decode_pem_cacerts(B) when is_binary(B) ->
-    case public_key:pem_decode(B) of
+    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
         [] -> skip;
-        Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
+        Ders -> Ders
     end.
 
 to_list(B) when is_binary(B) -> binary_to_list(B);
@@ -921,11 +1055,12 @@ to_version(<<"tlsv1">>) -> tlsv1.
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
-%% ARN resolution: threaded state, no global singleton mutation. See the HTTP
-%% backend's identical resolve_arn/1 for the full rationale (R3, R6).
--spec resolve_arn(binary()) -> {ok, binary()} | {error, term()}.
-resolve_arn(Arn) when is_binary(Arn) ->
-    State = aws_lib:new(),
+%% Resolve an ARN using the request's threaded aws_state(). The state is built
+%% once per request by resolve_request_state/1 -- under the operator-configured
+%% assume_role when any ARN is referenced -- so no global singleton is mutated.
+%% See the HTTP backend's identical resolve_arn/2 for the full rationale (R3, R6).
+-spec resolve_arn(binary(), aws_lib:aws_state()) -> {ok, binary()} | {error, term()}.
+resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
         {error, _} = Error -> Error
