@@ -43,6 +43,11 @@
 
 -define(METADATA_TOKEN, "X-aws-ec2-metadata-token").
 
+% Refresh credentials this many seconds before they actually expire, so a
+% request does not start with credentials that lapse mid-flight. Matches the
+% 5-minute buffer erlcloud uses.
+-define(CREDENTIAL_REFRESH_BUFFER_SECONDS, 300).
+
 -define(LINEAR_BACK_OFF_MILLIS, 500).
 -define(MAX_RETRIES, 5).
 

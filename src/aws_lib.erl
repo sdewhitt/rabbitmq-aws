@@ -556,14 +556,18 @@ get_content_type(Headers) ->
     parse_content_type(Value).
 
 -spec expired_credentials(Expiration :: calendar:datetime()) -> boolean().
-%% @doc Indicates if the date that is passed in has expired.
+%% @doc Indicates whether the given expiration is at or within the refresh
+%% buffer window. Credentials are treated as expired a few minutes before they
+%% actually lapse (?CREDENTIAL_REFRESH_BUFFER_SECONDS) so they are refreshed
+%% proactively rather than after a request has already started with credentials
+%% that expire mid-flight.
 %% end
 expired_credentials(undefined) ->
     false;
 expired_credentials(Expiration) ->
     Now = calendar:datetime_to_gregorian_seconds(local_time()),
     Expires = calendar:datetime_to_gregorian_seconds(Expiration),
-    Now >= Expires.
+    Now >= (Expires - ?CREDENTIAL_REFRESH_BUFFER_SECONDS).
 
 -spec local_time() -> calendar:datetime().
 %% @doc Return the current UTC time. Callers compare this against UTC expiration
