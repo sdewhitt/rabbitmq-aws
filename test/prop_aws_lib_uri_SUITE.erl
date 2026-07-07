@@ -85,8 +85,8 @@ any_string() ->
 %% Properties
 %%--------------------------------------------------------------------
 
-%% Issue #100: parsing arbitrary input never raises. It either yields a usable
-%% uri() (host/1 returns a string) or a {error, {malformed_uri, _}} tuple.
+%% Issue #100: parsing arbitrary input never raises. It either yields
+%% {ok, uri()} (host/1 returns a string) or a {error, {malformed_uri, _}} tuple.
 prop_parse_never_crashes(_Config) ->
     rabbit_ct_proper_helpers:run_proper(
         fun() ->
@@ -95,7 +95,7 @@ prop_parse_never_crashes(_Config) ->
                 any_string(),
                 case aws_lib_uri:parse(S) of
                     {error, {malformed_uri, _}} -> true;
-                    Uri -> is_list(aws_lib_uri:host(Uri))
+                    {ok, Uri} -> is_list(aws_lib_uri:host(Uri))
                 end
             )
         end,
@@ -112,7 +112,7 @@ prop_wellformed_roundtrips(_Config) ->
                 {URI, _Scheme, Host, ExpectedPort, _Path},
                 wellformed_uri(),
                 begin
-                    Uri = aws_lib_uri:parse(URI),
+                    {ok, Uri} = aws_lib_uri:parse(URI),
                     aws_lib_uri:host(Uri) =:= Host andalso
                         aws_lib_uri:port(Uri) =:= ExpectedPort
                 end
@@ -130,9 +130,12 @@ prop_path_starts_with_slash(_Config) ->
             ?FORALL(
                 {URI, _Scheme, _Host, _Port, _Path},
                 wellformed_uri(),
-                case aws_lib_uri:path(aws_lib_uri:parse(URI)) of
-                    [$/ | _] -> true;
-                    _ -> false
+                begin
+                    {ok, Uri} = aws_lib_uri:parse(URI),
+                    case aws_lib_uri:path(Uri) of
+                        [$/ | _] -> true;
+                        _ -> false
+                    end
                 end
             )
         end,
@@ -150,8 +153,8 @@ prop_target_preserves_query(_Config) ->
                 {wellformed_uri(), segment(), segment()},
                 begin
                     Query = Key ++ "=" ++ Value,
-                    Target = aws_lib_uri:target(aws_lib_uri:parse(URI ++ "?" ++ Query)),
-                    Target =:= BasePath ++ "?" ++ Query
+                    {ok, Uri} = aws_lib_uri:parse(URI ++ "?" ++ Query),
+                    aws_lib_uri:target(Uri) =:= BasePath ++ "?" ++ Query
                 end
             )
         end,

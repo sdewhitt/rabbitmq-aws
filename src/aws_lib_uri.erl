@@ -29,16 +29,17 @@
 %% parse/1 and read through the accessors below.
 -opaque uri() :: uri_string:uri_map().
 
--spec parse(string()) -> uri() | {error, {malformed_uri, string()}}.
+-spec parse(string()) -> {ok, uri()} | {error, {malformed_uri, string()}}.
 %% @doc Parse a URI string into an opaque uri(). Built on the RFC 3986 compliant
-%% uri_string:parse/1, so a scheme-less, relative, or otherwise malformed input
-%% (no host component, or a uri_string parse error) returns
-%% {error, {malformed_uri, _}} instead of crashing.
+%% uri_string:parse/1. A scheme-less, relative, or otherwise malformed input (no
+%% host component, or a uri_string parse error) returns
+%% {error, {malformed_uri, _}} rather than crashing, so callers handle a bad URI
+%% explicitly instead of a later accessor failing with a function_clause.
 %% @end
 parse(Value) ->
     case uri_string:parse(Value) of
         #{host := _} = UriMap ->
-            UriMap;
+            {ok, UriMap};
         %% No host component (scheme-less or relative input), or uri_string
         %% reported a parse error. Either way the input is not a usable
         %% absolute URI, so report it rather than hand back a partial map.

@@ -410,7 +410,7 @@ sign_headers_test_() ->
                         "AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT+FvwqnKwRcOIfrRh3c/L"}
                 ],
                 ?assertEqual(
-                    Expectation,
+                    {ok, Expectation},
                     aws_lib:sign_headers(
                         AccessKey,
                         SecretKey,

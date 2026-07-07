@@ -2,37 +2,37 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% parse/1 returns an opaque uri(); these tests read it only through the public
-%% accessors (host/1, port/1, path/1, query/1, target/1), never by inspecting
-%% the underlying representation.
+%% parse/1 returns {ok, uri()}; these tests read the uri() only through the
+%% public accessors (host/1, port/1, path/1, query/1, target/1), never by
+%% inspecting the underlying representation.
 parse_accessors_test_() ->
     [
         {"userinfo, explicit port, path and query", fun() ->
-            U = aws_lib_uri:parse("amqp://guest:password@rabbitmq:5672/%2F?heartbeat=5"),
+            {ok, U} = aws_lib_uri:parse("amqp://guest:password@rabbitmq:5672/%2F?heartbeat=5"),
             ?assertEqual("rabbitmq", aws_lib_uri:host(U)),
             ?assertEqual(5672, aws_lib_uri:port(U)),
             ?assertEqual("/%2F", aws_lib_uri:path(U)),
             ?assertEqual([{"heartbeat", "5"}], aws_lib_uri:query(U))
         end},
         {"http defaults the port to 80", fun() ->
-            U = aws_lib_uri:parse("http://www.google.com/search?foo=bar#baz"),
+            {ok, U} = aws_lib_uri:parse("http://www.google.com/search?foo=bar#baz"),
             ?assertEqual("www.google.com", aws_lib_uri:host(U)),
             ?assertEqual(80, aws_lib_uri:port(U)),
             ?assertEqual("/search", aws_lib_uri:path(U)),
             ?assertEqual([{"foo", "bar"}], aws_lib_uri:query(U))
         end},
         {"https defaults the port to 443", fun() ->
-            U = aws_lib_uri:parse("https://www.google.com/search"),
+            {ok, U} = aws_lib_uri:parse("https://www.google.com/search"),
             ?assertEqual("www.google.com", aws_lib_uri:host(U)),
             ?assertEqual(443, aws_lib_uri:port(U)),
             ?assertEqual("/search", aws_lib_uri:path(U))
         end},
         {"a query-less URI has an empty query proplist", fun() ->
-            U = aws_lib_uri:parse("https://www.google.com/search"),
+            {ok, U} = aws_lib_uri:parse("https://www.google.com/search"),
             ?assertEqual([], aws_lib_uri:query(U))
         end},
         {"an empty path is normalized to /", fun() ->
-            U = aws_lib_uri:parse("https://example.com"),
+            {ok, U} = aws_lib_uri:parse("https://example.com"),
             ?assertEqual("/", aws_lib_uri:path(U))
         end}
     ].
@@ -41,17 +41,17 @@ parse_accessors_test_() ->
 target_test_() ->
     [
         {"path only when there is no query", fun() ->
-            U = aws_lib_uri:parse("https://s3.amazonaws.com/bucket/key"),
+            {ok, U} = aws_lib_uri:parse("https://s3.amazonaws.com/bucket/key"),
             ?assertEqual("/bucket/key", aws_lib_uri:target(U))
         end},
         {"path with the query reattached", fun() ->
-            U = aws_lib_uri:parse(
+            {ok, U} = aws_lib_uri:parse(
                 "https://ec2.us-east-1.amazonaws.com/?Action=DescribeTags&Version=2015-10-01"
             ),
             ?assertEqual("/?Action=DescribeTags&Version=2015-10-01", aws_lib_uri:target(U))
         end},
         {"the raw query is preserved byte-for-byte (percent-encoding intact)", fun() ->
-            U = aws_lib_uri:parse("https://h.example.com/x?k=a%2Fb&t=1"),
+            {ok, U} = aws_lib_uri:parse("https://h.example.com/x?k=a%2Fb&t=1"),
             ?assertEqual("/x?k=a%2Fb&t=1", aws_lib_uri:target(U))
         end}
     ].
