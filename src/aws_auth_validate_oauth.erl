@@ -78,13 +78,6 @@
     <<"versions">>,
     <<"sni">>
 ]).
--define(SSL_VERIFY_VALUES, [<<"verify_peer">>, <<"verify_none">>]).
--define(SSL_VERSION_VALUES, [
-    <<"tlsv1.3">>,
-    <<"tlsv1.2">>,
-    <<"tlsv1.1">>,
-    <<"tlsv1">>
-]).
 
 %% Fixed, hardcoded reason strings (R4): no URL, host, or raw error echoed.
 -define(REASON_MISSING_URL, <<"at least one of jwks_uri or issuer must be present">>).
@@ -106,14 +99,10 @@
 -define(REASON_CLIENT_CERT_INCOMPLETE,
     <<"ssl_options.certfile_arn and keyfile_arn must be supplied together">>
 ).
--define(REASON_NO_TRUST_ANCHOR,
-    <<"verify_peer requested but no CA trust anchor is available; supply cacertfile_arn">>
-).
 -define(REASON_CONNECTION, <<"could not connect to OAuth endpoint">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_ENDPOINT, <<"endpoint did not return a valid JWKS document">>).
 -define(REASON_DISCOVERY, <<"issuer discovery did not return a valid OpenID configuration">>).
--define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_NO_ASSUME_ROLE, <<
     "auth validation requires an assume_role to be configured; "
@@ -145,8 +134,48 @@
     {{0, 0, 0, 0, 0, 0, 0, 0}, 128}
 ]).
 
-%% Profile pool for ephemeral httpc profiles (same sizing rationale as HTTP backend).
--define(PROFILE_POOL_SIZE, 128).
+%% Ephemeral httpc profile-name prefix for this backend's pool (shared pool
+%% machinery in aws_auth_validate_httpc). Disjoint from the http prefix so the
+%% two backends' pools never collide.
+-define(PROFILE_PREFIX, "aws_auth_validate_oauth_").
+
+%% Per-backend surface passed to the shared aws_auth_validate_ssl helpers.
+%% Identical shape to the HTTP backend's (both accept the mTLS pair and use the
+%% <<"sni">> key); only this backend's fixed R4 reason strings differ, kept here.
+ssl_opts() ->
+    #{
+        arn_keys => [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
+        ssl_option_keys => ?SSL_OPTION_KEYS,
+        sni_key => <<"sni">>,
+        client_cert => true,
+        reasons => #{
+            no_assume_role => ?REASON_NO_ASSUME_ROLE,
+            assume_role => ?REASON_ASSUME_ROLE,
+            unknown_ssl_option => ?REASON_UNKNOWN_SSL_OPTION,
+            client_cert_incomplete => ?REASON_CLIENT_CERT_INCOMPLETE,
+            bad_ssl_options => ?REASON_BAD_SSL_OPTIONS,
+            bad_ssl_verify => ?REASON_BAD_SSL_VERIFY,
+            bad_ssl_depth => ?REASON_BAD_SSL_DEPTH,
+            bad_ssl_versions => ?REASON_BAD_SSL_VERSIONS,
+            bad_ssl_sni => ?REASON_BAD_SSL_SNI,
+            bad_ssl_cacert_arn => ?REASON_BAD_SSL_CACERT_ARN,
+            bad_ssl_cert_arn => ?REASON_BAD_SSL_CERT_ARN,
+            bad_ssl_key_arn => ?REASON_BAD_SSL_KEY_ARN
+        }
+    }.
+
+%% SSRF policy passed to the shared aws_auth_validate_net guard: this backend's
+%% infra denylists, its scheme allowlist (https-only -- stricter than the HTTP
+%% backend), and the fixed reason strings for a disallowed target / an
+%% unreachable host.
+net_policy() ->
+    #{
+        denied_v4 => ?DENIED_V4_CIDRS,
+        denied_v6 => ?DENIED_V6_CIDRS,
+        allowed_schemes => ?ALLOWED_SCHEMES,
+        reason_not_allowed => ?REASON_URL_NOT_ALLOWED,
+        reason_connection => ?REASON_CONNECTION
+    }.
 
 %%--------------------------------------------------------------------
 %% Behaviour callbacks
@@ -202,47 +231,7 @@ validate(Body) when is_map(Body) ->
 %% needs no role and gets a default state that is never used to resolve an ARN --
 %% preserving the credential-free JWKS reachability check.
 resolve_request_state(Params) ->
-    case request_references_arn(Params) of
-        false ->
-            {ok, Params#{aws_state => aws_lib:new()}};
-        true ->
-            case configured_assume_role_arn() of
-                none ->
-                    {error, config_conflict, ?REASON_NO_ASSUME_ROLE};
-                RoleArn ->
-                    case aws_iam:assume_role(RoleArn, aws_lib:new()) of
-                        {ok, State} -> {ok, Params#{aws_state => State}};
-                        {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
-                    end
-            end
-    end.
-
-%% True when the request references any ARN-backed TLS material, i.e. resolving
-%% the request will make at least one AWS call. The ARN keys live under
-%% ssl_options (cacertfile_arn / certfile_arn / keyfile_arn); parse_ssl_options
-%% guaranteed cert/key are supplied together, so any one key means an AWS fetch.
-request_references_arn(#{ssl_options := Map}) ->
-    lists:any(
-        fun(K) -> maps:is_key(K, Map) end,
-        [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>]
-    ).
-
-%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
-%% read from the same `aws, arn_config' env the boot sequence uses
-%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
-%% when unset. Mirrors aws_auth_validate_http:configured_assume_role_arn/0.
-configured_assume_role_arn() ->
-    case application:get_env(aws, arn_config) of
-        {ok, ArnConfig} when is_list(ArnConfig) ->
-            case proplists:get_value(assume_role_arn, ArnConfig) of
-                undefined -> none;
-                Arn when is_list(Arn) -> Arn;
-                Arn when is_binary(Arn) -> binary_to_list(Arn);
-                _ -> none
-            end;
-        _ ->
-            none
-    end.
+    aws_auth_validate_ssl:resolve_request_state(Params, ssl_opts()).
 
 %%--------------------------------------------------------------------
 %% Input parsing (pure, no network)
@@ -339,75 +328,12 @@ parse_resource_server_id(Body, Acc) ->
             {error, input_invalid, ?REASON_BAD_RESOURCE_SERVER_ID}
     end.
 
-%% ssl_options parsing: validate both keys and values in the pure phase so a
-%% mis-typed value cannot be silently dropped and re-defaulted.
+%% ssl_options parsing (keys + values, mTLS pairing) is shared across backends;
+%% delegate to aws_auth_validate_ssl with this backend's surface (ssl_opts/0).
 parse_ssl_options(Body, Acc) ->
-    case maps:get(<<"ssl_options">>, Body, undefined) of
-        undefined ->
-            {ok, Acc#{ssl_options => #{}}};
-        Map when is_map(Map) ->
-            case [K || K <- maps:keys(Map), not lists:member(K, ?SSL_OPTION_KEYS)] of
-                [_ | _] ->
-                    {error, input_invalid, ?REASON_UNKNOWN_SSL_OPTION};
-                [] ->
-                    %% Client cert + key are an inseparable pair: one without
-                    %% the other cannot build an mTLS identity. Reject in the
-                    %% pure phase before resolving either ARN.
-                    HasCert = maps:is_key(<<"certfile_arn">>, Map),
-                    HasKey = maps:is_key(<<"keyfile_arn">>, Map),
-                    case HasCert =:= HasKey of
-                        false -> {error, input_invalid, ?REASON_CLIENT_CERT_INCOMPLETE};
-                        true -> validate_ssl_values(maps:to_list(Map), Acc, Map)
-                    end
-            end;
-        _ ->
-            {error, input_invalid, ?REASON_BAD_SSL_OPTIONS}
-    end.
-
-validate_ssl_values([], Acc, Map) ->
-    {ok, Acc#{ssl_options => Map}};
-validate_ssl_values([{Key, Value} | Rest], Acc, Map) ->
-    case valid_ssl_value(Key, Value) of
-        ok -> validate_ssl_values(Rest, Acc, Map);
-        {error, _, _} = Err -> Err
-    end.
-
-valid_ssl_value(<<"verify">>, V) ->
-    case lists:member(V, ?SSL_VERIFY_VALUES) of
-        true -> ok;
-        false -> {error, input_invalid, ?REASON_BAD_SSL_VERIFY}
-    end;
-valid_ssl_value(<<"depth">>, V) when is_integer(V), V >= 0 ->
-    ok;
-valid_ssl_value(<<"depth">>, _) ->
-    {error, input_invalid, ?REASON_BAD_SSL_DEPTH};
-valid_ssl_value(<<"versions">>, V) when is_list(V), V =/= [] ->
-    case lists:all(fun(Ver) -> lists:member(Ver, ?SSL_VERSION_VALUES) end, V) of
-        true -> ok;
-        false -> {error, input_invalid, ?REASON_BAD_SSL_VERSIONS}
-    end;
-valid_ssl_value(<<"versions">>, _) ->
-    {error, input_invalid, ?REASON_BAD_SSL_VERSIONS};
-valid_ssl_value(<<"sni">>, V) ->
-    case is_nonempty_binary(V) of
-        true -> ok;
-        false -> {error, input_invalid, ?REASON_BAD_SSL_SNI}
-    end;
-valid_ssl_value(<<"cacertfile_arn">>, V) ->
-    case is_nonempty_binary(V) of
-        true -> ok;
-        false -> {error, input_invalid, ?REASON_BAD_SSL_CACERT_ARN}
-    end;
-valid_ssl_value(<<"certfile_arn">>, V) ->
-    case is_nonempty_binary(V) of
-        true -> ok;
-        false -> {error, input_invalid, ?REASON_BAD_SSL_CERT_ARN}
-    end;
-valid_ssl_value(<<"keyfile_arn">>, V) ->
-    case is_nonempty_binary(V) of
-        true -> ok;
-        false -> {error, input_invalid, ?REASON_BAD_SSL_KEY_ARN}
-    end.
+    aws_auth_validate_ssl:parse_ssl_options(
+        maps:get(<<"ssl_options">>, Body, undefined), Acc, ssl_opts()
+    ).
 
 %%--------------------------------------------------------------------
 %% SSRF guard
@@ -439,114 +365,19 @@ collect_guard_urls(#{jwks_uri := JwksUrl, issuer := IssuerUrl}) ->
 check_urls([]) ->
     ok;
 check_urls([Url | Rest]) ->
-    case url_allowed(Url) of
+    case aws_auth_validate_net:url_allowed(Url, net_policy()) of
         ok -> check_urls(Rest);
         {error, _, _} = Err -> Err
     end.
 
-%% Pure per-URL policy check: scheme allowlist + literal-IP classification.
-%% Hostnames pass here (allow) and are re-checked after DNS in the probe layer.
-url_allowed(#{scheme := Scheme} = Url) ->
-    case lists:member(Scheme, ?ALLOWED_SCHEMES) of
-        false ->
-            {error, input_invalid, ?REASON_URL_NOT_ALLOWED};
-        true ->
-            case classify_address(Url) of
-                allow -> ok;
-                deny -> {error, input_invalid, ?REASON_URL_NOT_ALLOWED}
-            end
-    end.
-
-%% Classify a URL's host in the pure phase. A literal IP is classified directly
-%% against the infra denylist. A hostname cannot be classified without DNS, so
-%% it is allowed here and resolved+classified in the probe layer.
-classify_address(#{host := Host}) ->
-    case inet:parse_address(Host) of
-        {ok, IP} -> classify_ip(IP);
-        {error, _} -> allow
-    end.
-
-%% classify_ip/1: allow | deny for a parsed IP tuple. Denies the broker-infra
-%% ranges only. IPv6 notations that embed a v4 address are unwrapped and
-%% re-classified (DNS-rebinding defense via v6-encoded addresses).
-classify_ip({0, 0, 0, 0, 0, 16#ffff, W1, W2}) ->
-    %% IPv4-mapped ::ffff:a.b.c.d
-    classify_ip(v4_from_words(W1, W2));
-classify_ip({0, 0, 0, 0, 0, 0, W1, W2}) when {W1, W2} =/= {0, 0}, {W1, W2} =/= {0, 1} ->
-    %% IPv4-compatible ::a.b.c.d (RFC4291-deprecated). Guard lets :: and ::1
-    %% fall through to the v6 denylist.
-    classify_ip(v4_from_words(W1, W2));
-classify_ip({16#64, 16#ff9b, 0, 0, 0, 0, W1, W2}) ->
-    %% NAT64 well-known prefix 64:ff9b::/96 -> embedded v4 in the low 32 bits.
-    classify_ip(v4_from_words(W1, W2));
-classify_ip({16#2002, W1, W2, _, _, _, _, _}) ->
-    %% 6to4 2002::/16 -> embedded v4 in segments 2-3.
-    classify_ip(v4_from_words(W1, W2));
-classify_ip({_, _, _, _} = V4) ->
-    case in_any_cidr(V4, ?DENIED_V4_CIDRS) of
-        true -> classify_denied(V4);
-        false -> allow
-    end;
-classify_ip({_, _, _, _, _, _, _, _} = V6) ->
-    case in_any_cidr(V6, ?DENIED_V6_CIDRS) of
-        true -> classify_denied(V6);
-        false -> allow
-    end.
-
-%% A denied address is normally `deny'. The ONE exception is loopback when
-%% auth_validation_allow_private_networks is set: that flag (default false, off
-%% in production) lets the OAuth integration suite probe a local stub IdP on
-%% 127.0.0.1/::1. It is the OAuth analogue of the same flag the LDAP and HTTP
-%% backends honour for local-server tests. It relaxes ONLY loopback -- IMDS,
-%% link-local, and unspecified stay denied even with the flag on, so it cannot
-%% be used to reach instance metadata.
-classify_denied(IP) ->
-    case is_loopback(IP) andalso allow_private_networks() of
-        true -> allow;
-        false -> deny
-    end.
-
-is_loopback({127, _, _, _}) -> true;
-is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
-is_loopback(_) -> false.
-
-allow_private_networks() ->
-    application:get_env(aws, auth_validation_allow_private_networks, false) =:= true.
-
-%% Two 16-bit words -> a v4 4-tuple {a,b,c,d}.
-v4_from_words(W1, W2) ->
-    {W1 bsr 8, W1 band 16#ff, W2 bsr 8, W2 band 16#ff}.
-
-in_any_cidr(IP, Cidrs) ->
-    lists:any(fun(Cidr) -> in_cidr(IP, Cidr) end, Cidrs).
-
-in_cidr({_, _, _, _} = IP, {{_, _, _, _} = Net, Prefix}) when
-    Prefix >= 0, Prefix =< 32
-->
-    same_prefix(ip_to_int(IP), ip_to_int(Net), 32, Prefix);
-in_cidr({_, _, _, _, _, _, _, _} = IP, {{_, _, _, _, _, _, _, _} = Net, Prefix}) when
-    Prefix >= 0, Prefix =< 128
-->
-    same_prefix(ip_to_int(IP), ip_to_int(Net), 128, Prefix);
-in_cidr(_IP, _Cidr) ->
-    %% Cross-family (e.g. v4 IP vs v6 CIDR): never matches.
-    false.
-
-same_prefix(IpInt, NetInt, TotalBits, Prefix) ->
-    HostBits = TotalBits - Prefix,
-    (IpInt bsr HostBits) =:= (NetInt bsr HostBits).
-
-ip_to_int(Tuple) ->
-    BitsPerElem =
-        case tuple_size(Tuple) of
-            4 -> 8;
-            8 -> 16
-        end,
-    lists:foldl(
-        fun(Elem, Acc) -> (Acc bsl BitsPerElem) bor Elem end,
-        0,
-        tuple_to_list(Tuple)
-    ).
+-ifdef(TEST).
+%% TEST-only wrappers exposing the shared SSRF guard under this backend's policy,
+%% so the module's -ifdef(TEST) export contract stays stable. Production code
+%% calls aws_auth_validate_net directly.
+url_allowed(Url) -> aws_auth_validate_net:url_allowed(Url, net_policy()).
+classify_ip(IP) -> aws_auth_validate_net:classify_ip(IP, net_policy()).
+in_cidr(IP, Cidr) -> aws_auth_validate_net:in_cidr(IP, Cidr).
+-endif.
 
 %%--------------------------------------------------------------------
 %% Network phase: fetch JWKS (and optionally discover via issuer)
@@ -557,7 +388,7 @@ ip_to_int(Tuple) ->
 %% All probe requests run on a dedicated ephemeral httpc profile (R3).
 
 do_oauth_validate(Params) ->
-    case claim_probe_profile() of
+    case aws_auth_validate_httpc:claim_probe_profile(?PROFILE_PREFIX) of
         none ->
             %% Could not obtain an isolated profile; fail safe rather than fall
             %% back to the shared default profile (which would reintroduce the
@@ -577,7 +408,7 @@ do_oauth_validate(Params) ->
                     {error, connection_failed, ?REASON_CONNECTION}
             after
                 %% Only ever stop the profile THIS request started (claimed).
-                stop_probe_profile(Profile)
+                aws_auth_validate_httpc:stop_probe_profile(Profile)
             end
     end.
 
@@ -595,7 +426,7 @@ do_fetch_jwks(#{jwks_uri := undefined, issuer := IssuerUrl, timeout := Timeout},
             Err;
         {ok, DerivedUrl} ->
             %% SSRF-guard + resolve_and_pin the derived URL before fetching it.
-            case url_allowed(DerivedUrl) of
+            case aws_auth_validate_net:url_allowed(DerivedUrl, net_policy()) of
                 {error, _, _} = Err ->
                     Err;
                 ok ->
@@ -611,7 +442,7 @@ discover_jwks_uri(IssuerUrl, SslOpts, Timeout, Profile) ->
     DiscoveryUrlStr =
         strip_trailing_slash(maps:get(url_string, IssuerUrl)) ++
             "/.well-known/openid-configuration",
-    case resolve_and_pin(IssuerUrl) of
+    case aws_auth_validate_net:resolve_and_pin(IssuerUrl, net_policy()) of
         {error, _, _} = Err ->
             Err;
         {ok, PinnedUrl, Host} ->
@@ -654,7 +485,7 @@ parse_discovery_doc(Body, _DiscoveryUrlStr) ->
 
 %% Fetch the JWKS endpoint and validate the response is a well-formed JWKS.
 fetch_and_validate_jwks(JwksUrl, SslOpts, Timeout, Profile) ->
-    case resolve_and_pin(JwksUrl) of
+    case aws_auth_validate_net:resolve_and_pin(JwksUrl, net_policy()) of
         {error, _, _} = Err ->
             Err;
         {ok, PinnedUrl, Host} ->
@@ -692,59 +523,6 @@ is_valid_jwks(Body) when is_binary(Body) ->
             false
     end.
 
-%%--------------------------------------------------------------------
-%% DNS resolve-and-pin (SSRF network-phase defense)
-%%--------------------------------------------------------------------
-
-%% Resolve the URL's host to all addresses, deny if ANY is a blocked infra
-%% address, and return the URL rewritten to connect to a single pinned IP plus
-%% the original host (for the Host header / SNI).
-resolve_and_pin(#{host := Host} = Url) ->
-    case inet:parse_address(Host) of
-        {ok, IP} ->
-            %% Literal IP: re-classify defensively, pin to itself.
-            case classify_ip(IP) of
-                deny -> {error, input_invalid, ?REASON_URL_NOT_ALLOWED};
-                allow -> {ok, pin_url(Url, Host), Host}
-            end;
-        {error, _} ->
-            resolve_hostname_and_pin(Url, Host)
-    end.
-
-resolve_hostname_and_pin(Url, Host) ->
-    Addrs = resolve_all(Host),
-    case Addrs of
-        [] ->
-            {error, connection_failed, ?REASON_CONNECTION};
-        _ ->
-            case lists:any(fun(IP) -> classify_ip(IP) =:= deny end, Addrs) of
-                true ->
-                    {error, input_invalid, ?REASON_URL_NOT_ALLOWED};
-                false ->
-                    PinIP = inet:ntoa(hd(Addrs)),
-                    {ok, pin_url(Url, PinIP), Host}
-            end
-    end.
-
-%% Resolve a hostname to all IPv4 + IPv6 addresses (best-effort per family).
-resolve_all(Host) ->
-    V4 =
-        case inet:getaddrs(Host, inet) of
-            {ok, A4} -> A4;
-            {error, _} -> []
-        end,
-    V6 =
-        case inet:getaddrs(Host, inet6) of
-            {ok, A6} -> A6;
-            {error, _} -> []
-        end,
-    V4 ++ V6.
-
-%% Rewrite the URL to connect to the pinned IP, keeping scheme/port/path/query.
-pin_url(Url, PinHost) ->
-    Rebuilt = uri_string:recompose(maps:without([url_string], Url#{host => PinHost})),
-    Url#{url_string => Rebuilt}.
-
 %% Strip a single trailing slash from a URL string to avoid producing
 %% double-slash paths when appending "/.well-known/..." to an issuer URL
 %% that already ends with "/".
@@ -758,99 +536,12 @@ strip_trailing_slash(S) ->
 %% httpc error classification
 %%--------------------------------------------------------------------
 
+%% Shared classifier: TLS/cert failure -> tls_failed, else connection_failed.
+%% The raw reason is never echoed (R4).
 classify_http_error(Reason) ->
-    case is_tls_error(Reason) of
-        true -> {error, tls_failed, ?REASON_TLS_HANDSHAKE};
-        false -> {error, connection_failed, ?REASON_CONNECTION}
-    end.
-
-is_tls_error(Term) when is_tuple(Term) ->
-    case element(1, Term) of
-        tls_alert -> true;
-        Other when is_atom(Other) -> is_tls_atom(Other) orelse is_tls_error(tuple_to_list(Term));
-        _ -> is_tls_error(tuple_to_list(Term))
-    end;
-is_tls_error([H | T]) ->
-    is_tls_error(H) orelse is_tls_error(T);
-is_tls_error(Atom) when is_atom(Atom) ->
-    is_tls_atom(Atom);
-is_tls_error(_) ->
-    false.
-
-is_tls_atom(A) ->
-    lists:member(A, [
-        tls_alert,
-        certificate_expired,
-        bad_certificate,
-        unknown_ca,
-        handshake_failure,
-        certificate_unknown,
-        no_peercert
-    ]).
-
-%%--------------------------------------------------------------------
-%% Ephemeral httpc profile management
-%%--------------------------------------------------------------------
-
-%% Each in-flight probe OWNS a distinct started profile: a slot is claimed only
-%% by successfully starting it, so two simultaneous calls never share a profile
-%% and none is ever stolen from an actively-probing peer. The atom set stays
-%% bounded at exactly ?PROFILE_POOL_SIZE interned names. The "oauth" prefix keeps
-%% these names disjoint from the HTTP backend's pool so the two never collide.
-profile_atom(Slot) ->
-    list_to_atom("aws_auth_validate_oauth_" ++ integer_to_list(Slot)).
-
-%% Claim a profile by scanning the fixed pool for a FREE slot: start at a
-%% per-request hashed slot and try to inets:start it. Starting succeeds only if
-%% no concurrent validation already owns that slot, so success means we own it.
-%% On {already_started,_} (slot running) or already_present (slot mid-teardown)
-%% advance to the next slot -- never stop a slot in use by a peer, that would
-%% tear down its in-flight request. Bounded to one full pass over the pool; if
-%% every slot is busy, fail closed. Returns {ok, Profile} | none.
-claim_probe_profile() ->
-    Start = erlang:phash2(make_ref(), ?PROFILE_POOL_SIZE),
-    claim_probe_profile(Start, ?PROFILE_POOL_SIZE).
-
-claim_probe_profile(_Slot, 0) ->
-    %% Every slot busy: unreachable while the semaphore caps concurrency below
-    %% ?PROFILE_POOL_SIZE, but fail closed rather than reuse a shared profile.
-    none;
-claim_probe_profile(Slot, Remaining) ->
-    Profile = profile_atom(Slot),
-    case inets:start(httpc, [{profile, Profile}]) of
-        {ok, _Pid} ->
-            %% We started (own) this profile; disable reuse and take it.
-            set_probe_profile_opts(Profile),
-            {ok, Profile};
-        {error, {already_started, _}} ->
-            %% Slot in use by a concurrent validation -- do NOT steal it; advance.
-            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
-        {error, already_present} ->
-            %% Slot mid-teardown by a concurrent validation. inets:stop/2 runs
-            %% terminate_child THEN delete_child as two separate supervisor
-            %% calls; a permanent child (the httpc profile) keeps its spec with
-            %% pid=undefined between them, so a start landing in that window sees
-            %% already_present rather than already_started. Not cleanly free --
-            %% advance like the already_started case rather than fail this
-            %% request closed. The pool size exceeds the concurrency cap, so the
-            %% scan still lands on a genuinely free slot within one pass.
-            claim_probe_profile((Slot + 1) rem ?PROFILE_POOL_SIZE, Remaining - 1);
-        _ ->
-            %% Any other start error: fail closed rather than risk the shared
-            %% default profile's session-reuse hazard.
-            none
-    end.
-
-set_probe_profile_opts(Profile) ->
-    _ = httpc:set_options(
-        [{max_sessions, 0}, {max_keep_alive_length, 0}, {keep_alive_timeout, 0}],
-        Profile
-    ),
-    ok.
-
-stop_probe_profile(Profile) ->
-    _ = inets:stop(httpc, Profile),
-    ok.
+    aws_auth_validate_ssl:classify_http_error(
+        Reason, ?REASON_TLS_HANDSHAKE, ?REASON_CONNECTION
+    ).
 
 %%--------------------------------------------------------------------
 %% TLS option shaping (mirrors the HTTP backend's resolution, for httpc)
@@ -869,205 +560,34 @@ with_default_sni(SslOpts, Host) ->
         false -> [{server_name_indication, Host} | SslOpts]
     end.
 
-%% Resolve the ARN-backed TLS material (CA bundle, and the client cert+key for
-%% mTLS) and translate the validated ssl_options map into an Erlang ssl
-%% proplist for httpc. ARN resolution happens here, in the network phase, after
-%% all pure validation has passed (ARN-first ordering).
+%% Resolve the ARN-backed TLS material (CA bundle + optional mTLS client cert)
+%% and translate the validated ssl_options into an ssl proplist for httpc. The
+%% resolution, decoding, and verify-default policy are shared
+%% (aws_auth_validate_ssl); only the SNI key spelling (<<"sni">>) is
+%% backend-specific.
 build_client_ssl_opts(#{ssl_options := Map} = Params) ->
     %% aws_state was built once per request by resolve_request_state/1 (under the
     %% configured assume_role when any ARN is referenced) and is threaded into
     %% every ARN fetch here. A request that references no ARN carries a default
     %% state that is never used to resolve one.
-    State = maps:get(aws_state, Params, undefined),
-    case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State) of
+    State = maps:get(aws_state, Params, none),
+    case
+        aws_auth_validate_ssl:resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State)
+    of
         {error, _, _} = Err ->
             Err;
         {ok, CacertOpts} ->
-            case resolve_client_cert(Map, State) of
+            case aws_auth_validate_ssl:resolve_client_cert(Map, State) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, ClientOpts} ->
-                    Opts = CacertOpts ++ ClientOpts ++ translate_ssl_opts(Map),
+                    Opts =
+                        CacertOpts ++ ClientOpts ++
+                            aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
                     VerifyExplicit = maps:is_key(<<"verify">>, Map),
-                    apply_verify_default(Opts, VerifyExplicit)
+                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit)
             end
-    end.
-
-resolve_cacerts(undefined, _State) ->
-    {ok, []};
-resolve_cacerts(Arn, State) when is_binary(Arn) ->
-    case resolve_arn(Arn, State) of
-        {ok, Pem} ->
-            case decode_pem_cacerts(Pem) of
-                skip -> {ok, []};
-                Certs -> {ok, [{cacerts, Certs}]}
-            end;
-        {error, _} ->
-            {error, input_invalid, ?REASON_ARN_RESOLVE}
-    end.
-
-resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}, State) when
-    is_binary(CertArn), is_binary(KeyArn)
-->
-    case resolve_arn(CertArn, State) of
-        {ok, CertPem} ->
-            case decode_client_cert(CertPem) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, CertOpt} ->
-                    case resolve_arn(KeyArn, State) of
-                        {ok, KeyPem} ->
-                            case decode_client_key(KeyPem) of
-                                {error, _, _} = Err -> Err;
-                                {ok, KeyOpt} -> {ok, [CertOpt, KeyOpt]}
-                            end;
-                        {error, _} ->
-                            {error, input_invalid, ?REASON_ARN_RESOLVE}
-                    end
-            end;
-        {error, _} ->
-            {error, input_invalid, ?REASON_ARN_RESOLVE}
-    end;
-resolve_client_cert(_Map, _State) ->
-    {ok, []}.
-
-decode_client_cert(Pem) when is_binary(Pem) ->
-    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)] of
-        [] -> {error, input_invalid, ?REASON_ARN_RESOLVE};
-        Ders -> {ok, {cert, Ders}}
-    end.
-
-decode_client_key(Pem) when is_binary(Pem) ->
-    KeyEntries = [
-        {Type, Der}
-     || {Type, Der, not_encrypted} <- public_key:pem_decode(Pem),
-        lists:member(Type, [
-            'PrivateKeyInfo', 'RSAPrivateKey', 'ECPrivateKey', 'DSAPrivateKey'
-        ])
-    ],
-    case KeyEntries of
-        [{Type, Der} | _] -> {ok, {key, {Type, Der}}};
-        [] -> {error, input_invalid, ?REASON_ARN_RESOLVE}
-    end.
-
-translate_ssl_opts(Map) ->
-    Pairs = [
-        {verify, <<"verify">>, fun to_verify/1},
-        {depth, <<"depth">>, fun to_integer/1},
-        {versions, <<"versions">>, fun to_versions/1},
-        {server_name_indication, <<"sni">>, fun to_list/1}
-    ],
-    lists:foldl(
-        fun({SslKey, JsonKey, Fun}, Acc) ->
-            case maps:get(JsonKey, Map, undefined) of
-                undefined -> Acc;
-                Value -> [{SslKey, Fun(Value)} | Acc]
-            end
-        end,
-        [],
-        Pairs
-    ).
-
-%% Ensure verify_peer always has a trust anchor. Policy mirrors the HTTP backend:
-%%   * EXPLICIT verify_peer + no cacerts -> OS store or FAIL.
-%%   * DEFAULTED verify (caller omitted) -> verify_peer when anchor exists, else
-%%     leave unset (broker-parity verify_none).
-%%   * Explicit verify_none -> untouched.
-apply_verify_default(Opts, VerifyExplicit) ->
-    case lists:keyfind(verify, 1, Opts) of
-        {verify, verify_peer} when VerifyExplicit ->
-            case ensure_trust_anchor(Opts) of
-                {ok, _} = Ok -> Ok;
-                none -> {error, tls_failed, ?REASON_NO_TRUST_ANCHOR}
-            end;
-        {verify, verify_peer} ->
-            case ensure_trust_anchor(Opts) of
-                {ok, Opts1} -> {ok, Opts1};
-                none -> {ok, lists:keyreplace(verify, 1, Opts, {verify, verify_none})}
-            end;
-        {verify, _Other} ->
-            {ok, Opts};
-        false ->
-            case trust_source(Opts) of
-                {ok, Opts1} -> {ok, [{verify, verify_peer} | Opts1]};
-                none -> {ok, Opts}
-            end
-    end.
-
-ensure_trust_anchor(Opts) ->
-    case lists:keymember(cacerts, 1, Opts) of
-        true ->
-            {ok, Opts};
-        false ->
-            case os_cacerts() of
-                [] -> none;
-                Certs -> {ok, [{cacerts, Certs} | Opts]}
-            end
-    end.
-
-trust_source(Opts) ->
-    case lists:keymember(cacerts, 1, Opts) of
-        true ->
-            {ok, Opts};
-        false ->
-            case os_cacerts() of
-                [] -> none;
-                Certs -> {ok, [{cacerts, Certs} | Opts]}
-            end
-    end.
-
-os_cacerts() ->
-    try
-        public_key:cacerts_get()
-    catch
-        _:_ -> []
-    end.
-
-%% Return raw 'Certificate' DER binaries, NOT pem_entry_decode/1 records: ssl
-%% silently ignores #'OTPCertificate'{} records under {cacerts, _}, which
-%% surfaces as unknown_ca -> a spurious tls_failed on the verify_peer +
-%% cacertfile_arn path. Matches the HTTP/LDAP backends' decode_pem_cacerts/1.
-decode_pem_cacerts(B) when is_binary(B) ->
-    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
-        [] -> skip;
-        Ders -> Ders
-    end.
-
-to_list(B) when is_binary(B) -> binary_to_list(B);
-to_list(L) when is_list(L) -> L.
-
-to_integer(I) when is_integer(I) -> I.
-
-to_verify(<<"verify_peer">>) -> verify_peer;
-to_verify(<<"verify_none">>) -> verify_none.
-
-to_versions(L) when is_list(L) ->
-    [to_version(V) || V <- L].
-
-to_version(<<"tlsv1.3">>) -> 'tlsv1.3';
-to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
-to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
-to_version(<<"tlsv1">>) -> tlsv1.
-
-%%--------------------------------------------------------------------
-%% Shared helpers
-%%--------------------------------------------------------------------
-
-is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
-
-%% Resolve an ARN using the request's threaded aws_state(). The state is built
-%% once per request by resolve_request_state/1 -- under the operator-configured
-%% assume_role when any ARN is referenced -- so no global singleton is mutated.
-%% See the HTTP backend's identical resolve_arn/2 for the full rationale (R3, R6).
--spec resolve_arn(binary(), aws_lib:aws_state()) -> {ok, binary()} | {error, term()}.
-resolve_arn(Arn, State) when is_binary(Arn) ->
-    case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
-        {ok, Data, _State1} -> {ok, Data};
-        {error, _} = Error -> Error
     end.
 
 connection_timeout_ms() ->
-    case application:get_env(aws, auth_validation_connection_timeout_ms) of
-        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
-        _ -> ?DEFAULT_TIMEOUT_MS
-    end.
+    aws_auth_validate_ssl:connection_timeout_ms(#{default => ?DEFAULT_TIMEOUT_MS, max => 60_000}).
