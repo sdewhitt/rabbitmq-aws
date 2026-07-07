@@ -113,6 +113,7 @@
 %% explicit false to disable a specific method even when the master
 %% toggle is on. Example:
 %%   aws.auth_validation.enabled_methods.ldap = false
+%%   aws.auth_validation.enabled_methods.oauth = true
 {mapping, "aws.auth_validation.enabled_methods.$name", "aws.auth_validation_enabled_methods",
     [{datatype, {enum, [true, false]}}]}.
 
