@@ -273,7 +273,21 @@ validate(Body) when is_map(Body) ->
 resolve_request_state(Params) ->
     case request_references_arn(Params) of
         false ->
-            {ok, Params#{aws_state => aws_lib:new()}};
+            %% No ARN is referenced, so this request resolves nothing and needs
+            %% no credentials. Do NOT hand out a usable aws_lib:new() state here:
+            %% that state carries undefined credentials, and aws_lib's credential
+            %% chain (ensure_credentials_valid/1 -> refresh_credentials/1) would
+            %% fall back to env/file/EC2 instance metadata if any ARN fetch were
+            %% ever attempted under it -- letting a customer request resolve an
+            %% ARN under the broker's ambient (over-privileged) instance role, the
+            %% exact confused-deputy breach the assume_role guardrail exists to
+            %% prevent. We instead store the sentinel `none', which
+            %% resolve_arn/2 refuses, so the instance role is unreachable BY
+            %% CONSTRUCTION rather than by an invariant spread across
+            %% request_references_arn/1 and build_client_ssl_opts/1. The
+            %% credential-free reachability probe is preserved: it resolves zero
+            %% ARNs, so it never reaches resolve_arn/2.
+            {ok, Params#{aws_state => none}};
         true ->
             case configured_assume_role_arn() of
                 none ->
@@ -1039,9 +1053,12 @@ params_for(<<"topic_path">>) ->
 build_client_ssl_opts(#{ssl_options := Map} = Params) ->
     %% aws_state was built once per request by resolve_request_state/1 (under the
     %% configured assume_role when any ARN is referenced) and is threaded into
-    %% every ARN fetch here. A request that references no ARN carries a default
-    %% state that is never used to resolve one.
-    State = maps:get(aws_state, Params, undefined),
+    %% every ARN fetch here. A request that references no ARN carries the `none'
+    %% sentinel, which resolve_arn/2 refuses -- so even if an ARN fetch were
+    %% reached on that path it fails closed instead of falling back to the
+    %% instance role. Default to `none' (never a usable state) if the key is
+    %% somehow absent, preserving the fail-closed contract.
+    State = maps:get(aws_state, Params, none),
     case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State) of
         {error, _, _} = Err ->
             Err;
@@ -1263,7 +1280,16 @@ is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 %% validation pipeline. The 3-tuple {ok, Data, State1} from
 %% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
 %% callers expect; the threaded state is request-scoped and discarded here.
--spec resolve_arn(binary(), aws_lib:aws_state()) -> {ok, binary()} | {error, term()}.
+-spec resolve_arn(binary(), aws_lib:aws_state() | none) -> {ok, binary()} | {error, term()}.
+%% Fail closed on the `none' sentinel: a request that referenced no ARN carries
+%% aws_state => none (resolve_request_state/1), and must never resolve an ARN --
+%% doing so under aws_lib's default credential chain could reach the broker's EC2
+%% instance role. `none' can only appear if a future code path tries to resolve
+%% an ARN on the no-ARN branch; refusing here turns that into a fixed-category
+%% error (never an instance-role fetch). A credentialed state is only ever
+%% produced by resolve_request_state/1's assume_role path.
+resolve_arn(_Arn, none) ->
+    {error, no_credentials_state};
 resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
