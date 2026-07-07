@@ -488,6 +488,110 @@ http_arn_resolved_after_pure_pass_test_() ->
         end}.
 
 %%--------------------------------------------------------------------
+%% Option B: the broker's EC2 instance role must be unreachable by
+%% construction. A request that references no ARN carries aws_state => none;
+%% resolve_arn/2 refuses that sentinel, so an ARN can never be resolved under
+%% aws_lib's default credential chain (which would fall back to env/file/IMDS
+%% and thus the instance role). Credential-free reachability is preserved.
+%%--------------------------------------------------------------------
+
+%% A no-ARN reachability probe needs no credentials and no configured
+%% assume_role: it must succeed WITHOUT ever calling aws_arn_util:resolve_arn.
+%% arn_config is deliberately unset -- proving the credential-free path does not
+%% require (and never touches) the assume_role machinery.
+http_no_arn_request_resolves_nothing_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            ok = meck:new(httpc, [unstick, passthrough]),
+            ok = meck:new(inets, [unstick, passthrough]),
+            application:unset_env(aws, arn_config),
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
+            meck:expect(inets, start, fun(httpc, _) -> {ok, self()} end),
+            meck:expect(inets, stop, fun(httpc, _) -> ok end),
+            meck:expect(httpc, set_options, fun(_, _) -> ok end),
+            meck:expect(httpc, request, fun(_M, _R, _H, _O, _P) ->
+                {ok, {{"HTTP/1.1", 200, "OK"}, [], <<"allow">>}}
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(inets),
+            meck:unload(httpc),
+            meck:unload(aws_arn_util)
+        end,
+        fun(_) ->
+            %% No ssl_options ARNs -> request_references_arn = false ->
+            %% aws_state => none. verify_none avoids needing a trust anchor.
+            Body = base_body(#{
+                <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
+            }),
+            Result = aws_auth_validate_http:validate(Body),
+            [
+                ?_assertEqual(ok, Result),
+                ?_assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%% Direct fail-closed check: build_client_ssl_opts/1 with aws_state => none and a
+%% cacertfile_arn must refuse via resolve_arn's `none' clause -- mapping to the
+%% fixed input_invalid/ARN-resolve category -- and must NOT call the real ARN
+%% resolver (i.e. no env/file/IMDS credential lookup ever happens). This proves
+%% the instance role is unreachable even if a future code path reached ARN
+%% resolution on the no-ARN branch.
+http_resolve_arn_fails_closed_on_none_sentinel_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            %% If this is ever called the sentinel would leak into a real
+            %% (potentially IMDS-backed) resolve; assert 0 calls below.
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_arn_util)
+        end,
+        fun(_) ->
+            Params = #{
+                ssl_options => #{<<"cacertfile_arn">> => <<"arn:aws:s3:::ca">>},
+                aws_state => none
+            },
+            Result = aws_auth_validate_http:build_client_ssl_opts(Params),
+            [
+                ?_assertEqual({error, input_invalid, <<"failed to resolve ARN">>}, Result),
+                ?_assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%% An ARN-referencing request with NO configured assume_role must be refused with
+%% config_conflict BEFORE any ARN fetch -- the guardrail that keeps the endpoint
+%% off the broker's ambient instance role. resolve_arn must never be called.
+http_arn_request_without_role_is_config_conflict_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            application:unset_env(aws, arn_config),
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, ?SECRET, State} end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_arn_util)
+        end,
+        fun(_) ->
+            Body = base_body(#{
+                <<"ssl_options">> => #{
+                    <<"cacertfile_arn">> => <<"arn:aws:s3:::ca">>,
+                    <<"verify">> => <<"verify_peer">>
+                }
+            }),
+            Result = aws_auth_validate_http:validate(Body),
+            [
+                ?_assertMatch({error, config_conflict, _}, Result),
+                ?_assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%%--------------------------------------------------------------------
 %% R6: a resolved secret (CA/cert/key PEM) must never reach a result term,
 %% log, or crash report -- even when the probe raises with the secret in scope.
 %% Mirrors ldap_bind_raise_does_not_leak_password_test_.
