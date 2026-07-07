@@ -566,11 +566,15 @@ expired_credentials(Expiration) ->
     Now >= Expires.
 
 -spec local_time() -> calendar:datetime().
-%% @doc Return the current local time.
+%% @doc Return the current UTC time. Callers compare this against UTC expiration
+%% timestamps, so it must be UTC. We read calendar:universal_time/0 directly
+%% rather than converting local time via local_time_to_universal_time_dst/1:
+%% that conversion returns two datetimes during a DST fall-back transition (the
+%% local hour is ambiguous) and none during a spring-forward gap, so matching a
+%% single [Value] crashed with badmatch in the transition window.
 %% @end
 local_time() ->
-    [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-    Value.
+    calendar:universal_time().
 
 -spec maybe_decode_body(ContentType :: {nonempty_string(), nonempty_string()}, Body :: body()) ->
     list() | body().
