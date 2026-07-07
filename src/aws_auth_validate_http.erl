@@ -301,6 +301,10 @@ validate(Body) when is_map(Body) ->
 %% material. A plain reachability / (m)TLS probe that references no ARN performs
 %% no AWS call, so it needs no role and gets a default state that is never used
 %% to resolve an ARN -- preserving the credential-free reachability check.
+%% Delegates to the shared aws_auth_validate_ssl helper. The no-ARN branch there
+%% stores the `none' credential sentinel (which resolve_arn/2 refuses), matching
+%% the fail-closed contract PR #116 introduced -- a customer request can never
+%% resolve an ARN under the broker's ambient EC2 instance role.
 resolve_request_state(Params) ->
     aws_auth_validate_ssl:resolve_request_state(Params, ssl_opts()).
 
@@ -719,10 +723,11 @@ params_for(<<"topic_path">>) ->
 %% (aws_auth_validate_ssl); only the SNI key spelling (<<"sni">>) is
 %% backend-specific.
 build_client_ssl_opts(#{ssl_options := Map} = Params) ->
-    %% aws_state was built once per request by resolve_request_state/1 (under the
-    %% configured assume_role when any ARN is referenced) and is threaded into
-    %% every ARN fetch here. A request that references no ARN carries a default
-    %% state that is never used to resolve one.
+    %% every ARN fetch here. A request that references no ARN carries the `none'
+    %% sentinel, which the shared resolve_arn/2 refuses -- so even if an ARN fetch
+    %% were reached on that path it fails closed instead of falling back to the
+    %% instance role. Default to `none' (never a usable state) if the key is
+    %% somehow absent, preserving the fail-closed contract.
     State = maps:get(aws_state, Params, none),
     case
         aws_auth_validate_ssl:resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State)

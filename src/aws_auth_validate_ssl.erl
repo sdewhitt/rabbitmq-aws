@@ -129,7 +129,16 @@ configured_assume_role_arn() ->
 resolve_request_state(Params, Opts) ->
     case request_references_arn(Params, Opts) of
         false ->
-            {ok, Params#{aws_state => aws_lib:new()}};
+            %% No ARN is referenced, so this request resolves nothing and needs
+            %% no credentials. Do NOT hand out a usable aws_lib:new() state here:
+            %% that state's credential chain could fall back to the EC2 instance
+            %% role if any ARN fetch were ever attempted under it -- the exact
+            %% confused-deputy the assume_role guardrail prevents. Store the
+            %% `none' sentinel, which resolve_arn/2 refuses, so the instance role
+            %% is unreachable BY CONSTRUCTION. The credential-free reachability
+            %% probe is preserved: it resolves zero ARNs, so it never reaches
+            %% resolve_arn/2.
+            {ok, Params#{aws_state => none}};
         true ->
             case configured_assume_role_arn() of
                 none ->
