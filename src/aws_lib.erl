@@ -11,6 +11,8 @@
     new/0, new/1,
     get_region/1,
     set_region/2,
+    get_timeout/1,
+    set_timeout/2,
     get_credentials/1,
     get/3, get/4, get/5,
     put/5, put/6,
@@ -20,7 +22,6 @@
     set_credentials/3,
     set_credentials/4,
     has_credentials/1,
-    parse_uri/1,
     ensure_credentials_valid/1,
     ensure_imdsv2_token_valid/1,
     expired_imdsv2_token/1,
@@ -78,6 +79,22 @@ get_region(#aws_state{config = #aws_config{region = Region}}) ->
 %% @end
 set_region(Region, State = #aws_state{config = Config}) ->
     {ok, State#aws_state{config = Config#aws_config{region = Region}}}.
+
+-spec get_timeout(State :: aws_state()) -> timeout().
+%% @doc Get the AWS API request timeout (ms) from the state, falling back to
+%% ?DEFAULT_API_TIMEOUT when the state does not set one.
+%% @end
+get_timeout(#aws_state{config = #aws_config{timeout = undefined}}) ->
+    ?DEFAULT_API_TIMEOUT;
+get_timeout(#aws_state{config = #aws_config{timeout = Timeout}}) ->
+    Timeout.
+
+-spec set_timeout(Timeout :: timeout(), State :: aws_state()) -> {ok, aws_state()}.
+%% @doc Set the AWS API request timeout (ms) in the state. Applied to requests
+%% that do not pass an explicit `timeout' option.
+%% @end
+set_timeout(Timeout, State = #aws_state{config = Config}) ->
+    {ok, State#aws_state{config = Config#aws_config{timeout = Timeout}}}.
 
 -spec get_credentials(State :: aws_state()) -> {ok, aws_credentials()} | {error, undefined}.
 %% @doc Get the credentials from the state.
@@ -240,22 +257,29 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
             Host = endpoint_host(Region, Service),
             URI = create_uri(Host, Path),
             BodyHash = proplists:get_value(payload_hash, Options),
-            SignedHeaders = sign_headers(
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Region,
-                Service,
-                Method,
-                URI,
-                Headers,
-                Body,
-                BodyHash
-            ),
-            case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options) of
-                {ok, Response} ->
-                    {ok, Response, State1};
-                Error ->
+            case
+                sign_headers(
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Region,
+                    Service,
+                    Method,
+                    URI,
+                    Headers,
+                    Body,
+                    BodyHash
+                )
+            of
+                {ok, SignedHeaders} ->
+                    Options1 = ensure_timeout_option(Options, State1),
+                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options1) of
+                        {ok, Response} ->
+                            {ok, Response, State1};
+                        Error ->
+                            Error
+                    end;
+                {error, _} = Error ->
                     Error
             end;
         undefined ->
@@ -273,7 +297,7 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
     Headers :: headers(),
     Body :: body(),
     BodyHash :: iodata() | undefined
-) -> headers().
+) -> {ok, headers()} | {error, {malformed_uri, string()}}.
 sign_headers(
     AccessKey, SecretKey, SecurityToken, Region, Service, Method, URI, Headers, Body, BodyHash
 ) ->
@@ -424,22 +448,29 @@ perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, Stat
                 end,
 
             URI = endpoint(Region, Host, Service, Path),
-            SignedHeaders = sign_headers(
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Region,
-                Service,
-                Method,
-                URI,
-                Headers,
-                Body,
-                undefined
-            ),
-            case gun_request(Method, URI, SignedHeaders, Body, Options) of
-                {ok, Response} ->
-                    {ok, Response, State1};
-                Error ->
+            case
+                sign_headers(
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Region,
+                    Service,
+                    Method,
+                    URI,
+                    Headers,
+                    Body,
+                    undefined
+                )
+            of
+                {ok, SignedHeaders} ->
+                    Options1 = ensure_timeout_option(Options, State1),
+                    case gun_request(Method, URI, SignedHeaders, Body, Options1) of
+                        {ok, Response} ->
+                            {ok, Response, State1};
+                        Error ->
+                            Error
+                    end;
+                {error, _} = Error ->
                     Error
             end;
         undefined ->
@@ -545,21 +576,29 @@ get_content_type(Headers) ->
     parse_content_type(Value).
 
 -spec expired_credentials(Expiration :: calendar:datetime()) -> boolean().
-%% @doc Indicates if the date that is passed in has expired.
+%% @doc Indicates whether the given expiration is at or within the refresh
+%% buffer window. Credentials are treated as expired a few minutes before they
+%% actually lapse (?CREDENTIAL_REFRESH_BUFFER_SECONDS) so they are refreshed
+%% proactively rather than after a request has already started with credentials
+%% that expire mid-flight.
 %% end
 expired_credentials(undefined) ->
     false;
 expired_credentials(Expiration) ->
     Now = calendar:datetime_to_gregorian_seconds(local_time()),
     Expires = calendar:datetime_to_gregorian_seconds(Expiration),
-    Now >= Expires.
+    Now >= (Expires - ?CREDENTIAL_REFRESH_BUFFER_SECONDS).
 
 -spec local_time() -> calendar:datetime().
-%% @doc Return the current local time.
+%% @doc Return the current UTC time. Callers compare this against UTC expiration
+%% timestamps, so it must be UTC. We read calendar:universal_time/0 directly
+%% rather than converting local time via local_time_to_universal_time_dst/1:
+%% that conversion returns two datetimes during a DST fall-back transition (the
+%% local hour is ambiguous) and none during a spring-forward gap, so matching a
+%% single [Value] crashed with badmatch in the transition window.
 %% @end
 local_time() ->
-    [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-    Value.
+    calendar:universal_time().
 
 -spec maybe_decode_body(ContentType :: {nonempty_string(), nonempty_string()}, Body :: body()) ->
     list() | body().
@@ -567,14 +606,30 @@ local_time() ->
 %% @end
 maybe_decode_body(_, <<>>) ->
     <<>>;
-maybe_decode_body({"application", "x-amz-json-1.0"}, Body) ->
-    aws_lib_json:decode(Body);
-maybe_decode_body({"application", "json"}, Body) ->
-    aws_lib_json:decode(Body);
-maybe_decode_body({_, "xml"}, Body) ->
+maybe_decode_body({"application", Subtype}, Body) ->
+    case is_json_subtype(Subtype) of
+        true -> aws_lib_json:decode(Body);
+        false -> maybe_decode_xml(Subtype, Body)
+    end;
+maybe_decode_body({_, Subtype}, Body) ->
+    maybe_decode_xml(Subtype, Body).
+
+maybe_decode_xml("xml", Body) ->
     aws_lib_xml:parse(Body);
-maybe_decode_body(_ContentType, Body) ->
+maybe_decode_xml(_Subtype, Body) ->
     Body.
+
+%% Recognise the JSON subtypes AWS services return. Covers plain `json', every
+%% AWS JSON protocol version (`x-amz-json-1.0', `x-amz-json-1.1', and any future
+%% `x-amz-json-*'), and the RFC 6839 structured `+json' suffix. Secrets Manager
+%% and other services use the JSON 1.1 protocol, so matching only 1.0/plain left
+%% those responses undecoded (issue #99).
+is_json_subtype("json") ->
+    true;
+is_json_subtype("x-amz-json-" ++ _Version) ->
+    true;
+is_json_subtype(Subtype) ->
+    lists:suffix("+json", Subtype).
 
 -spec parse_content_type(ContentType :: string()) -> {Type :: string(), Subtype :: string()}.
 %% @doc parse a content type string returning a tuple of type/subtype
@@ -756,17 +811,35 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
             {error, {credentials, Reason}}
     end.
 
+%% Add the state's AWS API timeout to the request options unless the caller
+%% already passed an explicit `timeout'. A per-request `timeout' option therefore
+%% takes precedence over the per-state value (aws_lib:set_timeout/2), which in
+%% turn falls back to ?DEFAULT_API_TIMEOUT via get_timeout/1.
+ensure_timeout_option(Options, State) ->
+    case proplists:is_defined(timeout, Options) of
+        true -> Options;
+        false -> [{timeout, get_timeout(State)} | Options]
+    end.
+
 %% Gun HTTP client functions
 gun_request(Method, URI, Headers, Body, Options) ->
-    {Host, Port, Path} = parse_uri(URI),
-    %% A connection failure is returned as {error, Reason} (not raised) so it
-    %% flows through format_response/1 into the {error, _, _} shape the retry
-    %% loop in api_request_with_retries/8 matches, rather than escaping it.
-    case create_gun_connection(Host, Port, Options) of
-        {ok, GunPid} ->
-            Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
-            gun:close(GunPid),
-            Reply;
+    %% A parse or connection failure is returned as {error, Reason} (not raised)
+    %% so it flows through format_response/1 into the {error, _, _} shape the
+    %% retry loop in api_request_with_retries/8 matches, rather than escaping it.
+    case aws_lib_uri:parse(URI) of
+        {ok, Uri} ->
+            Host = aws_lib_uri:host(Uri),
+            Port = aws_lib_uri:port(Uri),
+            %% target/1 carries the query: Path is the Gun request line.
+            Path = aws_lib_uri:target(Uri),
+            case create_gun_connection(Host, Port, Options) of
+                {ok, GunPid} ->
+                    Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
+                    gun:close(GunPid),
+                    Reply;
+                {error, _Reason} = Error ->
+                    format_response(Error)
+            end;
         {error, _Reason} = Error ->
             format_response(Error)
     end.
@@ -826,34 +899,6 @@ create_uri(Host, Path) when is_list(Path) ->
 create_uri(Host, {Bucket, Key}) ->
     "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
 
-parse_uri(URI) ->
-    case string:split(URI, "://", leading) of
-        [Scheme, Rest] ->
-            case string:split(Rest, "/", leading) of
-                [HostPort] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/"};
-                [HostPort, Path] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/" ++ Path}
-            end
-    end.
-
-parse_host_port(HostPort, Scheme) ->
-    DefaultPort =
-        case Scheme of
-            "https" -> 443;
-            "http" -> 80;
-            % Fallback to HTTPS
-            _ -> 443
-        end,
-    case string:split(HostPort, ":", trailing) of
-        [Host] ->
-            {Host, DefaultPort};
-        [Host, PortStr] ->
-            {Host, list_to_integer(PortStr)}
-    end.
-
 status_text(200) -> "OK";
 status_text(206) -> "Partial Content";
 status_text(400) -> "Bad Request";
@@ -881,7 +926,7 @@ direct_gun_request(GunPid, Method, Path, Headers, Body, Options) ->
         end,
         Headers
     ),
-    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_HTTP_TIMEOUT),
+    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
     Response =
         try
             StreamRef = do_gun_request(GunPid, Method, Path, HeadersBin, Body),

@@ -111,6 +111,57 @@ cn_endpoint_host_test_() ->
         end}
     ].
 
+%% End-to-end guard for the DescribeVolumes response path: a real DescribeVolumes
+%% XML document decoded by aws_lib_xml:parse/1 must still parse into the expected
+%% volumes list. This pins the shape parse_volumes_response/1 depends on, so a
+%% change to the XML parser cannot silently break it.
+parse_volumes_response_test_() ->
+    [
+        {"a two-volume response parses into a volumes list", fun() ->
+            Xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<DescribeVolumesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\">"
+                "<volumeSet>"
+                "<item>"
+                "<volumeId>vol-1111</volumeId><size>8</size>"
+                "<volumeType>gp3</volumeType><status>in-use</status>"
+                "<attachmentSet><item>"
+                "<device>/dev/sda1</device><status>attached</status>"
+                "</item></attachmentSet>"
+                "</item>"
+                "<item>"
+                "<volumeId>vol-2222</volumeId><size>16</size>"
+                "<volumeType>gp2</volumeType><status>available</status>"
+                "<attachmentSet/>"
+                "</item>"
+                "</volumeSet>"
+                "</DescribeVolumesResponse>",
+            Parsed = aws_lib_xml:parse(Xml),
+            {ok, Volumes} = aws_lib:parse_volumes_response(Parsed),
+            ?assertEqual(2, length(Volumes)),
+            [V1, V2] = Volumes,
+            ?assertEqual("vol-1111", proplists:get_value(volume_id, V1)),
+            ?assertEqual("gp3", proplists:get_value(volume_type, V1)),
+            ?assertEqual(
+                [{device, "/dev/sda1"}, {state, "attached"}],
+                proplists:get_value(attachment, V1)
+            ),
+            ?assertEqual("vol-2222", proplists:get_value(volume_id, V2)),
+            ?assertEqual([], proplists:get_value(attachment, V2))
+        end}
+    ].
+
+timeout_test_() ->
+    [
+        {"defaults to the API timeout when unset", fun() ->
+            ?assertEqual(30000, aws_lib:get_timeout(aws_lib:new()))
+        end},
+        {"set_timeout/2 overrides the default", fun() ->
+            {ok, State} = aws_lib:set_timeout(60000, aws_lib:new()),
+            ?assertEqual(60000, aws_lib:get_timeout(State))
+        end}
+    ].
+
 expired_credentials_test_() ->
     {
         foreach,
@@ -123,8 +174,8 @@ expired_credentials_test_() ->
             {"true", fun() ->
                 Value = {{2016, 4, 1}, {12, 0, 0}},
                 Expectation = true,
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2016, 4, 1}, {12, 0, 0}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2016, 4, 1}, {12, 0, 0}}
                 end),
                 ?assertEqual(Expectation, aws_lib:expired_credentials(Value)),
                 meck:validate(calendar)
@@ -132,10 +183,29 @@ expired_credentials_test_() ->
             {"false", fun() ->
                 Value = {{2016, 5, 1}, {16, 30, 0}},
                 Expectation = false,
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2016, 4, 1}, {12, 0, 0}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2016, 4, 1}, {12, 0, 0}}
                 end),
                 ?assertEqual(Expectation, aws_lib:expired_credentials(Value)),
+                meck:validate(calendar)
+            end},
+            %% Within the refresh buffer window (#93): credentials that expire in
+            %% 4 minutes are still valid on the clock but are treated as expired
+            %% so they refresh before a request can start with them.
+            {"within refresh buffer is treated as expired", fun() ->
+                Now = {{2016, 4, 1}, {12, 0, 0}},
+                %% Expires 240s from now, inside the 300s buffer.
+                Expiration = {{2016, 4, 1}, {12, 4, 0}},
+                meck:expect(calendar, universal_time, fun() -> Now end),
+                ?assertEqual(true, aws_lib:expired_credentials(Expiration)),
+                meck:validate(calendar)
+            end},
+            %% Just outside the buffer window: expires in 6 minutes, still valid.
+            {"outside refresh buffer is still valid", fun() ->
+                Now = {{2016, 4, 1}, {12, 0, 0}},
+                Expiration = {{2016, 4, 1}, {12, 6, 0}},
+                meck:expect(calendar, universal_time, fun() -> Now end),
+                ?assertEqual(false, aws_lib:expired_credentials(Expiration)),
                 meck:validate(calendar)
             end},
             {"undefined", fun() ->
@@ -242,7 +312,7 @@ local_time_test_() ->
         [
             {"value", fun() ->
                 Value = {{2016, 5, 1}, {12, 0, 0}},
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) -> [Value] end),
+                meck:expect(calendar, universal_time, fun() -> Value end),
                 ?assertEqual(Value, aws_lib:local_time()),
                 meck:validate(calendar)
             end}
@@ -257,8 +327,21 @@ maybe_decode_body_test_() ->
             Expectation = [{"test", true}],
             ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
         end},
+        {"application/x-amz-json-1.1", fun() ->
+            %% The JSON 1.1 protocol (e.g. Secrets Manager) must decode too (#99).
+            ContentType = {"application", "x-amz-json-1.1"},
+            Body = "{\"test\": true}",
+            Expectation = [{"test", true}],
+            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
+        end},
         {"application/json", fun() ->
             ContentType = {"application", "json"},
+            Body = "{\"test\": true}",
+            Expectation = [{"test", true}],
+            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
+        end},
+        {"application/*+json structured suffix", fun() ->
+            ContentType = {"application", "vnd.api+json"},
             Body = "{\"test\": true}",
             Expectation = [{"test", true}],
             ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
@@ -272,6 +355,13 @@ maybe_decode_body_test_() ->
         {"text/html [unsupported]", fun() ->
             ContentType = {"text", "html"},
             Body = "<html><head></head><body></body></html>",
+            ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
+        end},
+        {"application/octet-stream is not decoded", fun() ->
+            %% A non-JSON application/* subtype must fall through undecoded, not
+            %% be treated as JSON.
+            ContentType = {"application", "octet-stream"},
+            Body = <<"raw bytes">>,
             ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
         end}
     ].
@@ -350,6 +440,58 @@ perform_request_test_() ->
                 end
             },
             {
+                "the state timeout reaches gun:await when no option is given",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State1} = aws_lib:set_region("us-east-1", State0),
+                    {ok, State} = aws_lib:set_timeout(45000, State1),
+                    Self = self(),
+                    meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                    meck:expect(gun, close, fun(_) -> ok end),
+                    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                    meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                    %% Capture the timeout gun:await/3 is called with.
+                    meck:expect(gun, await, fun(_Pid, _, Timeout) ->
+                        Self ! {await_timeout, Timeout},
+                        {response, fin, 200, []}
+                    end),
+                    {ok, _, _} = aws_lib:request("ec2", get, "/", "", [], [], State),
+                    receive
+                        {await_timeout, T} -> ?assertEqual(45000, T)
+                    after 1000 -> ?assert(false)
+                    end,
+                    meck:validate(gun)
+                end
+            },
+            {
+                "an explicit timeout option overrides the state timeout",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State1} = aws_lib:set_region("us-east-1", State0),
+                    {ok, State} = aws_lib:set_timeout(45000, State1),
+                    Self = self(),
+                    meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                    meck:expect(gun, close, fun(_) -> ok end),
+                    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                    meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                    meck:expect(gun, await, fun(_Pid, _, Timeout) ->
+                        Self ! {await_timeout, Timeout},
+                        {response, fin, 200, []}
+                    end),
+                    %% Options carries an explicit timeout that must win.
+                    {ok, _, _} = aws_lib:request("ec2", get, "/", "", [], [{timeout, 1234}], State),
+                    receive
+                        {await_timeout, T} -> ?assertEqual(1234, T)
+                    after 1000 -> ?assert(false)
+                    end,
+                    meck:validate(gun)
+                end
+            },
+            {
                 "await_body timeout is returned as a clean {error, timeout}",
                 fun() ->
                     State0 = set_test_credentials(
@@ -387,7 +529,7 @@ sign_headers_test_() ->
         [
             {"with security token", fun() ->
                 Value = {{2016, 5, 1}, {12, 0, 0}},
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) -> [Value] end),
+                meck:expect(calendar, universal_time, fun() -> Value end),
                 AccessKey = "AKIDEXAMPLE",
                 SecretKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
                 SecurityToken =
@@ -410,7 +552,7 @@ sign_headers_test_() ->
                         "AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT+FvwqnKwRcOIfrRh3c/L"}
                 ],
                 ?assertEqual(
-                    Expectation,
+                    {ok, Expectation},
                     aws_lib:sign_headers(
                         AccessKey,
                         SecretKey,
@@ -669,14 +811,12 @@ ensure_credentials_valid_test_() ->
 expired_imdsv2_token_test_() ->
     [
         {"imdsv2 token is valid", fun() ->
-            [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-            Now = calendar:datetime_to_gregorian_seconds(Value),
+            Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
             Imdsv2Token = #imdsv2token{token = "value", expiration = Now + 100},
             ?assertEqual(false, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end},
         {"imdsv2 token is expired", fun() ->
-            [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-            Now = calendar:datetime_to_gregorian_seconds(Value),
+            Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
             Imdsv2Token = #imdsv2token{token = "value", expiration = Now - 100},
             ?assertEqual(true, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end},
