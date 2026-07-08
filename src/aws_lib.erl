@@ -48,7 +48,7 @@
 -include_lib("kernel/include/logger.hrl").
 
 -opaque aws_state() :: #aws_state{}.
--type connection_handle() :: {pid(), string()}.
+-type connection_handle() :: {aws_lib_httpc:conn(), string()}.
 
 %%====================================================================
 %% State construction and accessors
@@ -207,17 +207,17 @@ open_connection(Service, Options, State0) ->
 
     Host = endpoint_host(Region, Service),
     Port = 443,
-    case create_gun_connection(Host, Port, Options) of
-        {ok, GunPid} ->
-            {ok, {GunPid, Service}, State1};
+    case aws_lib_httpc:open(Host, Port, gun_open_opts(Port, Options)) of
+        {ok, Conn} ->
+            {ok, {Conn, Service}, State1};
         {error, _Reason} = Error ->
             Error
     end.
 
 %% Close a direct connection
 -spec close_connection(Handle :: connection_handle()) -> ok.
-close_connection({GunPid, _Service}) ->
-    gun:close(GunPid).
+close_connection({Conn, _Service}) ->
+    aws_lib_httpc:close(Conn).
 
 -spec direct_request(
     Handle :: connection_handle(),
@@ -821,7 +821,9 @@ ensure_timeout_option(Options, State) ->
         false -> [{timeout, get_timeout(State)} | Options]
     end.
 
-%% Gun HTTP client functions
+%% Gun HTTP client functions. The Gun lifecycle itself lives in aws_lib_httpc;
+%% these functions build the AWS-API-specific request (URI parsing, connection
+%% options from Options) and shape the result via format_response/1.
 gun_request(Method, URI, Headers, Body, Options) ->
     %% A parse or connection failure is returned as {error, Reason} (not raised)
     %% so it flows through format_response/1 into the {error, _, _} shape the
@@ -832,35 +834,19 @@ gun_request(Method, URI, Headers, Body, Options) ->
             Port = aws_lib_uri:port(Uri),
             %% target/1 carries the query: Path is the Gun request line.
             Path = aws_lib_uri:target(Uri),
-            case create_gun_connection(Host, Port, Options) of
-                {ok, GunPid} ->
-                    Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
-                    gun:close(GunPid),
-                    Reply;
-                {error, _Reason} = Error ->
-                    format_response(Error)
-            end;
+            OpenOpts = gun_open_opts(Port, Options),
+            Response = aws_lib_httpc:request(
+                Host, Port, Method, Path, Headers, Body, OpenOpts
+            ),
+            format_response(Response);
         {error, _Reason} = Error ->
             format_response(Error)
     end.
 
-do_gun_request(ConnPid, get, Path, Headers, _Body) ->
-    gun:get(ConnPid, Path, Headers);
-do_gun_request(ConnPid, post, Path, Headers, Body) ->
-    gun:post(ConnPid, Path, Headers, Body, #{});
-do_gun_request(ConnPid, put, Path, Headers, Body) ->
-    gun:put(ConnPid, Path, Headers, Body, #{});
-do_gun_request(ConnPid, head, Path, Headers, _Body) ->
-    gun:head(ConnPid, Path, Headers, #{});
-do_gun_request(ConnPid, delete, Path, Headers, _Body) ->
-    gun:delete(ConnPid, Path, Headers, #{});
-do_gun_request(ConnPid, patch, Path, Headers, Body) ->
-    gun:patch(ConnPid, Path, Headers, Body, #{});
-do_gun_request(ConnPid, options, Path, Headers, _Body) ->
-    gun:options(ConnPid, Path, Headers, #{}).
-
-create_gun_connection(Host, Port, Options) ->
-    % Map HTTP version to Gun protocols, always include http as fallback
+%% Build aws_lib_httpc open options from the request Options and target port:
+%% derive Gun protocols from the requested HTTP version, use TLS on port 443,
+%% and thread the connect and request timeouts through.
+gun_open_opts(Port, Options) ->
     HttpVersion = proplists:get_value(version, Options, "HTTP/1.1"),
     Protocols =
         case HttpVersion of
@@ -871,28 +857,17 @@ create_gun_connection(Host, Port, Options) ->
             % Default: try HTTP/2, fallback to HTTP/1.1
             _ -> [http2, http]
         end,
-    ConnectTimeout = proplists:get_value(connect_timeout, Options, infinity),
-    Opts = #{
-        transport =>
-            if
-                Port == 443 -> tls;
-                true -> tcp
-            end,
+    Transport =
+        if
+            Port == 443 -> tls;
+            true -> tcp
+        end,
+    #{
+        transport => Transport,
         protocols => Protocols,
-        connect_timeout => ConnectTimeout
-    },
-    case gun:open(Host, Port, Opts) of
-        {ok, ConnPid} ->
-            case gun:await_up(ConnPid, ConnectTimeout) of
-                {ok, _Protocol} ->
-                    {ok, ConnPid};
-                {error, Reason} ->
-                    gun:close(ConnPid),
-                    {error, {gun_connection_failed, Reason}}
-            end;
-        {error, Reason} ->
-            {error, {gun_open_failed, Reason}}
-    end.
+        connect_timeout => proplists:get_value(connect_timeout, Options, infinity),
+        timeout => proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT)
+    }.
 
 create_uri(Host, Path) when is_list(Path) ->
     "https://" ++ Host ++ Path;
@@ -910,48 +885,22 @@ status_text(500) -> "Internal Server Error";
 status_text(Code) -> integer_to_list(Code).
 
 -spec direct_gun_request(
-    GunPid :: pid(),
+    Conn :: aws_lib_httpc:conn(),
     Method :: method(),
-    Path :: path(),
+    Path :: path() | {term(), path()},
     Headers :: headers(),
     Body :: body(),
     Options :: list()
 ) -> result().
-direct_gun_request(GunPid, Method, {_, Path}, Headers, Body, Options) ->
-    direct_gun_request(GunPid, Method, [$/ | Path], Headers, Body, Options);
-direct_gun_request(GunPid, Method, Path, Headers, Body, Options) ->
-    HeadersBin = lists:map(
-        fun({Key, Value}) ->
-            {list_to_binary(Key), list_to_binary(Value)}
-        end,
-        Headers
-    ),
+%% Issue a request on an already-open connection (the two-step API). The Gun
+%% lifecycle lives in aws_lib_httpc; this resolves the request timeout and
+%% shapes the result. A {_, Path} tuple (S3 bucket/key) is normalized to an
+%% absolute path first.
+direct_gun_request(Conn, Method, {_, Path}, Headers, Body, Options) ->
+    direct_gun_request(Conn, Method, [$/ | Path], Headers, Body, Options);
+direct_gun_request(Conn, Method, Path, Headers, Body, Options) ->
     Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
-    Response =
-        try
-            StreamRef = do_gun_request(GunPid, Method, Path, HeadersBin, Body),
-            case gun:await(GunPid, StreamRef, Timeout) of
-                {response, fin, Status, RespHeaders} ->
-                    {ok, {{http_version, Status, status_text(Status)}, RespHeaders, <<>>}};
-                {response, nofin, Status, RespHeaders} ->
-                    %% await_body/3 can return {error, timeout} (and other
-                    %% {error, _} reasons); surface it cleanly rather than
-                    %% letting a hard match turn it into a {badmatch, _} term.
-                    case gun:await_body(GunPid, StreamRef, Timeout) of
-                        {ok, RespBody} ->
-                            {ok, {
-                                {http_version, Status, status_text(Status)}, RespHeaders, RespBody
-                            }};
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
-                {error, Reason} ->
-                    {error, Reason}
-            end
-        catch
-            _:Error ->
-                {error, Error}
-        end,
+    Response = aws_lib_httpc:request(Conn, Method, Path, Headers, Body, Timeout),
     format_response(Response).
 
 -spec parse_volumes_response(term()) -> {'ok', volumes_list()} | {'error', 'parse_error'}.
