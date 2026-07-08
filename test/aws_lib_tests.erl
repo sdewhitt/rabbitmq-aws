@@ -189,6 +189,25 @@ expired_credentials_test_() ->
                 ?assertEqual(Expectation, aws_lib:expired_credentials(Value)),
                 meck:validate(calendar)
             end},
+            %% Within the refresh buffer window (#93): credentials that expire in
+            %% 4 minutes are still valid on the clock but are treated as expired
+            %% so they refresh before a request can start with them.
+            {"within refresh buffer is treated as expired", fun() ->
+                Now = {{2016, 4, 1}, {12, 0, 0}},
+                %% Expires 240s from now, inside the 300s buffer.
+                Expiration = {{2016, 4, 1}, {12, 4, 0}},
+                meck:expect(calendar, universal_time, fun() -> Now end),
+                ?assertEqual(true, aws_lib:expired_credentials(Expiration)),
+                meck:validate(calendar)
+            end},
+            %% Just outside the buffer window: expires in 6 minutes, still valid.
+            {"outside refresh buffer is still valid", fun() ->
+                Now = {{2016, 4, 1}, {12, 0, 0}},
+                Expiration = {{2016, 4, 1}, {12, 6, 0}},
+                meck:expect(calendar, universal_time, fun() -> Now end),
+                ?assertEqual(false, aws_lib:expired_credentials(Expiration)),
+                meck:validate(calendar)
+            end},
             {"undefined", fun() ->
                 ?assertEqual(false, aws_lib:expired_credentials(undefined))
             end}
