@@ -229,22 +229,9 @@ resolve_request_state(Params) ->
             end
     end.
 
-%% The operator-configured boot-time assume role (aws.arns.assume_role_arn),
-%% read from the same `aws, arn_config' env the boot sequence uses
-%% (aws_arn_config:maybe_assume_role/1). Returns the role ARN string, or `none'
-%% when unset.
+%% The operator-configured boot-time assume role (shared helper).
 configured_assume_role_arn() ->
-    case application:get_env(aws, arn_config) of
-        {ok, ArnConfig} when is_list(ArnConfig) ->
-            case proplists:get_value(assume_role_arn, ArnConfig) of
-                undefined -> none;
-                Arn when is_list(Arn) -> Arn;
-                Arn when is_binary(Arn) -> binary_to_list(Arn);
-                _ -> none
-            end;
-        _ ->
-            none
-    end.
+    aws_auth_validate_ssl:configured_assume_role_arn().
 
 %%--------------------------------------------------------------------
 %% Input parsing
@@ -352,7 +339,7 @@ resolve_cacert(#{ssl_options := SslOpts, aws_state := State} = Params) ->
                     %% certless PEM returns `skip'. Both mean the ARN does not
                     %% hold a usable CA cert -- report input_invalid rather than
                     %% degrading the trust anchor.
-                    try decode_pem_cacerts(PemData) of
+                    try aws_auth_validate_ssl:decode_pem_cacerts(PemData) of
                         skip -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID};
                         Certs -> {ok, Params#{ssl_options => SslOpts#{cacerts => Certs}}}
                     catch
@@ -1008,10 +995,10 @@ maybe_start_tls(Handle, true, SslOpts, Timeout) ->
 build_ssl_opts(Map) when is_map(Map) ->
     Pairs = [
         {cacerts, cacerts, fun(Certs) -> Certs end},
-        {verify, <<"verify">>, fun to_verify/1},
-        {depth, <<"depth">>, fun to_integer/1},
-        {versions, <<"versions">>, fun to_versions/1},
-        {server_name_indication, <<"server_name_indication">>, fun to_list/1}
+        {verify, <<"verify">>, fun aws_auth_validate_ssl:to_verify/1},
+        {depth, <<"depth">>, fun aws_auth_validate_ssl:to_integer/1},
+        {versions, <<"versions">>, fun aws_auth_validate_ssl:to_versions/1},
+        {server_name_indication, <<"server_name_indication">>, fun aws_auth_validate_ssl:to_list/1}
     ],
     Translated = lists:foldl(
         fun({SslKey, JsonKey, Fun}, Acc) ->
@@ -1042,101 +1029,30 @@ add_ssl_opt(SslKey, Fun, Value, Acc) ->
 %% config error, breaking decision parity. With no trust source we therefore
 %% leave `verify' unset (broker-parity verify_none). An explicit `verify'
 %% from the caller is always left untouched (verify_none stays opt-in).
+%% OTP's ssl defaults `verify' to verify_none. When the caller did not specify
+%% `verify', prefer verify_peer -- but only when a trust anchor is available (the
+%% caller's cacertfile_arn, or the host OS store). trust_source/1 is shared with
+%% the http/oauth backends (aws_auth_validate_ssl). An explicit `verify' is left
+%% untouched.
 apply_verify_default(Opts) ->
     case lists:keymember(verify, 1, Opts) of
         true ->
             Opts;
         false ->
-            case trust_source(Opts) of
+            case aws_auth_validate_ssl:trust_source(Opts) of
                 {ok, Opts1} -> [{verify, verify_peer} | Opts1];
                 none -> Opts
             end
     end.
 
-%% Returns {ok, OptsWithCacerts} when a trust anchor is available (either the
-%% caller already supplied cacerts, or the OS trust store is non-empty, in
-%% which case it is added), or `none' when nothing can verify the peer.
-trust_source(Opts) ->
-    case lists:keymember(cacerts, 1, Opts) of
-        true ->
-            {ok, Opts};
-        false ->
-            case os_cacerts() of
-                [] -> none;
-                Certs -> {ok, [{cacerts, Certs} | Opts]}
-            end
-    end.
-
-os_cacerts() ->
-    try
-        public_key:cacerts_get()
-    catch
-        _:_ -> []
-    end.
-
-to_list(B) when is_binary(B) -> binary_to_list(B);
-to_list(L) when is_list(L) -> L.
-
-%% Map the validated `verify' binary to its ssl atom via an explicit table,
-%% NOT binary_to_existing_atom: those atoms (verify_peer/verify_none) only
-%% exist once the ssl app has been loaded, and build_ssl_opts runs while
-%% assembling eldap:open options -- before ssl is guaranteed loaded -- so
-%% binary_to_existing_atom would raise badarg on a perfectly valid request.
-%% parse_ssl_options/2 has already constrained the value to this domain.
-to_verify(<<"verify_peer">>) -> verify_peer;
-to_verify(<<"verify_none">>) -> verify_none.
-
-to_integer(I) when is_integer(I) -> I.
-
-%% Map each validated TLS version binary to its ssl atom via an explicit
-%% table, for the same reason as to_verify/1 (the version atoms are not
-%% guaranteed to exist when build_ssl_opts runs). parse_ssl_options/2 has
-%% already constrained every element to this domain.
-to_versions(L) when is_list(L) ->
-    [to_version(V) || V <- L].
-
-to_version(<<"tlsv1.3">>) -> 'tlsv1.3';
-to_version(<<"tlsv1.2">>) -> 'tlsv1.2';
-to_version(<<"tlsv1.1">>) -> 'tlsv1.1';
-to_version(<<"tlsv1">>) -> tlsv1.
-
-%% Decode a CA-bundle PEM into the raw DER binaries ssl's `cacerts' option
-%% expects. eldap has NO special cacerts contract: build_ssl_opts/1's proplist
-%% is handed to eldap:open/2 as {sslopts, _} and to eldap:start_tls/3, both of
-%% which forward it straight to the `ssl' module -- the same ssl httpc uses. ssl
-%% silently ignores decoded #'OTPCertificate'{} records (pem_entry_decode/1
-%% output) as a trust anchor -> unknown_ca -> a spurious tls_failed. So pass raw
-%% DER, exactly as the HTTP backend's decode_pem_cacerts/1 now does. Returns
-%% `skip' when the data holds no certificate entries (so resolve_cacert/1 can
-%% reject it as input_invalid rather than proceeding with an empty trust set).
-decode_pem_cacerts(B) when is_binary(B) ->
-    case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(B)] of
-        [] -> skip;
-        Ders -> Ders
-    end.
-
 %%--------------------------------------------------------------------
 
-%% Resolve an ARN using the request's threaded aws_state(). The state is built
-%% once per request by resolve_request_state/1 with the operator-configured
-%% assume_role assumed (a request with no configured role is refused before
-%% reaching here) and passed to every ARN fetch in the request. Region and
-%% credentials live in that value, not a shared singleton, so concurrent
-%% validations cannot clobber each other. R6 is preserved -- resolution runs in
-%% the caller process and the
-%% resolved secret is neither logged nor returned (only adapted to the caller's
-%% {ok, Binary} contract). R3 is preserved -- this still runs only after the pure
-%% validation pipeline. The 3-tuple {ok, Data, State1} from
-%% aws_arn_util:resolve_arn/2 is adapted back to the {ok, Binary} contract the
-%% callers expect; the returned state is request-scoped and discarded here.
+%% Resolve an ARN using the request's threaded aws_state() (shared helper). The
+%% state is built once per request by resolve_request_state/1 under the
+%% operator-configured assume_role. R6: the resolved secret is neither logged nor
+%% returned; R3: this runs only after the pure validation pipeline.
 resolve_arn(Arn, State) when is_binary(Arn) ->
-    case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
-        {ok, Data, _State1} -> {ok, Data};
-        {error, _} = Error -> Error
-    end.
+    aws_auth_validate_ssl:resolve_arn(Arn, State).
 
 connection_timeout_ms() ->
-    case application:get_env(aws, auth_validation_connection_timeout_ms) of
-        {ok, Ms} when is_integer(Ms), Ms > 0, Ms =< 60_000 -> Ms;
-        _ -> ?DEFAULT_TIMEOUT_MS
-    end.
+    aws_auth_validate_ssl:connection_timeout_ms(#{default => ?DEFAULT_TIMEOUT_MS, max => 60_000}).
