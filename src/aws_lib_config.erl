@@ -66,10 +66,10 @@
 %%      credentials.
 %%
 %%      When the EC2 instance metadata server is checked for but does not exist,
-%%      the operation will timeout in ``?DEFAULT_HTTP_TIMEOUT``ms.
+%%      the operation will timeout in ``?DEFAULT_IMDS_TIMEOUT``ms.
 %%
 %%      When the EC2 instance metadata server exists, but data is not returned
-%%      quickly, the operation will timeout in ``?DEFAULT_HTTP_TIMEOUT``ms.
+%%      quickly, the operation will timeout in ``?DEFAULT_IMDS_TIMEOUT``ms.
 %%
 %%      If the service does exist, it will attempt to use the
 %%      ``/meta-data/iam/security-credentials`` endpoint to request expiring
@@ -115,10 +115,10 @@ credentials(Config) ->
 %%      credentials.
 %%
 %%      When the EC2 instance metadata server is checked for but does not exist,
-%%      the operation will timeout in ``?DEFAULT_HTTP_TIMEOUT``ms.
+%%      the operation will timeout in ``?DEFAULT_IMDS_TIMEOUT``ms.
 %%
 %%      When the EC2 instance metadata server exists, but data is not returned
-%%      quickly, the operation will timeout in ``?DEFAULT_HTTP_TIMEOUT``ms.
+%%      quickly, the operation will timeout in ``?DEFAULT_IMDS_TIMEOUT``ms.
 %%
 %%      If the service does exist, it will attempt to use the
 %%      ``/meta-data/iam/security-credentials`` endpoint to request expiring
@@ -766,11 +766,11 @@ maybe_get_region_from_instance_metadata(Config) ->
 perform_http_get_with_conn(ConnPid, Path, Config) ->
     {ok, Headers, Config1} = instance_metadata_request_headers(Config),
     StreamRef = gun:get(ConnPid, Path, Headers),
-    case gun:await(ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT) of
+    case gun:await(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
         {response, fin, Status, RespHeaders} ->
             {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, <<>>}, Config1};
         {response, nofin, Status, RespHeaders} ->
-            case gun:await_body(ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT) of
+            case gun:await_body(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
                 {ok, Body} ->
                     {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, Body},
                         Config1};
@@ -881,7 +881,7 @@ perform_http_get_instance_metadata_conn(Uri, Config) ->
                     {ok, Headers, Config1} = instance_metadata_request_headers(Config),
                     StreamRef = gun:get(ConnPid, Path, Headers),
                     Result =
-                        case gun:await(ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT) of
+                        case gun:await(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
                             {response, fin, Status, RespHeaders} ->
                                 {ok,
                                     {
@@ -893,7 +893,7 @@ perform_http_get_instance_metadata_conn(Uri, Config) ->
                             {response, nofin, Status, RespHeaders} ->
                                 case
                                     gun:await_body(
-                                        ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT
+                                        ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT
                                     )
                                 of
                                     {ok, Body} ->
@@ -1011,7 +1011,7 @@ load_imdsv2_token(Uri) ->
                     ],
                     StreamRef = gun:put(ConnPid, Path, Headers, <<>>),
                     Result =
-                        case gun:await(ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT) of
+                        case gun:await(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
                             {response, fin, 200, _RespHeaders} ->
                                 ?LOG_DEBUG("Successfully obtained EC2 IMDSv2 token."),
                                 % Empty body for fin response
@@ -1019,7 +1019,7 @@ load_imdsv2_token(Uri) ->
                             {response, nofin, 200, _RespHeaders} ->
                                 case
                                     gun:await_body(
-                                        ConnPid, StreamRef, ?DEFAULT_HTTP_TIMEOUT
+                                        ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT
                                     )
                                 of
                                     {ok, Body} ->

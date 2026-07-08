@@ -151,6 +151,17 @@ parse_volumes_response_test_() ->
         end}
     ].
 
+timeout_test_() ->
+    [
+        {"defaults to the API timeout when unset", fun() ->
+            ?assertEqual(30000, aws_lib:get_timeout(aws_lib:new()))
+        end},
+        {"set_timeout/2 overrides the default", fun() ->
+            {ok, State} = aws_lib:set_timeout(60000, aws_lib:new()),
+            ?assertEqual(60000, aws_lib:get_timeout(State))
+        end}
+    ].
+
 expired_credentials_test_() ->
     {
         foreach,
@@ -406,6 +417,58 @@ perform_request_test_() ->
                     ?assertEqual([{<<"content-type">>, <<"application/json">>}], Headers1),
                     ?assertEqual([{"pass", true}], Body1),
                     ?assert(is_record(State1, aws_state)),
+                    meck:validate(gun)
+                end
+            },
+            {
+                "the state timeout reaches gun:await when no option is given",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State1} = aws_lib:set_region("us-east-1", State0),
+                    {ok, State} = aws_lib:set_timeout(45000, State1),
+                    Self = self(),
+                    meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                    meck:expect(gun, close, fun(_) -> ok end),
+                    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                    meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                    %% Capture the timeout gun:await/3 is called with.
+                    meck:expect(gun, await, fun(_Pid, _, Timeout) ->
+                        Self ! {await_timeout, Timeout},
+                        {response, fin, 200, []}
+                    end),
+                    {ok, _, _} = aws_lib:request("ec2", get, "/", "", [], [], State),
+                    receive
+                        {await_timeout, T} -> ?assertEqual(45000, T)
+                    after 1000 -> ?assert(false)
+                    end,
+                    meck:validate(gun)
+                end
+            },
+            {
+                "an explicit timeout option overrides the state timeout",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State1} = aws_lib:set_region("us-east-1", State0),
+                    {ok, State} = aws_lib:set_timeout(45000, State1),
+                    Self = self(),
+                    meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                    meck:expect(gun, close, fun(_) -> ok end),
+                    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                    meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                    meck:expect(gun, await, fun(_Pid, _, Timeout) ->
+                        Self ! {await_timeout, Timeout},
+                        {response, fin, 200, []}
+                    end),
+                    %% Options carries an explicit timeout that must win.
+                    {ok, _, _} = aws_lib:request("ec2", get, "/", "", [], [{timeout, 1234}], State),
+                    receive
+                        {await_timeout, T} -> ?assertEqual(1234, T)
+                    after 1000 -> ?assert(false)
+                    end,
                     meck:validate(gun)
                 end
             },
