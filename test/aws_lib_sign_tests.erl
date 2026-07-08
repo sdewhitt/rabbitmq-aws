@@ -427,7 +427,7 @@ headers_test_() ->
                     {"x-amz-content-sha256",
                         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
                 ],
-                ?assertEqual(Expectation, aws_lib_sign:headers(Request)),
+                ?assertEqual({ok, Expectation}, aws_lib_sign:headers(Request)),
                 meck:validate(calendar)
             end},
             {"with host header", fun() ->
@@ -453,7 +453,22 @@ headers_test_() ->
                     {"x-amz-content-sha256",
                         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
                 ],
-                ?assertEqual(Expectation, aws_lib_sign:headers(Request)),
+                ?assertEqual({ok, Expectation}, aws_lib_sign:headers(Request)),
                 meck:validate(calendar)
+            end},
+            {"a malformed request URI is reported, not crashed", fun() ->
+                Request = #request{
+                    access_key = "AKIDEXAMPLE",
+                    secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                    service = "iam",
+                    method = get,
+                    uri = "not-a-uri",
+                    body = "",
+                    headers = []
+                },
+                ?assertEqual(
+                    {error, {malformed_uri, "not-a-uri"}},
+                    aws_lib_sign:headers(Request)
+                )
             end}
         ]}.

@@ -20,8 +20,9 @@
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
 
--spec headers(request()) -> headers().
-%% @doc Create the signed request headers
+-spec headers(request()) -> {ok, headers()} | {error, {malformed_uri, string()}}.
+%% @doc Create the signed request headers, or {error, {malformed_uri, _}} when
+%% the request URI cannot be parsed.
 %% end
 headers(Request) ->
     headers(Request, undefined).
@@ -29,9 +30,16 @@ headers(Request) ->
 headers(Request, undefined) ->
     headers(Request, sha256(Request#request.body));
 headers(Request, PayloadHash) ->
+    case aws_lib_uri:parse(Request#request.uri) of
+        {ok, URI} ->
+            {ok, headers(Request, PayloadHash, URI)};
+        {error, _} = Error ->
+            Error
+    end.
+
+headers(Request, PayloadHash, URI) ->
     RequestTimestamp = local_time(),
-    URI = aws_lib_uri:parse(Request#request.uri),
-    {_, Host, _} = URI#uri.authority,
+    Host = aws_lib_uri:host(URI),
 
     Headers = append_headers(
         RequestTimestamp,
@@ -43,8 +51,8 @@ headers(Request, PayloadHash) ->
     ),
     RequestHash = request_hash(
         Request#request.method,
-        URI#uri.path,
-        URI#uri.query,
+        aws_lib_uri:path(URI),
+        aws_lib_uri:query(URI),
         Headers,
         PayloadHash
     ),
@@ -200,7 +208,7 @@ local_time({{Y, M, D}, {HH, MM, SS}}) ->
 %% @doc Return the sorted query string for the specified arguments.
 %% @end
 query_string(undefined) -> "";
-query_string(QueryArgs) -> aws_lib_uri:build_query_string(lists:keysort(1, QueryArgs)).
+query_string(QueryArgs) -> aws_lib_uri:compose_query(lists:keysort(1, QueryArgs)).
 
 -spec request_hash(
     Method :: method(),

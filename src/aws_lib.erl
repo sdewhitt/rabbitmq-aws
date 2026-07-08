@@ -20,7 +20,6 @@
     set_credentials/3,
     set_credentials/4,
     has_credentials/1,
-    parse_uri/1,
     ensure_credentials_valid/1,
     ensure_imdsv2_token_valid/1,
     expired_imdsv2_token/1,
@@ -240,22 +239,28 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
             Host = endpoint_host(Region, Service),
             URI = create_uri(Host, Path),
             BodyHash = proplists:get_value(payload_hash, Options),
-            SignedHeaders = sign_headers(
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Region,
-                Service,
-                Method,
-                URI,
-                Headers,
-                Body,
-                BodyHash
-            ),
-            case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options) of
-                {ok, Response} ->
-                    {ok, Response, State1};
-                Error ->
+            case
+                sign_headers(
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Region,
+                    Service,
+                    Method,
+                    URI,
+                    Headers,
+                    Body,
+                    BodyHash
+                )
+            of
+                {ok, SignedHeaders} ->
+                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options) of
+                        {ok, Response} ->
+                            {ok, Response, State1};
+                        Error ->
+                            Error
+                    end;
+                {error, _} = Error ->
                     Error
             end;
         undefined ->
@@ -273,7 +278,7 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
     Headers :: headers(),
     Body :: body(),
     BodyHash :: iodata() | undefined
-) -> headers().
+) -> {ok, headers()} | {error, {malformed_uri, string()}}.
 sign_headers(
     AccessKey, SecretKey, SecurityToken, Region, Service, Method, URI, Headers, Body, BodyHash
 ) ->
@@ -424,22 +429,28 @@ perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, Stat
                 end,
 
             URI = endpoint(Region, Host, Service, Path),
-            SignedHeaders = sign_headers(
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Region,
-                Service,
-                Method,
-                URI,
-                Headers,
-                Body,
-                undefined
-            ),
-            case gun_request(Method, URI, SignedHeaders, Body, Options) of
-                {ok, Response} ->
-                    {ok, Response, State1};
-                Error ->
+            case
+                sign_headers(
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Region,
+                    Service,
+                    Method,
+                    URI,
+                    Headers,
+                    Body,
+                    undefined
+                )
+            of
+                {ok, SignedHeaders} ->
+                    case gun_request(Method, URI, SignedHeaders, Body, Options) of
+                        {ok, Response} ->
+                            {ok, Response, State1};
+                        Error ->
+                            Error
+                    end;
+                {error, _} = Error ->
                     Error
             end;
         undefined ->
@@ -758,15 +769,23 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
 
 %% Gun HTTP client functions
 gun_request(Method, URI, Headers, Body, Options) ->
-    {Host, Port, Path} = parse_uri(URI),
-    %% A connection failure is returned as {error, Reason} (not raised) so it
-    %% flows through format_response/1 into the {error, _, _} shape the retry
-    %% loop in api_request_with_retries/8 matches, rather than escaping it.
-    case create_gun_connection(Host, Port, Options) of
-        {ok, GunPid} ->
-            Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
-            gun:close(GunPid),
-            Reply;
+    %% A parse or connection failure is returned as {error, Reason} (not raised)
+    %% so it flows through format_response/1 into the {error, _, _} shape the
+    %% retry loop in api_request_with_retries/8 matches, rather than escaping it.
+    case aws_lib_uri:parse(URI) of
+        {ok, Uri} ->
+            Host = aws_lib_uri:host(Uri),
+            Port = aws_lib_uri:port(Uri),
+            %% target/1 carries the query: Path is the Gun request line.
+            Path = aws_lib_uri:target(Uri),
+            case create_gun_connection(Host, Port, Options) of
+                {ok, GunPid} ->
+                    Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
+                    gun:close(GunPid),
+                    Reply;
+                {error, _Reason} = Error ->
+                    format_response(Error)
+            end;
         {error, _Reason} = Error ->
             format_response(Error)
     end.
@@ -825,34 +844,6 @@ create_uri(Host, Path) when is_list(Path) ->
     "https://" ++ Host ++ Path;
 create_uri(Host, {Bucket, Key}) ->
     "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
-
-parse_uri(URI) ->
-    case string:split(URI, "://", leading) of
-        [Scheme, Rest] ->
-            case string:split(Rest, "/", leading) of
-                [HostPort] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/"};
-                [HostPort, Path] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/" ++ Path}
-            end
-    end.
-
-parse_host_port(HostPort, Scheme) ->
-    DefaultPort =
-        case Scheme of
-            "https" -> 443;
-            "http" -> 80;
-            % Fallback to HTTPS
-            _ -> 443
-        end,
-    case string:split(HostPort, ":", trailing) of
-        [Host] ->
-            {Host, DefaultPort};
-        [Host, PortStr] ->
-            {Host, list_to_integer(PortStr)}
-    end.
 
 status_text(200) -> "OK";
 status_text(206) -> "Partial Content";

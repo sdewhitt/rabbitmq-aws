@@ -96,24 +96,8 @@
 }).
 %% Type aws_state() and related result types are defined in aws_lib.erl
 
--type scheme() :: atom().
--type username() :: string().
--type password() :: string().
 -type host() :: string().
--type tcp_port() :: integer().
 -type query_args() :: [tuple() | string()].
--type fragment() :: string().
-
--type userinfo() :: {undefined | username(), undefined | password()}.
-
--type authority() :: {undefined | userinfo(), host(), undefined | tcp_port()}.
--record(uri, {
-    scheme :: undefined | scheme(),
-    authority :: authority(),
-    path :: undefined | path(),
-    query :: undefined | query_args(),
-    fragment :: undefined | fragment()
-}).
 
 -type method() :: head | get | put | post | trace | options | delete | patch.
 -type http_version() :: string().
