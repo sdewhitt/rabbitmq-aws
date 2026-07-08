@@ -63,12 +63,12 @@ name() ->
         "value"
     ]).
 
-%% A non-empty value drawn from a small FIXED pool. Like element names,
-%% xmerl_scan interns attribute values as atoms, so unbounded distinct values
-%% exhaust the atom table over many iterations. A fixed pool bounds the atom
-%% count while still varying which value appears where. Values contain no
-%% whitespace or XML metacharacters, so they need no escaping and are not
-%% touched by the parser's whitespace stripping.
+%% A non-empty value drawn from a small FIXED pool. Unlike element and attribute
+%% NAMES (which xmerl_scan interns as atoms -- see name/0), attribute and text
+%% VALUES are NOT interned, so a pool is not required here for atom safety. It is
+%% used for simplicity and to keep values realistic: they contain no whitespace
+%% or XML metacharacters, so they need no escaping and are not touched by the
+%% parser's whitespace stripping.
 value() ->
     elements([
         "vol-1111",
