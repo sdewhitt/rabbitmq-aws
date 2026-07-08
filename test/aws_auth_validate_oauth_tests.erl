@@ -361,6 +361,33 @@ oidc_discovery_success_test_() ->
         [?_assertEqual(ok, Result)]
     end}.
 
+%% A discovery doc whose jwks_uri points at IMDS is rejected, not dereferenced.
+oidc_discovery_jwks_uri_ssrf_denied_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        JwksBody = rabbit_json:encode(#{
+            <<"keys">> => [#{<<"kty">> => <<"RSA">>, <<"kid">> => <<"k1">>}]
+        }),
+        DiscoveryBody = rabbit_json:encode(#{
+            <<"issuer">> => <<"https://idp.example.com">>,
+            <<"jwks_uri">> => <<"https://169.254.169.254/latest/meta-data/jwks">>
+        }),
+        %% Sequence: first call = discovery, second call = JWKS fetch (never
+        %% reached if the SSRF guard rejects the derived jwks_uri).
+        meck:expect(httpc, request, fun(_Method, Req, _HttpOpts, _Opts, _Profile) ->
+            Url = request_url(Req),
+            case string:find(Url, "openid-configuration") of
+                nomatch -> {ok, {{"HTTP/1.1", 200, "OK"}, [], JwksBody}};
+                _ -> {ok, {{"HTTP/1.1", 200, "OK"}, [], DiscoveryBody}}
+            end
+        end),
+        mock_arn_resolve_noop(),
+        Result = aws_auth_validate_oauth:validate(issuer_body()),
+        [
+            ?_assertMatch({error, input_invalid, _}, Result),
+            ?_assertEqual(1, meck:num_calls(httpc, request, '_'))
+        ]
+    end}.
+
 %%--------------------------------------------------------------------
 %% R6: no secret leakage in error results
 %%--------------------------------------------------------------------
