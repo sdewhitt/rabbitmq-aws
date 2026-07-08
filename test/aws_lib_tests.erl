@@ -257,8 +257,21 @@ maybe_decode_body_test_() ->
             Expectation = [{"test", true}],
             ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
         end},
+        {"application/x-amz-json-1.1", fun() ->
+            %% The JSON 1.1 protocol (e.g. Secrets Manager) must decode too (#99).
+            ContentType = {"application", "x-amz-json-1.1"},
+            Body = "{\"test\": true}",
+            Expectation = [{"test", true}],
+            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
+        end},
         {"application/json", fun() ->
             ContentType = {"application", "json"},
+            Body = "{\"test\": true}",
+            Expectation = [{"test", true}],
+            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
+        end},
+        {"application/*+json structured suffix", fun() ->
+            ContentType = {"application", "vnd.api+json"},
             Body = "{\"test\": true}",
             Expectation = [{"test", true}],
             ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
@@ -272,6 +285,13 @@ maybe_decode_body_test_() ->
         {"text/html [unsupported]", fun() ->
             ContentType = {"text", "html"},
             Body = "<html><head></head><body></body></html>",
+            ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
+        end},
+        {"application/octet-stream is not decoded", fun() ->
+            %% A non-JSON application/* subtype must fall through undecoded, not
+            %% be treated as JSON.
+            ContentType = {"application", "octet-stream"},
+            Body = <<"raw bytes">>,
             ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
         end}
     ].

@@ -578,14 +578,30 @@ local_time() ->
 %% @end
 maybe_decode_body(_, <<>>) ->
     <<>>;
-maybe_decode_body({"application", "x-amz-json-1.0"}, Body) ->
-    aws_lib_json:decode(Body);
-maybe_decode_body({"application", "json"}, Body) ->
-    aws_lib_json:decode(Body);
-maybe_decode_body({_, "xml"}, Body) ->
+maybe_decode_body({"application", Subtype}, Body) ->
+    case is_json_subtype(Subtype) of
+        true -> aws_lib_json:decode(Body);
+        false -> maybe_decode_xml(Subtype, Body)
+    end;
+maybe_decode_body({_, Subtype}, Body) ->
+    maybe_decode_xml(Subtype, Body).
+
+maybe_decode_xml("xml", Body) ->
     aws_lib_xml:parse(Body);
-maybe_decode_body(_ContentType, Body) ->
+maybe_decode_xml(_Subtype, Body) ->
     Body.
+
+%% Recognise the JSON subtypes AWS services return. Covers plain `json', every
+%% AWS JSON protocol version (`x-amz-json-1.0', `x-amz-json-1.1', and any future
+%% `x-amz-json-*'), and the RFC 6839 structured `+json' suffix. Secrets Manager
+%% and other services use the JSON 1.1 protocol, so matching only 1.0/plain left
+%% those responses undecoded (issue #99).
+is_json_subtype("json") ->
+    true;
+is_json_subtype("x-amz-json-" ++ _Version) ->
+    true;
+is_json_subtype(Subtype) ->
+    lists:suffix("+json", Subtype).
 
 -spec parse_content_type(ContentType :: string()) -> {Type :: string(), Subtype :: string()}.
 %% @doc parse a content type string returning a tuple of type/subtype
