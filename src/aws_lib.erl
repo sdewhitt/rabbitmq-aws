@@ -11,6 +11,8 @@
     new/0, new/1,
     get_region/1,
     set_region/2,
+    get_timeout/1,
+    set_timeout/2,
     get_credentials/1,
     get/3, get/4, get/5,
     put/5, put/6,
@@ -77,6 +79,22 @@ get_region(#aws_state{config = #aws_config{region = Region}}) ->
 %% @end
 set_region(Region, State = #aws_state{config = Config}) ->
     {ok, State#aws_state{config = Config#aws_config{region = Region}}}.
+
+-spec get_timeout(State :: aws_state()) -> timeout().
+%% @doc Get the AWS API request timeout (ms) from the state, falling back to
+%% ?DEFAULT_API_TIMEOUT when the state does not set one.
+%% @end
+get_timeout(#aws_state{config = #aws_config{timeout = undefined}}) ->
+    ?DEFAULT_API_TIMEOUT;
+get_timeout(#aws_state{config = #aws_config{timeout = Timeout}}) ->
+    Timeout.
+
+-spec set_timeout(Timeout :: timeout(), State :: aws_state()) -> {ok, aws_state()}.
+%% @doc Set the AWS API request timeout (ms) in the state. Applied to requests
+%% that do not pass an explicit `timeout' option.
+%% @end
+set_timeout(Timeout, State = #aws_state{config = Config}) ->
+    {ok, State#aws_state{config = Config#aws_config{timeout = Timeout}}}.
 
 -spec get_credentials(State :: aws_state()) -> {ok, aws_credentials()} | {error, undefined}.
 %% @doc Get the credentials from the state.
@@ -254,7 +272,8 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
                 )
             of
                 {ok, SignedHeaders} ->
-                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options) of
+                    Options1 = ensure_timeout_option(Options, State1),
+                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options1) of
                         {ok, Response} ->
                             {ok, Response, State1};
                         Error ->
@@ -444,7 +463,8 @@ perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, Stat
                 )
             of
                 {ok, SignedHeaders} ->
-                    case gun_request(Method, URI, SignedHeaders, Body, Options) of
+                    Options1 = ensure_timeout_option(Options, State1),
+                    case gun_request(Method, URI, SignedHeaders, Body, Options1) of
                         {ok, Response} ->
                             {ok, Response, State1};
                         Error ->
@@ -783,6 +803,16 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
             {error, {credentials, Reason}}
     end.
 
+%% Add the state's AWS API timeout to the request options unless the caller
+%% already passed an explicit `timeout'. A per-request `timeout' option therefore
+%% takes precedence over the per-state value (aws_lib:set_timeout/2), which in
+%% turn falls back to ?DEFAULT_API_TIMEOUT via get_timeout/1.
+ensure_timeout_option(Options, State) ->
+    case proplists:is_defined(timeout, Options) of
+        true -> Options;
+        false -> [{timeout, get_timeout(State)} | Options]
+    end.
+
 %% Gun HTTP client functions
 gun_request(Method, URI, Headers, Body, Options) ->
     %% A parse or connection failure is returned as {error, Reason} (not raised)
@@ -888,7 +918,7 @@ direct_gun_request(GunPid, Method, Path, Headers, Body, Options) ->
         end,
         Headers
     ),
-    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_HTTP_TIMEOUT),
+    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
     Response =
         try
             StreamRef = do_gun_request(GunPid, Method, Path, HeadersBin, Body),
