@@ -111,6 +111,46 @@ cn_endpoint_host_test_() ->
         end}
     ].
 
+%% End-to-end guard for the DescribeVolumes response path: a real DescribeVolumes
+%% XML document decoded by aws_lib_xml:parse/1 must still parse into the expected
+%% volumes list. This pins the shape parse_volumes_response/1 depends on, so a
+%% change to the XML parser cannot silently break it.
+parse_volumes_response_test_() ->
+    [
+        {"a two-volume response parses into a volumes list", fun() ->
+            Xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<DescribeVolumesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\">"
+                "<volumeSet>"
+                "<item>"
+                "<volumeId>vol-1111</volumeId><size>8</size>"
+                "<volumeType>gp3</volumeType><status>in-use</status>"
+                "<attachmentSet><item>"
+                "<device>/dev/sda1</device><status>attached</status>"
+                "</item></attachmentSet>"
+                "</item>"
+                "<item>"
+                "<volumeId>vol-2222</volumeId><size>16</size>"
+                "<volumeType>gp2</volumeType><status>available</status>"
+                "<attachmentSet/>"
+                "</item>"
+                "</volumeSet>"
+                "</DescribeVolumesResponse>",
+            Parsed = aws_lib_xml:parse(Xml),
+            {ok, Volumes} = aws_lib:parse_volumes_response(Parsed),
+            ?assertEqual(2, length(Volumes)),
+            [V1, V2] = Volumes,
+            ?assertEqual("vol-1111", proplists:get_value(volume_id, V1)),
+            ?assertEqual("gp3", proplists:get_value(volume_type, V1)),
+            ?assertEqual(
+                [{device, "/dev/sda1"}, {state, "attached"}],
+                proplists:get_value(attachment, V1)
+            ),
+            ?assertEqual("vol-2222", proplists:get_value(volume_id, V2)),
+            ?assertEqual([], proplists:get_value(attachment, V2))
+        end}
+    ].
+
 expired_credentials_test_() ->
     {
         foreach,
