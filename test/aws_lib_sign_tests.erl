@@ -371,11 +371,23 @@ local_time_0_test_() ->
         end,
         [
             {"variation1", fun() ->
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2015, 05, 08}, {12, 36, 00}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2015, 05, 08}, {12, 36, 00}}
                 end),
                 Expectation = "20150508T123600Z",
                 ?assertEqual(Expectation, aws_lib_sign:local_time()),
+                meck:validate(calendar)
+            end},
+            %% Regression for #87: local_time/0 reads calendar:universal_time/0
+            %% directly, so a UTC datetime that falls inside a DST fall-back
+            %% window (which local_time_to_universal_time_dst/1 would have
+            %% returned as two ambiguous datetimes) yields a single, well-formed
+            %% timestamp rather than a badmatch crash.
+            {"dst fall-back instant does not crash", fun() ->
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2024, 11, 3}, {8, 30, 00}}
+                end),
+                ?assertEqual("20241103T083000Z", aws_lib_sign:local_time()),
                 meck:validate(calendar)
             end}
         ]}.
@@ -404,8 +416,8 @@ headers_test_() ->
         end,
         [
             {"without signing key", fun() ->
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2015, 08, 30}, {12, 36, 00}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2015, 08, 30}, {12, 36, 00}}
                 end),
                 Request = #request{
                     access_key = "AKIDEXAMPLE",
@@ -431,8 +443,8 @@ headers_test_() ->
                 meck:validate(calendar)
             end},
             {"with host header", fun() ->
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2015, 08, 30}, {12, 36, 00}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2015, 08, 30}, {12, 36, 00}}
                 end),
                 Request = #request{
                     access_key = "AKIDEXAMPLE",

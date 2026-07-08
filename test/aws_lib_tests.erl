@@ -174,8 +174,8 @@ expired_credentials_test_() ->
             {"true", fun() ->
                 Value = {{2016, 4, 1}, {12, 0, 0}},
                 Expectation = true,
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2016, 4, 1}, {12, 0, 0}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2016, 4, 1}, {12, 0, 0}}
                 end),
                 ?assertEqual(Expectation, aws_lib:expired_credentials(Value)),
                 meck:validate(calendar)
@@ -183,8 +183,8 @@ expired_credentials_test_() ->
             {"false", fun() ->
                 Value = {{2016, 5, 1}, {16, 30, 0}},
                 Expectation = false,
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) ->
-                    [{{2016, 4, 1}, {12, 0, 0}}]
+                meck:expect(calendar, universal_time, fun() ->
+                    {{2016, 4, 1}, {12, 0, 0}}
                 end),
                 ?assertEqual(Expectation, aws_lib:expired_credentials(Value)),
                 meck:validate(calendar)
@@ -293,7 +293,7 @@ local_time_test_() ->
         [
             {"value", fun() ->
                 Value = {{2016, 5, 1}, {12, 0, 0}},
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) -> [Value] end),
+                meck:expect(calendar, universal_time, fun() -> Value end),
                 ?assertEqual(Value, aws_lib:local_time()),
                 meck:validate(calendar)
             end}
@@ -510,7 +510,7 @@ sign_headers_test_() ->
         [
             {"with security token", fun() ->
                 Value = {{2016, 5, 1}, {12, 0, 0}},
-                meck:expect(calendar, local_time_to_universal_time_dst, fun(_) -> [Value] end),
+                meck:expect(calendar, universal_time, fun() -> Value end),
                 AccessKey = "AKIDEXAMPLE",
                 SecretKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
                 SecurityToken =
@@ -792,14 +792,12 @@ ensure_credentials_valid_test_() ->
 expired_imdsv2_token_test_() ->
     [
         {"imdsv2 token is valid", fun() ->
-            [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-            Now = calendar:datetime_to_gregorian_seconds(Value),
+            Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
             Imdsv2Token = #imdsv2token{token = "value", expiration = Now + 100},
             ?assertEqual(false, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end},
         {"imdsv2 token is expired", fun() ->
-            [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-            Now = calendar:datetime_to_gregorian_seconds(Value),
+            Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
             Imdsv2Token = #imdsv2token{token = "value", expiration = Now - 100},
             ?assertEqual(true, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end},

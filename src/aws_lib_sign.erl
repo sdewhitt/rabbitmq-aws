@@ -192,11 +192,15 @@ hmac_sign(Key, Message) ->
     binary_to_list(SignedValue).
 
 -spec local_time() -> string().
-%% @doc Return the current timestamp in GMT formatted in ISO8601 basic format.
+%% @doc Return the current UTC timestamp formatted in ISO8601 basic format. We
+%% read calendar:universal_time/0 directly rather than converting local time via
+%% local_time_to_universal_time_dst/1: that conversion returns two datetimes
+%% during a DST fall-back transition (the local hour is ambiguous) and none
+%% during a spring-forward gap, so matching a single [LocalTime] crashed with
+%% badmatch in the transition window.
 %% @end
 local_time() ->
-    [LocalTime] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-    local_time(LocalTime).
+    local_time(calendar:universal_time()).
 
 -spec local_time(calendar:datetime()) -> string().
 %% @doc Return the current timestamp in GMT formatted in ISO8601 basic format.
