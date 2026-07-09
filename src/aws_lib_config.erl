@@ -618,7 +618,7 @@ lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
     },
     {ok, Creds, Config}.
 
--spec with_metadata_connection(fun((pid()) -> Result)) -> Result.
+-spec with_metadata_connection(fun((aws_lib_httpc:conn()) -> Result)) -> Result.
 %% @doc Execute a function with a shared metadata service connection
 %% @end
 with_metadata_connection(Fun) ->
@@ -626,24 +626,24 @@ with_metadata_connection(Fun) ->
         {ok, Uri} ->
             Host = aws_lib_uri:host(Uri),
             Port = aws_lib_uri:port(Uri),
-            Opts = #{transport => tcp, protocols => [http]},
-            case gun:open(Host, Port, Opts) of
-                {ok, ConnPid} ->
-                    case gun:await_up(ConnPid, 5000) of
-                        {ok, _Protocol} ->
-                            Result = Fun(ConnPid),
-                            gun:close(ConnPid),
-                            Result;
-                        {error, Reason} ->
-                            gun:close(ConnPid),
-                            {error, Reason}
+            case aws_lib_httpc:open(Host, Port, metadata_open_opts()) of
+                {ok, Conn} ->
+                    try
+                        Fun(Conn)
+                    after
+                        aws_lib_httpc:close(Conn)
                     end;
-                {error, Reason} ->
-                    {error, Reason}
+                {error, _Reason} = Error ->
+                    Error
             end;
         {error, _} = Error ->
             Error
     end.
+
+%% Open options shared by the EC2 metadata-service sites: plain TCP/HTTP to the
+%% link-local IMDS host, with the short IMDS connect timeout.
+metadata_open_opts() ->
+    #{transport => tcp, protocols => [http], connect_timeout => 5000}.
 
 -spec lookup_credentials_from_instance_metadata(aws_config()) ->
     {ok, aws_credentials(), aws_config()} | error().
@@ -715,7 +715,7 @@ maybe_convert_number(Value) ->
     end.
 
 -spec maybe_get_credentials_from_instance_metadata_with_conn(
-    ConnPid :: pid(),
+    ConnPid :: aws_lib_httpc:conn(),
     Role :: string(),
     aws_config()
 ) -> {'ok', aws_credentials(), aws_config()} | error().
@@ -759,24 +759,15 @@ maybe_get_region_from_instance_metadata(Config) ->
             Error
     end.
 
--spec perform_http_get_with_conn(pid(), string(), aws_config()) ->
+-spec perform_http_get_with_conn(aws_lib_httpc:conn(), string(), aws_config()) ->
     {ok, {any(), any(), any()}, aws_config()} | {error, term()}.
 %% @doc Make HTTP GET request using existing Gun connection
 %% @end
-perform_http_get_with_conn(ConnPid, Path, Config) ->
+perform_http_get_with_conn(Conn, Path, Config) ->
     {ok, Headers, Config1} = instance_metadata_request_headers(Config),
-    StreamRef = gun:get(ConnPid, Path, Headers),
-    case gun:await(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
-        {response, fin, Status, RespHeaders} ->
-            {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, <<>>}, Config1};
-        {response, nofin, Status, RespHeaders} ->
-            case gun:await_body(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
-                {ok, Body} ->
-                    {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, Body},
-                        Config1};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+    case aws_lib_httpc:request(Conn, get, Path, Headers, <<>>, ?DEFAULT_IMDS_TIMEOUT) of
+        {ok, Response} ->
+            {ok, Response, Config1};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -784,7 +775,7 @@ perform_http_get_with_conn(ConnPid, Path, Config) ->
 %% @doc Try to query the EC2 local instance metadata service to get the role
 %%      assigned to the instance using an existing connection.
 %% @end
--spec maybe_get_role_from_instance_metadata_with_conn(pid(), aws_config()) ->
+-spec maybe_get_role_from_instance_metadata_with_conn(aws_lib_httpc:conn(), aws_config()) ->
     {ok, string(), aws_config()} | error().
 maybe_get_role_from_instance_metadata_with_conn(ConnPid, Config) ->
     case aws_lib_uri:parse(instance_role_url()) of
@@ -870,54 +861,13 @@ perform_http_get_instance_metadata_conn(Uri, Config) ->
     Host = aws_lib_uri:host(Uri),
     Port = aws_lib_uri:port(Uri),
     Path = aws_lib_uri:target(Uri),
-    % Simple Gun connection for metadata service
-
-    % HTTP only, no TLS
-    Opts = #{transport => tcp, protocols => [http]},
-    case gun:open(Host, Port, Opts) of
-        {ok, ConnPid} ->
-            case gun:await_up(ConnPid, 5000) of
-                {ok, _Protocol} ->
-                    {ok, Headers, Config1} = instance_metadata_request_headers(Config),
-                    StreamRef = gun:get(ConnPid, Path, Headers),
-                    Result =
-                        case gun:await(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
-                            {response, fin, Status, RespHeaders} ->
-                                {ok,
-                                    {
-                                        {http_version, Status, aws_lib:status_text(Status)},
-                                        RespHeaders,
-                                        <<>>
-                                    },
-                                    Config1};
-                            {response, nofin, Status, RespHeaders} ->
-                                case
-                                    gun:await_body(
-                                        ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT
-                                    )
-                                of
-                                    {ok, Body} ->
-                                        {ok,
-                                            {
-                                                {http_version, Status, aws_lib:status_text(Status)},
-                                                RespHeaders,
-                                                Body
-                                            },
-                                            Config1};
-                                    {error, Reason} ->
-                                        {error, Reason}
-                                end;
-                            {error, Reason} ->
-                                {error, Reason}
-                        end,
-                    gun:close(ConnPid),
-                    Result;
-                {error, Reason} ->
-                    gun:close(ConnPid),
-                    {error, Reason}
-            end;
-        {error, Reason} ->
-            {error, Reason}
+    {ok, Headers, Config1} = instance_metadata_request_headers(Config),
+    Opts = maps:put(timeout, ?DEFAULT_IMDS_TIMEOUT, metadata_open_opts()),
+    case aws_lib_httpc:request(Host, Port, get, Path, Headers, <<>>, Opts) of
+        {ok, Response} ->
+            {ok, Response, Config1};
+        {error, _Reason} = Error ->
+            Error
     end.
 
 -spec get_instruction_on_instance_metadata_error(string()) -> string().
@@ -997,88 +947,25 @@ load_imdsv2_token(Uri) ->
     Host = aws_lib_uri:host(Uri),
     Port = aws_lib_uri:port(Uri),
     Path = aws_lib_uri:target(Uri),
-    % Simple Gun connection for metadata service
-
-    % HTTP only, no TLS
-    Opts = #{transport => tcp, protocols => [http]},
-    case gun:open(Host, Port, Opts) of
-        {ok, ConnPid} ->
-            case gun:await_up(ConnPid, 5000) of
-                {ok, _Protocol} ->
-                    % PUT request with IMDSv2 token TTL header
-                    Headers = [
-                        {?METADATA_TOKEN_TTL_HEADER, integer_to_list(?METADATA_TOKEN_TTL_SECONDS)}
-                    ],
-                    StreamRef = gun:put(ConnPid, Path, Headers, <<>>),
-                    Result =
-                        case gun:await(ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT) of
-                            {response, fin, 200, _RespHeaders} ->
-                                ?LOG_DEBUG("Successfully obtained EC2 IMDSv2 token."),
-                                % Empty body for fin response
-                                <<>>;
-                            {response, nofin, 200, _RespHeaders} ->
-                                case
-                                    gun:await_body(
-                                        ConnPid, StreamRef, ?DEFAULT_IMDS_TIMEOUT
-                                    )
-                                of
-                                    {ok, Body} ->
-                                        ?LOG_DEBUG("Successfully obtained EC2 IMDSv2 token."),
-                                        binary_to_list(Body);
-                                    {error, Reason} ->
-                                        ?LOG_WARNING(
-                                            get_instruction_on_instance_metadata_error(
-                                                "Failed to read EC2 IMDSv2 token body: ~tp. "
-                                                "Falling back to EC2 IMDSv1 for now. It is recommended to use EC2 IMDSv2."
-                                            ),
-                                            [Reason]
-                                        ),
-                                        undefined
-                                end;
-                            {response, _, 400, _RespHeaders} ->
-                                ?LOG_WARNING(
-                                    "Failed to obtain EC2 IMDSv2 token: Missing or Invalid Parameters – The PUT request is not valid."
-                                ),
-                                undefined;
-                            {error, Reason} ->
-                                ?LOG_WARNING(
-                                    get_instruction_on_instance_metadata_error(
-                                        "Failed to obtain EC2 IMDSv2 token: ~tp. "
-                                        "Falling back to EC2 IMDSv1 for now. It is recommended to use EC2 IMDSv2."
-                                    ),
-                                    [Reason]
-                                ),
-                                undefined;
-                            Other ->
-                                ?LOG_WARNING(
-                                    get_instruction_on_instance_metadata_error(
-                                        "Failed to obtain EC2 IMDSv2 token: ~tp. "
-                                        "Falling back to EC2 IMDSv1 for now. It is recommended to use EC2 IMDSv2."
-                                    ),
-                                    [Other]
-                                ),
-                                undefined
-                        end,
-                    gun:close(ConnPid),
-                    Result;
-                {error, Reason} ->
-                    gun:close(ConnPid),
-                    ?LOG_WARNING(
-                        get_instruction_on_instance_metadata_error(
-                            "Failed to connect for EC2 IMDSv2 token: ~tp. "
-                            "Falling back to EC2 IMDSv1 for now. It is recommended to use EC2 IMDSv2."
-                        ),
-                        [Reason]
-                    ),
-                    undefined
-            end;
-        {error, Reason} ->
+    % PUT request with IMDSv2 token TTL header
+    Headers = [{?METADATA_TOKEN_TTL_HEADER, integer_to_list(?METADATA_TOKEN_TTL_SECONDS)}],
+    Opts = maps:put(timeout, ?DEFAULT_IMDS_TIMEOUT, metadata_open_opts()),
+    case aws_lib_httpc:request(Host, Port, put, Path, Headers, <<>>, Opts) of
+        {ok, {{_, 200, _}, _RespHeaders, Body}} ->
+            ?LOG_DEBUG("Successfully obtained EC2 IMDSv2 token."),
+            binary_to_list(Body);
+        {ok, {{_, 400, _}, _RespHeaders, _Body}} ->
+            ?LOG_WARNING(
+                "Failed to obtain EC2 IMDSv2 token: Missing or Invalid Parameters – The PUT request is not valid."
+            ),
+            undefined;
+        Other ->
             ?LOG_WARNING(
                 get_instruction_on_instance_metadata_error(
-                    "Failed to open connection for EC2 IMDSv2 token: ~tp. "
+                    "Failed to obtain EC2 IMDSv2 token: ~tp. "
                     "Falling back to EC2 IMDSv1 for now. It is recommended to use EC2 IMDSv2."
                 ),
-                [Reason]
+                [Other]
             ),
             undefined
     end.
