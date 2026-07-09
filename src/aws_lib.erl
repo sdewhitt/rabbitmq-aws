@@ -421,6 +421,35 @@ ensure_credentials_valid(State) ->
     State :: aws_state()
 ) -> {ok, {headers(), term()}, aws_state()} | result_error().
 perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, State0) ->
+    case prepare_signed_request(Service, Method, Headers, Path, Body, Options, Host, State0) of
+        {ok, URI, SignedHeaders, Options1, State1} ->
+            case gun_request(Method, URI, SignedHeaders, Body, Options1) of
+                {ok, Response} ->
+                    {ok, Response, State1};
+                Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec prepare_signed_request(
+    Service :: string(),
+    Method :: method(),
+    Headers :: headers(),
+    Path :: path(),
+    Body :: body(),
+    Options :: http_options(),
+    Host :: string() | undefined,
+    State :: aws_state()
+) ->
+    {ok, URI :: string(), headers(), http_options(), aws_state()}
+    | {error, term()}.
+%% Ensure credentials, resolve the region, build the endpoint URI, and sign the
+%% request headers. Shared by the one-shot path (perform_request_direct/8) and
+%% the connection-reusing retry path (perform_request_reuse/8); it performs no
+%% network I/O of its own beyond a possible credential refresh.
+prepare_signed_request(Service, Method, Headers, Path, Body, Options, Host, State0) ->
     % Ensure we have credentials
     State1 =
         case has_credentials(State0) of
@@ -464,12 +493,7 @@ perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, Stat
             of
                 {ok, SignedHeaders} ->
                     Options1 = ensure_timeout_option(Options, State1),
-                    case gun_request(Method, URI, SignedHeaders, Body, Options1) of
-                        {ok, Response} ->
-                            {ok, Response, State1};
-                        Error ->
-                            Error
-                    end;
+                    {ok, URI, SignedHeaders, Options1, State1};
                 {error, _} = Error ->
                     Error
             end;
@@ -775,17 +799,46 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     {ok, list(), aws_state()} | {error, term()}.
 %% @doc Invoke an API call to an AWS service with retries.
 %% @end
-api_request_with_retries(_Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State) when
+api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
+    %% Open a single connection and reuse it across the whole retry sequence
+    %% instead of opening a fresh TCP+TLS connection per attempt (issue #91).
+    %% The connection is threaded as the extra argument, starting as `undefined'
+    %% (nothing open yet), and is closed however the sequence ends.
+    api_request_with_retries(
+        Service, Method, Path, Body, Headers, Retries, WaitTime, State, undefined
+    ).
+
+-spec api_request_with_retries(
+    Service :: string(),
+    Method :: method(),
+    Path :: path(),
+    Body :: body(),
+    Headers :: headers(),
+    Retries :: integer(),
+    WaitTime :: integer(),
+    State :: aws_state(),
+    Conn :: aws_lib_httpc:conn() | undefined
+) ->
+    {ok, list(), aws_state()} | {error, term()}.
+api_request_with_retries(
+    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State, Conn
+) when
     Retries =< 0
 ->
+    close_if_open(Conn),
     ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
     {error, "AWS service is unavailable"};
-api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State0) ->
+api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0) ->
     case ensure_credentials_valid(State0) of
         {ok, State1} ->
-            case request(Service, Method, Path, Body, Headers, State1) of
+            {Result, Conn1} =
+                perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, Conn0),
+            case Result of
                 {ok, {_Headers, Payload}, State2} ->
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
+                    %% Success ends the unit of work: close the connection rather
+                    %% than keep it alive (this is bounded reuse, not a pool).
+                    close_if_open(Conn1),
                     {ok, Payload, State2};
                 {error, Message, Response} ->
                     %% Message may be a status string (from format_response/1
@@ -803,13 +856,95 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
                     end,
                     ?LOG_WARNING("Will retry AWS request, remaining retries: ~b", [Retries]),
                     timer:sleep(WaitTime),
+                    %% perform_request_reuse/8 hands back a live connection after
+                    %% an HTTP-level error (reused on the next attempt) or
+                    %% `undefined' after a transport failure (reopened next attempt).
                     api_request_with_retries(
-                        Service, Method, Path, Body, Headers, Retries - 1, WaitTime, State1
+                        Service, Method, Path, Body, Headers, Retries - 1, WaitTime, State1, Conn1
                     )
             end;
         {error, Reason} ->
+            close_if_open(Conn0),
             {error, {credentials, Reason}}
     end.
+
+%% Perform one request attempt on a reusable connection. Opens a connection when
+%% none is carried and reuses the carried one otherwise. Returns the same result
+%% shape as request/6 together with the connection to carry into the next
+%% attempt: the connection after an HTTP-level error (so the retry reuses it), or
+%% `undefined' after a transport failure (so the retry reopens). The connection
+%% is opened with `retry => 0' so a dropped socket terminates the Gun process; a
+%% request on a since-dead connection then fails fast through gun:await's process
+%% monitor ({error, {down, _}}) and is reopened on the next attempt, so no
+%% separate liveness check is needed.
+-spec perform_request_reuse(
+    Service :: string(),
+    Method :: method(),
+    Headers :: headers(),
+    Path :: path(),
+    Body :: body(),
+    Options :: http_options(),
+    State :: aws_state(),
+    Conn :: aws_lib_httpc:conn() | undefined
+) ->
+    {{ok, {headers(), term()}, aws_state()} | result_error(), aws_lib_httpc:conn() | undefined}.
+perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Conn0) ->
+    case prepare_signed_request(Service, Method, Headers, Path, Body, Options, undefined, State0) of
+        {ok, URI, SignedHeaders, Options1, State1} ->
+            case aws_lib_uri:parse(URI) of
+                {ok, Uri} ->
+                    Host = aws_lib_uri:host(Uri),
+                    Port = aws_lib_uri:port(Uri),
+                    Target = aws_lib_uri:target(Uri),
+                    OpenOpts = (gun_open_opts(Port, Options1))#{retry => 0},
+                    case ensure_open(Conn0, Host, Port, OpenOpts) of
+                        {ok, Conn1} ->
+                            Timeout = proplists:get_value(
+                                timeout, Options1, ?DEFAULT_API_TIMEOUT
+                            ),
+                            Response = aws_lib_httpc:request(
+                                Conn1, Method, Target, SignedHeaders, Body, Timeout
+                            ),
+                            classify_reuse_response(format_response(Response), State1, Conn1);
+                        {error, Reason} ->
+                            %% Could not (re)open the connection: a transport-level
+                            %% failure that re-enters the retry loop with no
+                            %% connection to carry.
+                            {format_response({error, Reason}), undefined}
+                    end;
+                {error, _Reason} = Error ->
+                    %% A malformed URI never becomes valid on retry, but preserve
+                    %% the pre-existing behaviour of routing it through the retry
+                    %% loop; the connection is unaffected, so carry it forward.
+                    {format_response(Error), Conn0}
+            end;
+        {error, _} = Error ->
+            {Error, Conn0}
+    end.
+
+%% Attach the connection to carry forward based on the request outcome: a 2xx
+%% success or an HTTP-level error leaves the connection intact (kept for reuse);
+%% a transport failure (format_response/1's {error, _, undefined}) makes it
+%% unusable, so close it and carry `undefined' to force a reopen.
+classify_reuse_response({ok, Result}, State, Conn) ->
+    {{ok, Result, State}, Conn};
+classify_reuse_response({error, _Reason, undefined} = Err, _State, Conn) ->
+    aws_lib_httpc:close(Conn),
+    {Err, undefined};
+classify_reuse_response({error, _Message, _Payload} = Err, _State, Conn) ->
+    {Err, Conn}.
+
+%% Reuse the carried connection, or open one when none is carried. A carried
+%% connection is reused as-is: if it has since died, gun:await detects it via its
+%% process monitor and the request returns a transport error that reopens on the
+%% next attempt, so no liveness pre-check is needed here.
+ensure_open(undefined, Host, Port, OpenOpts) ->
+    aws_lib_httpc:open(Host, Port, OpenOpts);
+ensure_open(Conn, _Host, _Port, _OpenOpts) ->
+    {ok, Conn}.
+
+close_if_open(undefined) -> ok;
+close_if_open(Conn) -> aws_lib_httpc:close(Conn).
 
 %% Add the state's AWS API timeout to the request options unless the caller
 %% already passed an explicit `timeout'. A per-request `timeout' option therefore

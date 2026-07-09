@@ -35,6 +35,12 @@
     transport => tcp | tls,
     protocols => [http | http2],
     connect_timeout => timeout(),
+    %% Gun's reconnection count. Omitted, gun defaults to 5 (a dropped socket
+    %% reconnects in the background). A bounded reuse caller (issue #91) passes
+    %% 0 so a dropped connection terminates the Gun process instead: a request
+    %% on it then fails fast via gun:await's process monitor ({error, {down,
+    %% _}}) rather than blocking on a background reconnect.
+    retry => non_neg_integer(),
     %% Request (await/await_body) timeout, consulted only by request/7.
     timeout => timeout()
 }.
@@ -58,11 +64,18 @@
 %% @end
 open(Host, Port, Opts) ->
     ConnectTimeout = maps:get(connect_timeout, Opts, infinity),
-    GunOpts = #{
+    GunOpts0 = #{
         transport => maps:get(transport, Opts, tcp),
         protocols => maps:get(protocols, Opts, [http]),
         connect_timeout => ConnectTimeout
     },
+    %% Only override gun's default retry count when the caller asks; existing
+    %% one-shot callers leave it unset and keep gun's default behaviour.
+    GunOpts =
+        case maps:find(retry, Opts) of
+            {ok, Retry} -> GunOpts0#{retry => Retry};
+            error -> GunOpts0
+        end,
     case gun:open(Host, Port, GunOpts) of
         {ok, ConnPid} ->
             case gun:await_up(ConnPid, ConnectTimeout) of
