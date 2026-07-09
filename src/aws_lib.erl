@@ -34,7 +34,9 @@
     direct_request/7,
     endpoint/4,
     sign_headers/10,
-    instance_volumes/1
+    instance_volumes/1,
+    enable_connection_reuse/1,
+    close_reuse_connection/1
 ]).
 
 -export_type([aws_state/0]).
@@ -103,6 +105,27 @@ get_credentials(#aws_state{credentials = undefined}) ->
     {error, undefined};
 get_credentials(#aws_state{credentials = Creds}) ->
     {ok, Creds}.
+
+-spec enable_connection_reuse(State :: aws_state()) -> aws_state().
+%% @doc Arm the state for connection reuse: subsequent api_get_request /
+%% api_post_request calls that target the same Host:Port reuse a single
+%% connection across calls instead of opening a fresh one each time. The caller
+%% MUST call close_reuse_connection/1 when the unit of work is complete.
+%% @end
+enable_connection_reuse(State) ->
+    State#aws_state{reuse_conn = none}.
+
+-spec close_reuse_connection(State :: aws_state()) -> aws_state().
+%% @doc Close any connection held in the reuse slot and clear it, returning the
+%% state to one-shot mode. Safe to call when no connection is held.
+%% @end
+close_reuse_connection(#aws_state{reuse_conn = undefined} = State) ->
+    State;
+close_reuse_connection(#aws_state{reuse_conn = none} = State) ->
+    State#aws_state{reuse_conn = undefined};
+close_reuse_connection(#aws_state{reuse_conn = {Conn, _Host, _Port}} = State) ->
+    aws_lib_httpc:close(Conn),
+    State#aws_state{reuse_conn = undefined}.
 
 %%====================================================================
 %% Legacy functions - to be updated
@@ -802,10 +825,12 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
 api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
     %% Open a single connection and reuse it across the whole retry sequence
     %% instead of opening a fresh TCP+TLS connection per attempt (issue #91).
-    %% The connection is threaded as the extra argument, starting as `undefined'
-    %% (nothing open yet), and is closed however the sequence ends.
+    %% When the state carries a reuse_conn (cross-request reuse, issue #107),
+    %% seed from it so the first attempt avoids a fresh handshake; otherwise
+    %% start with `undefined' (nothing open yet, opened lazily on first attempt).
+    Conn0 = seed_conn_from_state(State),
     api_request_with_retries(
-        Service, Method, Path, Body, Headers, Retries, WaitTime, State, undefined
+        Service, Method, Path, Body, Headers, Retries, WaitTime, State, Conn0
     ).
 
 -spec api_request_with_retries(
@@ -836,10 +861,8 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
             case Result of
                 {ok, {_Headers, Payload}, State2} ->
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
-                    %% Success ends the unit of work: close the connection rather
-                    %% than keep it alive (this is bounded reuse, not a pool).
-                    close_if_open(Conn1),
-                    {ok, Payload, State2};
+                    State3 = finish_conn_success(Conn1, State2),
+                    {ok, Payload, State3};
                 {error, Message, Response} ->
                     %% Message may be a status string (from format_response/1
                     %% on an HTTP error) or a tuple such as
@@ -869,14 +892,14 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     end.
 
 %% Perform one request attempt on a reusable connection. Opens a connection when
-%% none is carried and reuses the carried one otherwise. Returns the same result
-%% shape as request/6 together with the connection to carry into the next
-%% attempt: the connection after an HTTP-level error (so the retry reuses it), or
+%% none is carried (or the carried one targets a different host) and reuses the
+%% carried one otherwise. Returns the same result shape as request/6 together
+%% with the connection slot to carry into the next attempt: a live
+%% {Conn, Host, Port} after an HTTP-level error (so the retry reuses it), or
 %% `undefined' after a transport failure (so the retry reopens). The connection
 %% is opened with `retry => 0' so a dropped socket terminates the Gun process; a
 %% request on a since-dead connection then fails fast through gun:await's process
-%% monitor ({error, {down, _}}) and is reopened on the next attempt, so no
-%% separate liveness check is needed.
+%% monitor ({error, {down, _}}) and is reopened on the next attempt.
 -spec perform_request_reuse(
     Service :: string(),
     Method :: method(),
@@ -885,10 +908,13 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     Body :: body(),
     Options :: http_options(),
     State :: aws_state(),
-    Conn :: aws_lib_httpc:conn() | undefined
+    ConnSlot :: {aws_lib_httpc:conn(), string(), inet:port_number()} | undefined
 ) ->
-    {{ok, {headers(), term()}, aws_state()} | result_error(), aws_lib_httpc:conn() | undefined}.
-perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Conn0) ->
+    {
+        {ok, {headers(), term()}, aws_state()} | result_error(),
+        {aws_lib_httpc:conn(), string(), inet:port_number()} | undefined
+    }.
+perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, ConnSlot0) ->
     case prepare_signed_request(Service, Method, Headers, Path, Body, Options, undefined, State0) of
         {ok, URI, SignedHeaders, Options1, State1} ->
             case aws_lib_uri:parse(URI) of
@@ -897,7 +923,7 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
                     Port = aws_lib_uri:port(Uri),
                     Target = aws_lib_uri:target(Uri),
                     OpenOpts = (gun_open_opts(Port, Options1))#{retry => 0},
-                    case ensure_open(Conn0, Host, Port, OpenOpts) of
+                    case ensure_open(ConnSlot0, Host, Port, OpenOpts) of
                         {ok, Conn1} ->
                             Timeout = proplists:get_value(
                                 timeout, Options1, ?DEFAULT_API_TIMEOUT
@@ -905,46 +931,66 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
                             Response = aws_lib_httpc:request(
                                 Conn1, Method, Target, SignedHeaders, Body, Timeout
                             ),
-                            classify_reuse_response(format_response(Response), State1, Conn1);
+                            classify_reuse_response(
+                                format_response(Response), State1, {Conn1, Host, Port}
+                            );
                         {error, Reason} ->
-                            %% Could not (re)open the connection: a transport-level
-                            %% failure that re-enters the retry loop with no
-                            %% connection to carry.
                             {format_response({error, Reason}), undefined}
                     end;
                 {error, _Reason} = Error ->
-                    %% A malformed URI never becomes valid on retry, but preserve
-                    %% the pre-existing behaviour of routing it through the retry
-                    %% loop; the connection is unaffected, so carry it forward.
-                    {format_response(Error), Conn0}
+                    {format_response(Error), ConnSlot0}
             end;
         {error, _} = Error ->
-            {Error, Conn0}
+            {Error, ConnSlot0}
     end.
 
-%% Attach the connection to carry forward based on the request outcome: a 2xx
-%% success or an HTTP-level error leaves the connection intact (kept for reuse);
-%% a transport failure (format_response/1's {error, _, undefined}) makes it
-%% unusable, so close it and carry `undefined' to force a reopen.
-classify_reuse_response({ok, Result}, State, Conn) ->
-    {{ok, Result, State}, Conn};
-classify_reuse_response({error, _Reason, undefined} = Err, _State, Conn) ->
+%% Attach the connection slot to carry forward based on the request outcome:
+%% success or an HTTP-level error leaves the connection intact; a transport
+%% failure (format_response/1's {error, _, undefined}) makes it unusable.
+classify_reuse_response({ok, Result}, State, ConnSlot) ->
+    {{ok, Result, State}, ConnSlot};
+classify_reuse_response({error, _Reason, undefined} = Err, _State, {Conn, _, _}) ->
     aws_lib_httpc:close(Conn),
     {Err, undefined};
-classify_reuse_response({error, _Message, _Payload} = Err, _State, Conn) ->
-    {Err, Conn}.
+classify_reuse_response({error, _Message, _Payload} = Err, _State, ConnSlot) ->
+    {Err, ConnSlot}.
 
-%% Reuse the carried connection, or open one when none is carried. A carried
-%% connection is reused as-is: if it has since died, gun:await detects it via its
-%% process monitor and the request returns a transport error that reopens on the
-%% next attempt, so no liveness pre-check is needed here.
+%% Return a usable connection to Host:Port. If the carried slot targets the same
+%% host, reuse it; if it targets a different host (cross-service boot pass),
+%% close the old one and open fresh; if none is carried, open fresh. A carried
+%% connection is reused as-is: if it has since died, gun:await's process monitor
+%% surfaces a transport error and the next attempt reopens.
 ensure_open(undefined, Host, Port, OpenOpts) ->
     aws_lib_httpc:open(Host, Port, OpenOpts);
-ensure_open(Conn, _Host, _Port, _OpenOpts) ->
-    {ok, Conn}.
+ensure_open({Conn, Host, Port}, Host, Port, _OpenOpts) ->
+    {ok, Conn};
+ensure_open({OldConn, _OldHost, _OldPort}, Host, Port, OpenOpts) ->
+    aws_lib_httpc:close(OldConn),
+    aws_lib_httpc:open(Host, Port, OpenOpts).
 
 close_if_open(undefined) -> ok;
-close_if_open(Conn) -> aws_lib_httpc:close(Conn).
+close_if_open({Conn, _Host, _Port}) -> aws_lib_httpc:close(Conn).
+
+%% Seed the retry loop's connection slot from the state's reuse_conn. In
+%% one-shot mode (reuse_conn = undefined, the default) this returns `undefined'
+%% and the loop opens fresh on the first attempt. In reuse mode (none or a
+%% cached {Conn, Host, Port}) the state's slot is handed in so the first attempt
+%% avoids a handshake when possible.
+seed_conn_from_state(#aws_state{reuse_conn = undefined}) ->
+    undefined;
+seed_conn_from_state(#aws_state{reuse_conn = none}) ->
+    undefined;
+seed_conn_from_state(#aws_state{reuse_conn = ConnSlot}) ->
+    ConnSlot.
+
+%% On success: in reuse mode, write the live connection back into the state so
+%% the next api_*_request call in the same unit of work reuses it. In one-shot
+%% mode (reuse_conn = undefined), close the connection.
+finish_conn_success(ConnSlot, #aws_state{reuse_conn = undefined} = State) ->
+    close_if_open(ConnSlot),
+    State;
+finish_conn_success(ConnSlot, State) ->
+    State#aws_state{reuse_conn = ConnSlot}.
 
 %% Add the state's AWS API timeout to the request options unless the caller
 %% already passed an explicit `timeout'. A per-request `timeout' option therefore

@@ -23,8 +23,6 @@ process_arns() ->
                 ?AWS_LOG_INFO("success");
             {ok, {iam_role_result, not_assumed}} ->
                 ?AWS_LOG_INFO("success");
-            {error, credentials, _} = Error ->
-                ?AWS_LOG_ERROR("~tp", [Error]);
             {error, Error, {iam_role_result, assumed}} ->
                 ?AWS_LOG_ERROR("~tp", [Error]);
             {error, Error, {iam_role_result, not_assumed}} ->
@@ -78,18 +76,22 @@ process_arn_config({handle_env_arns, ArnList, ArnConfig}) ->
         {handle_assume_role, maybe_assume_role({arn_config, ArnConfig, State})}, ArnList
     ).
 
-process_arn_config({handle_assume_role, {ok, AssumeRoleResult, State}}, ArnList) ->
-    handle_arn_handlers_result(run_arn_handlers(ArnList, State), AssumeRoleResult);
+process_arn_config({handle_assume_role, {ok, AssumeRoleResult, State0}}, ArnList) ->
+    State1 = aws_lib:enable_connection_reuse(State0),
+    Result = run_arn_handlers(ArnList, State1),
+    handle_arn_handlers_result(Result, AssumeRoleResult);
 process_arn_config({handle_assume_role, {error, _}} = Error, _ArnList) ->
     {error, Error, {iam_role_result, not_assumed}}.
 
-handle_arn_handlers_result(ok, AssumeRoleResult) ->
+handle_arn_handlers_result({ok, State}, AssumeRoleResult) ->
+    _ = aws_lib:close_reuse_connection(State),
     {ok, {iam_role_result, AssumeRoleResult}};
-handle_arn_handlers_result({error, Error}, AssumeRoleResult) ->
+handle_arn_handlers_result({error, Error, State}, AssumeRoleResult) ->
+    _ = aws_lib:close_reuse_connection(State),
     {error, Error, {iam_role_result, AssumeRoleResult}}.
 
-run_arn_handlers([], _State) ->
-    ok;
+run_arn_handlers([], State) ->
+    {ok, State};
 run_arn_handlers([{Mod, undefined, _SchemaKey, Args} | Rest], State) ->
     %% Pure-sink / self-resolving handler. The only such handler is the oauth2
     %% providers map (aws_arn_config_oauth2:run/4), which resolves a map of ARNs
@@ -100,8 +102,8 @@ run_arn_handlers([{Mod, undefined, _SchemaKey, Args} | Rest], State) ->
     case erlang:apply(Mod, run, Args ++ [State]) of
         {ok, State1} ->
             run_arn_handlers(Rest, State1);
-        Error ->
-            Error
+        {error, _} = Error ->
+            {error, Error, State}
     end;
 run_arn_handlers([{Mod, Arn, SchemaKey, Args} | Rest], State) ->
     case aws_arn_util:resolve_arn(Arn, State) of
@@ -109,11 +111,11 @@ run_arn_handlers([{Mod, Arn, SchemaKey, Args} | Rest], State) ->
             case erlang:apply(Mod, run, [ArnData | Args]) of
                 ok ->
                     run_arn_handlers(Rest, State1);
-                Error ->
-                    Error
+                {error, _} = Error ->
+                    {error, Error, State1}
             end;
-        Error ->
-            get_resolve_arn_error(Arn, SchemaKey, Error)
+        {error, _} = Error ->
+            {error, get_resolve_arn_error(Arn, SchemaKey, Error), State}
     end.
 
 get_resolve_arn_error(Arn, SchemaKey, {error, E} = Error) ->
@@ -122,4 +124,4 @@ get_resolve_arn_error(Arn, SchemaKey, {error, E} = Error) ->
         [Arn, SchemaKey, E]
     ),
     ErrMsg1 = rabbit_data_coercion:to_utf8_binary(ErrMsg0),
-    {error, {ErrMsg1, Error}}.
+    {ErrMsg1, Error}.
