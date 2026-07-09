@@ -319,6 +319,16 @@ conn_reuse_setup() ->
         },
         {ok, Creds, Config}
     end),
+    %% Resolve the region deterministically. Without this, do_refresh_credentials
+    %% resolves an undefined region via aws_lib_config:region/1, which falls
+    %% through to the EC2 metadata service when no region is configured in the
+    %% environment. The mocked gun then returns the response body as the
+    %% availability zone, corrupting the endpoint host. This is host-dependent:
+    %% it passes where ~/.aws/config supplies a region but fails in CI where none
+    %% is set.
+    meck:expect(aws_lib_config, region, fun(Config) ->
+        {ok, "us-east-1", Config}
+    end),
     %% Assume-role succeeds trivially.
     meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
     %% Handler always succeeds.
