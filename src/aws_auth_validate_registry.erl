@@ -36,6 +36,8 @@ lookup_backend(<<"http">>) ->
     {ok, aws_auth_validate_http};
 lookup_backend(<<"oauth">>) ->
     {ok, aws_auth_validate_oauth};
+lookup_backend(<<"tls">>) ->
+    {ok, aws_auth_validate_tls};
 lookup_backend(_) ->
     {error, unknown_method}.
 
@@ -58,7 +60,10 @@ effective_allowed_fields(Module, Method) ->
 %% and AppSec reviewed (see aws_auth_validate_http / aws_auth_validate_oauth):
 %% without this, enabling validation for ldap would silently bring the http
 %% and oauth probes live too.
--define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>]).
+%% tls makes no outbound connection, but resolving a cacertfile ARN under the
+%% assume_role is still a capability worth enabling explicitly, so it is opt-in
+%% too: turning on ldap or the master toggle does not bring it live.
+-define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>, <<"tls">>]).
 
 -spec is_method_enabled(binary()) -> boolean().
 is_method_enabled(Method) ->
