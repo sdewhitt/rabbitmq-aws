@@ -58,7 +58,7 @@ groups() ->
     [
         {tls_method, [], [
             %% tls is opt-in: with the feature on but the method not enabled it
-            %% must 404 (enabling ldap/the master toggle does not bring it live).
+            %% must 404 (enabling ldap/the feature toggle does not bring it live).
             tls_disabled_by_default_returns_404,
             %% The method enabled + a valid, in-window CA -> 204.
             tls_valid_ca_returns_204,
@@ -168,8 +168,10 @@ pem_for_case(tls_malformed_pem_returns_400_input_invalid, _Config) ->
     %% this, which the backend must catch and report as input_invalid.
     <<"-----BEGIN CERTIFICATE-----\nnot base64 %%%\n-----END CERTIFICATE-----\n">>;
 pem_for_case(tls_no_certs_returns_400_input_invalid, _Config) ->
-    %% Well-formed PEM but no certificate entries (an RSA key only).
-    <<"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKn\n-----END RSA PRIVATE KEY-----\n">>;
+    %% Well-formed PEM with no certificate entries: public_key:pem_decode/1
+    %% decodes the body but yields zero certificates (the `skip' branch), as
+    %% opposed to the malformed-base64 case above, which raises.
+    <<"-----BEGIN PRIVATE KEY-----\naGVsbG8=\n-----END PRIVATE KEY-----\n">>;
 pem_for_case(_TC, Config) ->
     %% Default (valid CA) for tls_valid_ca_returns_204 / tls_response_no_ca_material.
     ?config(valid_ca_pem, Config).

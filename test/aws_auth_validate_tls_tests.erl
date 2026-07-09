@@ -213,8 +213,26 @@ tls_arn_not_resolved_on_bad_input_test_() ->
 %% Material validation via validate/1 (resolve_arn mocked)
 %%--------------------------------------------------------------------
 
-%% A resolved PEM with no certificates maps to input_invalid.
+%% A well-formed PEM that holds no certificate entries (a private key only)
+%% decodes cleanly to zero certificates (the `skip' branch) and maps to
+%% input_invalid.
 tls_no_certs_in_bundle_test_() ->
+    with_resolved_pem(
+        <<"-----BEGIN PRIVATE KEY-----\naGVsbG8=\n-----END PRIVATE KEY-----\n">>, fun() ->
+            R = validate_ok_body(),
+            [
+                ?_assertMatch(
+                    {error, input_invalid,
+                        <<"cacertfile ARN did not resolve to any CA certificates">>},
+                    R
+                )
+            ]
+        end
+    ).
+
+%% A cert-framed PEM whose body is not valid base64 makes public_key:pem_decode/1
+%% raise; the backend must catch it and map to input_invalid rather than crash.
+tls_malformed_pem_maps_to_input_invalid_test_() ->
     with_resolved_pem(
         <<"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----">>, fun() ->
             R = validate_ok_body(),

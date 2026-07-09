@@ -58,10 +58,10 @@ effective_allowed_fields(Module, Method) ->
 %% in ?OPT_IN_METHODS defaults to DISABLED and must be turned on explicitly.
 %% http and oauth connect to a customer-supplied URL (an SSRF surface). Their
 %% address policy is implemented and enforced (see aws_auth_validate_net); they
-%% are opt-in so enabling ldap or the master toggle does not bring them live.
+%% are opt-in so enabling ldap or the feature toggle does not bring them live.
 %% tls makes no outbound connection, but resolving a cacertfile ARN under the
 %% assume_role is still a capability worth enabling explicitly, so it is opt-in
-%% too: turning on ldap or the master toggle does not bring it live.
+%% too: turning on ldap or the feature toggle does not bring it live.
 -define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>, <<"tls">>]).
 
 -spec is_method_enabled(binary()) -> boolean().
