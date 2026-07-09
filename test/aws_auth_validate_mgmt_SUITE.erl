@@ -36,7 +36,10 @@
     options_returns_allowed_methods/1,
     get_returns_405/1,
     password_not_in_response/1,
-    success_returns_204/1
+    success_returns_204/1,
+    oauth_disabled_by_default_returns_404/1,
+    oauth_success_returns_204/1,
+    oauth_response_no_secret/1
 ]).
 
 %% Invoked on the broker node via rpc to hold a semaphore slot.
@@ -51,12 +54,14 @@
 -include("aws.hrl").
 
 -define(API, "/aws/auth/validate/ldap").
+-define(OAUTH_API, "/aws/auth/validate/oauth").
 
 all() ->
     [
         {group, feature_disabled},
         {group, feature_enabled},
-        {group, feature_enabled_custom_tag}
+        {group, feature_enabled_custom_tag},
+        {group, oauth_method}
     ].
 
 groups() ->
@@ -84,6 +89,13 @@ groups() ->
         {feature_enabled_custom_tag, [], [
             custom_tag_insufficient_returns_401,
             custom_tag_options_preflight_allowed
+        ]},
+        %% OAuth method tests: opt-in behaviour (disabled by default -> 404),
+        %% and success/no-secret when enabled with mocked dispatch.
+        {oauth_method, [], [
+            oauth_disabled_by_default_returns_404,
+            oauth_success_returns_204,
+            oauth_response_no_secret
         ]}
     ].
 
@@ -120,6 +132,16 @@ init_per_group(feature_enabled_custom_tag, Config) ->
         %% guest has the administrator tag but not monitoring, so the
         %% authorize_tag/3 membership check fails -> 401.
         {auth_validation_required_user_tag, monitoring}
+    ]);
+init_per_group(oauth_method, Config) ->
+    %% OAuth is opt-in; enable validation but do NOT add oauth to
+    %% enabled_methods so the default (disabled) applies for the
+    %% disabled-by-default case. Individual testcases that need the method
+    %% enabled will toggle it in init_per_testcase.
+    setup_broker(Config, [
+        {auth_validation_enabled, true},
+        {auth_validation_max_concurrent, 1},
+        {auth_validation_max_body_size, 1024}
     ]).
 
 end_per_group(_Group, Config) ->
@@ -145,6 +167,32 @@ init_per_testcase(success_returns_204 = TC, Config) ->
         Config, 0, ?MODULE, mock_dispatch_ok, []
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
+init_per_testcase(oauth_success_returns_204 = TC, Config) ->
+    %% Enable the oauth method and mock dispatch to return ok.
+    rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        application,
+        set_env,
+        [aws, auth_validation_enabled_methods, [{<<"oauth">>, true}]]
+    ),
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, mock_dispatch_ok, []
+    ),
+    rabbit_ct_helpers:testcase_started(Config, TC);
+init_per_testcase(oauth_response_no_secret = TC, Config) ->
+    %% Enable the oauth method and mock dispatch to return ok.
+    rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        application,
+        set_env,
+        [aws, auth_validation_enabled_methods, [{<<"oauth">>, true}]]
+    ),
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, mock_dispatch_ok, []
+    ),
+    rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC).
 
@@ -156,6 +204,22 @@ end_per_testcase(method_disabled_returns_404 = TC, Config) ->
 end_per_testcase(success_returns_204 = TC, Config) ->
     ok = rabbit_ct_broker_helpers:rpc(
         Config, 0, ?MODULE, unmock_dispatch, []
+    ),
+    rabbit_ct_helpers:testcase_finished(Config, TC);
+end_per_testcase(oauth_success_returns_204 = TC, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, unmock_dispatch, []
+    ),
+    rabbit_ct_broker_helpers:rpc(
+        Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
+    ),
+    rabbit_ct_helpers:testcase_finished(Config, TC);
+end_per_testcase(oauth_response_no_secret = TC, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, unmock_dispatch, []
+    ),
+    rabbit_ct_broker_helpers:rpc(
+        Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
     ),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(TC, Config) ->
@@ -323,6 +387,33 @@ success_returns_204(Config) ->
     ?assertEqual(<<>>, iolist_to_binary(ResBody)).
 
 %%--------------------------------------------------------------------
+%% OAuth method group
+%%--------------------------------------------------------------------
+
+%% OAuth is an opt-in method (in ?OPT_IN_METHODS). Without explicit enablement
+%% it defaults to disabled, so any PUT to /aws/auth/validate/oauth returns 404.
+oauth_disabled_by_default_returns_404(Config) ->
+    Body = oauth_body(),
+    {ok, {{_, Code, _}, _, _}} = put_request(Config, ?OAUTH_API, Body),
+    ?assertEqual(404, Code).
+
+%% With the method enabled and dispatch mocked, the handler returns 204.
+oauth_success_returns_204(Config) ->
+    Body = oauth_body(),
+    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?OAUTH_API, Body),
+    ?assertEqual(204, Code),
+    ?assertEqual(<<>>, iolist_to_binary(ResBody)).
+
+%% The 204 response must carry no secret material. We submit a body that
+%% contains a plausible secret field and verify it does not appear in the
+%% response (R6).
+oauth_response_no_secret(Config) ->
+    Secret = <<"oauth-client-secret-DO-NOT-LEAK-1234">>,
+    Body = (oauth_body())#{<<"client_secret">> => Secret},
+    {ok, {{_, _Code, _}, _, ResBody}} = put_request(Config, ?OAUTH_API, Body),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Secret)).
+
+%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
@@ -404,6 +495,11 @@ put_request(Config, Path, BodyMap) ->
         ],
         Body
     ).
+
+oauth_body() ->
+    #{
+        <<"jwks_uri">> => <<"https://idp.example.com/.well-known/jwks.json">>
+    }.
 
 decode(ResBody) ->
     case rabbit_json:try_decode(iolist_to_binary(ResBody)) of
