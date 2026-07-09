@@ -718,6 +718,192 @@ api_get_request_test_() ->
         ]
     }.
 
+%% Issue #91: the retry loop reuses one connection across attempts instead of
+%% opening a fresh TCP+TLS connection every time. These tests pin that
+%% behaviour by counting gun:open calls, which is the whole point of the change.
+connection_reuse_across_retries_test_() ->
+    {
+        foreach,
+        fun() ->
+            setup(),
+            meck:new(gun, []),
+            meck:new(aws_lib_config, []),
+            [gun, aws_lib_config]
+        end,
+        fun(Mods) ->
+            teardown(ok),
+            meck:unload(Mods)
+        end,
+        [
+            {"one connection is reused across HTTP-error retries", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                %% A long-lived pid so the reuse liveness check (is_process_alive)
+                %% sees the connection as alive between attempts.
+                Conn = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% Two 500s (HTTP-level errors, connection stays intact) then a 200.
+                meck:expect(
+                    gun,
+                    await,
+                    3,
+                    meck:seq([
+                        {response, nofin, 500, [{<<"content-type">>, <<"application/json">>}]},
+                        {response, nofin, 500, [{<<"content-type">>, <<"application/json">>}]},
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    ])
+                ),
+                meck:expect(
+                    gun,
+                    await_body,
+                    3,
+                    meck:seq([
+                        {ok, <<"{\"error\": \"e\"}">>},
+                        {ok, <<"{\"error\": \"e\"}">>},
+                        {ok, <<"{\"data\": \"value\"}">>}
+                    ])
+                ),
+
+                {ok, Body, _State1} = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual([{"data", "value"}], Body),
+                %% Three attempts, but the connection was opened exactly once and
+                %% reused for the two retries.
+                ?assertEqual(1, meck:num_calls(gun, open, '_')),
+                %% Opened once and closed once (on the terminating success).
+                ?assertEqual(1, meck:num_calls(gun, close, '_')),
+                Conn ! stop,
+                meck:validate(gun)
+            end},
+            {"a transport failure reopens the connection on the next attempt", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                Conn = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A transport error (await returns {error, _}) makes the
+                %% connection unusable, so it is closed and reopened; then a 200.
+                meck:expect(
+                    gun,
+                    await,
+                    3,
+                    meck:seq([
+                        {error, "network error"},
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    ])
+                ),
+                meck:expect(
+                    gun,
+                    await_body,
+                    fun(_Pid, _, _) -> {ok, <<"{\"data\": \"value\"}">>} end
+                ),
+
+                {ok, Body, _State1} = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual([{"data", "value"}], Body),
+                %% One transport failure -> a second open (reopen); two total.
+                ?assertEqual(2, meck:num_calls(gun, open, '_')),
+                Conn ! stop,
+                meck:validate(gun)
+            end},
+            {"a connection that died between attempts is detected and reopened", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                Conn = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% Attempt 1: HTTP 500 (connection stays intact, carried forward).
+                %% Attempt 2: the carried connection has since died, which gun
+                %% surfaces as {error, {down, _}} from await's process monitor --
+                %% a transport failure that closes and reopens. Attempt 3: 200 on
+                %% the reopened connection.
+                meck:expect(
+                    gun,
+                    await,
+                    3,
+                    meck:seq([
+                        {response, nofin, 500, [{<<"content-type">>, <<"application/json">>}]},
+                        {error, {down, noproc}},
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    ])
+                ),
+                meck:expect(
+                    gun,
+                    await_body,
+                    3,
+                    meck:seq([
+                        {ok, <<"{\"error\": \"e\"}">>},
+                        {ok, <<"{\"data\": \"value\"}">>}
+                    ])
+                ),
+
+                {ok, Body, _State1} = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual([{"data", "value"}], Body),
+                %% Opened once up front; the {down, _} on attempt 2 forced exactly
+                %% one reopen -- two opens total. The HTTP 500 on attempt 1 did
+                %% NOT reopen (that connection was still usable).
+                ?assertEqual(2, meck:num_calls(gun, open, '_')),
+                Conn ! stop,
+                meck:validate(gun)
+            end},
+            {"retry => 0 is passed to the reused connection's open options", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                Self = self(),
+                Conn = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                meck:expect(gun, open, fun(_, _, Opts) ->
+                    Self ! {open_opts, Opts},
+                    {ok, Conn}
+                end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                meck:expect(gun, await, fun(_Pid, _, _) -> {response, fin, 200, []} end),
+
+                {ok, _, _} = aws_lib:api_get_request("AWS", "API", State),
+                receive
+                    {open_opts, Opts} -> ?assertEqual(0, maps:get(retry, Opts))
+                after 1000 -> ?assert(false)
+                end,
+                Conn ! stop,
+                meck:validate(gun)
+            end}
+        ]
+    }.
+
 ensure_credentials_valid_test_() ->
     {
         foreach,
