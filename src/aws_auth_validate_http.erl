@@ -167,13 +167,12 @@
 -define(AUTH_RESPONSE_CODES, [200, 201]).
 
 %% SSRF guard toggles (see the SSRF guard section below for the full rationale).
-%% The address policy (classify_ip/1 + the probe-layer resolve+pin) is now live,
-%% so ?ENFORCE_ADDRESS_POLICY is TRUE. It is retained as a defined marker of that
+%% The address policy (classify_ip/1 + the probe-layer resolve+pin) is live, so
+%% ?ENFORCE_ADDRESS_POLICY is TRUE. It is retained as a defined marker of that
 %% state; enforcement itself runs unconditionally via url_allowed/1 and the
-%% probe-layer resolve+classify.
-%% NOTE: AppSec review + pen test are still pending (parent FAQ 2.1); the method
-%% remains opt-in (aws_auth_validate_registry ?OPT_IN_METHODS) so it is not live
-%% until an operator explicitly enables it.
+%% probe-layer resolve+classify. The method is opt-in
+%% (aws_auth_validate_registry ?OPT_IN_METHODS), so it is not live until an
+%% operator explicitly enables it.
 -define(ALLOWED_SCHEMES, ["https", "http"]).
 -define(ENFORCE_ADDRESS_POLICY, true).
 
