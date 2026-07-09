@@ -238,6 +238,10 @@ valid_ssl_value(<<"versions">>, V, Opts) when is_list(V), V =/= [] ->
     end;
 valid_ssl_value(<<"versions">>, _V, Opts) ->
     {error, input_invalid, reason(bad_ssl_versions, Opts)};
+valid_ssl_value(<<"fail_if_no_peer_cert">>, V, _Opts) when is_boolean(V) ->
+    ok;
+valid_ssl_value(<<"fail_if_no_peer_cert">>, _V, Opts) ->
+    {error, input_invalid, reason(bad_ssl_fail_if_no_peer_cert, Opts)};
 valid_ssl_value(<<"cacertfile_arn">>, V, Opts) ->
     nonempty_or(V, bad_ssl_cacert_arn, Opts);
 valid_ssl_value(<<"certfile_arn">>, V, Opts) ->
