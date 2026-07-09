@@ -271,6 +271,15 @@ cert_validity_seconds(Der) ->
 
 %% UTCTime is "YYMMDDHHMMSSZ" with a 2-digit year (RFC 5280: YY >= 50 => 19YY,
 %% else 20YY). GeneralizedTime is "YYYYMMDDHHMMSSZ" with a 4-digit year.
+%%
+%% The fixed 50 pivot is deliberate: RFC 5280 4.1.2.5 requires validity dates
+%% through 2049 to be UTCTime and dates in 2050 or later to be GeneralizedTime,
+%% so in a compliant certificate a 2-digit year can only mean 1950-2049 and this
+%% pivot is exact. Do not replace it with a sliding window relative to the
+%% current year (as public_key's pubkey_cert:time_str_2_gregorian_sec/1 does):
+%% that only matters for non-compliant certificates that encode a post-2049 date
+%% as UTCTime, which this pivot reads as a past year and so rejects as expired --
+%% the safe, fail-closed outcome for a pre-flight material check.
 asn1_time_to_seconds({utcTime, T}) ->
     S = to_str(T),
     YY = list_to_integer(lists:sublist(S, 1, 2)),
