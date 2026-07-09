@@ -207,9 +207,9 @@ validate(Body) when is_map(Body) ->
 %% that would resolve ARNs with the broker's ambient (EC2 instance) credentials,
 %% which on Amazon MQ can be far more privileged than the role a customer would
 %% attach to their own secret/bucket, so a validate request could resolve ARNs
-%% the caller's intended role never could -- a least-privilege pitfall that is
-%% hard to spot without an appsec review (the resolved secret is never returned
-%% to the caller today, but the capability is a hazard for future development).
+%% the caller's intended role never could -- a least-privilege pitfall (the
+%% resolved secret is never returned to the caller today, but the capability
+%% would be a hazard for future development).
 %% We therefore never use the instance role: with no assume_role configured we
 %% refuse the request with config_conflict before any secret fetch or outbound
 %% connection.
