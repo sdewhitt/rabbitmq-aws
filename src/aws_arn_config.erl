@@ -26,9 +26,7 @@ process_arns() ->
             {error, Error, {iam_role_result, assumed}} ->
                 ?AWS_LOG_ERROR("~tp", [Error]);
             {error, Error, {iam_role_result, not_assumed}} ->
-                ?AWS_LOG_ERROR("~tp", [Error]);
-            Unexpected ->
-                ?AWS_LOG_ERROR("unexpected result: ~tp", [Unexpected])
+                ?AWS_LOG_ERROR("~tp", [Error])
         end
     catch
         Class:Reason:Stacktrace ->

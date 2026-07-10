@@ -386,10 +386,11 @@ different_host_arns_reopen() ->
     meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
     meck:expect(gun, get, fun(_, _, _) -> stream_ref end),
     meck:expect(gun, post, fun(_, _, _, _, _) -> stream_ref end),
-    %% text/plain avoids maybe_decode_body's JSON decode, so the raw binary
-    %% reaches aws_sms:make_request which calls rabbit_json:decode itself.
+    %% Secrets Manager replies with JSON; maybe_decode_body decodes it into the
+    %% string-keyed proplist aws_sms:find_secret/1 matches (issue #131 fixed the
+    %% earlier double-decode, so aws_sms no longer decodes it a second time).
     meck:expect(gun, await, fun(_, _, _) ->
-        {response, nofin, 200, [{<<"content-type">>, <<"text/plain">>}]}
+        {response, nofin, 200, [{<<"content-type">>, <<"application/x-amz-json-1.1">>}]}
     end),
     meck:expect(gun, await_body, fun(_, _, _) ->
         {ok, <<"{\"SecretString\": \"secret-value\"}">>}
@@ -407,6 +408,9 @@ different_host_arns_reopen() ->
     ?assertMatch({ok, {iam_role_result, assumed}}, Result),
     %% Two different hosts -> two opens.
     ?assertEqual(2, meck:num_calls(gun, open, '_')),
+    %% Two closes: ensure_open closes the S3 connection when it switches to the
+    %% Secrets Manager host, and the end-of-pass close tears the second one down.
+    ?assertEqual(2, meck:num_calls(gun, close, '_')),
     Conn ! stop.
 
 %% The connection is closed at the end of the pass (not leaked).
