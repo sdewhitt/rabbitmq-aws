@@ -106,7 +106,14 @@
 
 -record(aws_state, {
     credentials :: aws_credentials() | undefined,
-    config :: aws_config() | undefined
+    config :: aws_config() | undefined,
+    %% A reusable connection carried across a bounded unit of work (e.g. the
+    %% boot ARN-resolution pass). `undefined' = one-shot mode (the default for
+    %% all callers that do not opt in). `none' = reuse mode armed but no
+    %% connection cached yet. `{Conn, Host, Port}' = a cached connection to the
+    %% given endpoint. api_request_with_retries seeds from and writes back to
+    %% this field when it is not `undefined'.
+    reuse_conn :: {aws_lib_httpc:conn(), string(), inet:port_number()} | none | undefined
 }).
 %% Type aws_state() and related result types are defined in aws_lib.erl
 
