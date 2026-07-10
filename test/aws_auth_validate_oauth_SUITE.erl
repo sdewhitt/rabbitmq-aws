@@ -53,6 +53,8 @@ groups() ->
             self_signed_verify_peer_returns_tls_failed,
             custom_ca_verify_peer_returns_ok,
             error_reason_leaks_no_target_detail,
+            sts_direct_jwks_uri_returns_ok,
+            sts_issuer_only_returns_auth_failed,
             token_fetch_valid_returns_ok,
             token_fetch_rejected_returns_auth_failed,
             token_fetch_no_secret_or_token_leak
@@ -252,6 +254,54 @@ error_reason_leaks_no_target_detail(Config) ->
     ].
 
 %%--------------------------------------------------------------------
+%% IAM-over-OAuth2 contract regression tests
+%%--------------------------------------------------------------------
+%%
+%% IAM authentication for Amazon MQ for RabbitMQ is OAuth2 under the hood: AWS
+%% STS outbound web identity federation issues JWTs that rabbitmq_auth_backend_
+%% oauth2 verifies against the account's STS JWKS. There is no separate `iam'
+%% validation backend -- an operator validates an IAM auth config by pointing
+%% THIS oauth method at the STS JWKS URL (see the IAM validation guidance in the
+%% customer docs). These two cases pin the STS-specific contract so a future
+%% oauth refactor cannot silently break the documented IAM recipe.
+%%
+%% The STS JWKS layout differs from generic OIDC in one contract-critical way:
+%% STS serves its signing keys at `{issuer}/.well-known/jwks.json' but does NOT
+%% publish an OIDC discovery document at `{issuer}/.well-known/openid-
+%% configuration'. Consequently:
+%%   * the documented recipe -- pass the explicit `jwks_uri' (the STS issuer
+%%     identifier + /.well-known/jwks.json) -- MUST succeed, and
+%%   * the `issuer'-only path (which drives OIDC discovery) MUST fail against an
+%%     STS-shaped endpoint, because discovery is unavailable.
+%% The second case is the regression guard for the doc clarification "for IAM,
+%% always pass jwks_uri, never issuer".
+%%
+%% The stub models the STS shape via the "/sts" path prefix (see do/1): it serves
+%% a valid JWKS at /sts/.well-known/jwks.json but returns 404 for the OIDC
+%% discovery path under the same prefix.
+
+%% Documented IAM recipe: an explicit STS jwks_uri
+%% ({issuer}/.well-known/jwks.json) serving a well-formed JWKS -> ok.
+sts_direct_jwks_uri_returns_ok(Config) ->
+    Url = self_url(Config, "/sts/.well-known/jwks.json"),
+    Body = #{
+        <<"jwks_uri">> => Url,
+        <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
+    },
+    ?assertEqual(ok, validate(Body)).
+
+%% The STS issuer identifier passed as `issuer' drives OIDC discovery, which STS
+%% does not serve (no /.well-known/openid-configuration) -> auth_failed. This is
+%% why the IAM recipe requires jwks_uri, not issuer.
+sts_issuer_only_returns_auth_failed(Config) ->
+    Issuer = self_url(Config, "/sts"),
+    Body = #{
+        <<"issuer">> => Issuer,
+        <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
+    },
+    ?assertMatch({error, auth_failed, _}, validate(Body)).
+
+%%--------------------------------------------------------------------
 %% client_credentials token-fetch tier (integration)
 %%--------------------------------------------------------------------
 %%
@@ -374,6 +424,17 @@ do(Info) ->
                     <<"authorization_endpoint">> => list_to_binary(Base ++ "/authorize")
                 }),
                 {200, Doc, "application/json"};
+            "/sts/.well-known/jwks.json" ->
+                %% AWS STS serves signing keys here (the documented IAM recipe's
+                %% jwks_uri). Same well-formed JWKS as /jwks.
+                Jwks = rabbit_json:encode(#{
+                    <<"keys">> => [#{<<"kty">> => <<"RSA">>, <<"kid">> => <<"sts1">>}]
+                }),
+                {200, Jwks, "application/json"};
+            "/sts/.well-known/openid-configuration" ->
+                %% STS does NOT publish an OIDC discovery document; the issuer-only
+                %% path must therefore fail. 404 drives auth_failed.
+                {404, <<"not found">>, "text/plain"};
             "/jwks" ->
                 Jwks = rabbit_json:encode(#{
                     <<"keys">> => [#{<<"kty">> => <<"RSA">>, <<"kid">> => <<"k1">>}]

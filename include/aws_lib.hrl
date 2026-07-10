@@ -19,13 +19,19 @@
 
 % rabbitmq/rabbitmq-peer-discovery-aws#25
 
-% Note: this timeout must not be greater than the default
-% gen_server:call timeout of 5000ms. INSTANCE_HOST is
-% a pseudo-ip that should have good performance, and the
-% data should be returned quickly. Note that `timeout`,
-% when set, is used as the connect and then request timeout
-% by `httpc`
--define(DEFAULT_HTTP_TIMEOUT, 2250).
+% Timeout for EC2 Instance Metadata service (IMDS) requests. INSTANCE_HOST is a
+% link-local pseudo-IP that should have good performance and return data
+% quickly, so a short timeout is appropriate here. This is NOT used for AWS API
+% requests -- see ?DEFAULT_API_TIMEOUT.
+-define(DEFAULT_IMDS_TIMEOUT, 2250).
+
+% Default timeout for AWS API requests, applied when neither the request options
+% nor the aws_config() specify one. AWS API operations (S3 uploads,
+% CreateSnapshot, DynamoDB batch writes, and so on) can routinely exceed a few
+% seconds, so this matches the AWS SDK default of 30s rather than the short IMDS
+% timeout. Overridable per request via the `timeout' option or per state via
+% aws_lib:set_timeout/2.
+-define(DEFAULT_API_TIMEOUT, 30000).
 
 -define(INSTANCE_CREDENTIALS, "iam/security-credentials").
 -define(INSTANCE_METADATA_BASE, "latest/meta-data").
@@ -42,6 +48,11 @@
 -define(METADATA_TOKEN_TTL_SECONDS, 60).
 
 -define(METADATA_TOKEN, "X-aws-ec2-metadata-token").
+
+% Refresh credentials this many seconds before they actually expire, so a
+% request does not start with credentials that lapse mid-flight. Matches the
+% 5-minute buffer erlcloud uses.
+-define(CREDENTIAL_REFRESH_BUFFER_SECONDS, 300).
 
 -define(LINEAR_BACK_OFF_MILLIS, 500).
 -define(MAX_RETRIES, 5).
@@ -86,34 +97,28 @@
 
 -record(aws_config, {
     region = undefined :: region(),
-    imdsv2_token = undefined :: imdsv2token() | undefined
+    imdsv2_token = undefined :: imdsv2token() | undefined,
+    %% Per-state override for the AWS API request timeout (ms). undefined means
+    %% use ?DEFAULT_API_TIMEOUT. Set via aws_lib:set_timeout/2.
+    timeout = undefined :: timeout() | undefined
 }).
 -type aws_config() :: #aws_config{}.
 
 -record(aws_state, {
     credentials :: aws_credentials() | undefined,
-    config :: aws_config() | undefined
+    config :: aws_config() | undefined,
+    %% A reusable connection carried across a bounded unit of work (e.g. the
+    %% boot ARN-resolution pass). `undefined' = one-shot mode (the default for
+    %% all callers that do not opt in). `none' = reuse mode armed but no
+    %% connection cached yet. `{Conn, Host, Port}' = a cached connection to the
+    %% given endpoint. api_request_with_retries seeds from and writes back to
+    %% this field when it is not `undefined'.
+    reuse_conn :: {aws_lib_httpc:conn(), string(), inet:port_number()} | none | undefined
 }).
 %% Type aws_state() and related result types are defined in aws_lib.erl
 
--type scheme() :: atom().
--type username() :: string().
--type password() :: string().
 -type host() :: string().
--type tcp_port() :: integer().
 -type query_args() :: [tuple() | string()].
--type fragment() :: string().
-
--type userinfo() :: {undefined | username(), undefined | password()}.
-
--type authority() :: {undefined | userinfo(), host(), undefined | tcp_port()}.
--record(uri, {
-    scheme :: undefined | scheme(),
-    authority :: authority(),
-    path :: undefined | path(),
-    query :: undefined | query_args(),
-    fragment :: undefined | fragment()
-}).
 
 -type method() :: head | get | put | post | trace | options | delete | patch.
 -type http_version() :: string().

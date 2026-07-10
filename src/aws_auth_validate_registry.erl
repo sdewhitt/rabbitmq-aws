@@ -36,6 +36,8 @@ lookup_backend(<<"http">>) ->
     {ok, aws_auth_validate_http};
 lookup_backend(<<"oauth">>) ->
     {ok, aws_auth_validate_oauth};
+lookup_backend(<<"tls">>) ->
+    {ok, aws_auth_validate_tls};
 lookup_backend(_) ->
     {error, unknown_method}.
 
@@ -54,11 +56,13 @@ effective_allowed_fields(Module, Method) ->
 %% Per-method enable check. Most methods default to enabled when no
 %% per-method setting is provided (operator opts out, not in) -- but a method
 %% in ?OPT_IN_METHODS defaults to DISABLED and must be turned on explicitly.
-%% http and oauth are opt-in until their SSRF address policy is implemented
-%% and AppSec reviewed (see aws_auth_validate_http / aws_auth_validate_oauth):
-%% without this, enabling validation for ldap would silently bring the http
-%% and oauth probes live too.
--define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>]).
+%% http and oauth connect to a customer-supplied URL (an SSRF surface). Their
+%% address policy is implemented and enforced (see aws_auth_validate_net); they
+%% are opt-in so enabling ldap or the feature toggle does not bring them live.
+%% tls makes no outbound connection, but resolving a cacertfile ARN under the
+%% assume_role is still a capability worth enabling explicitly, so it is opt-in
+%% too: turning on ldap or the feature toggle does not bring it live.
+-define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>, <<"tls">>]).
 
 -spec is_method_enabled(binary()) -> boolean().
 is_method_enabled(Method) ->

@@ -20,8 +20,9 @@
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
 
--spec headers(request()) -> headers().
-%% @doc Create the signed request headers
+-spec headers(request()) -> {ok, headers()} | {error, {malformed_uri, string()}}.
+%% @doc Create the signed request headers, or {error, {malformed_uri, _}} when
+%% the request URI cannot be parsed.
 %% end
 headers(Request) ->
     headers(Request, undefined).
@@ -29,9 +30,16 @@ headers(Request) ->
 headers(Request, undefined) ->
     headers(Request, sha256(Request#request.body));
 headers(Request, PayloadHash) ->
+    case aws_lib_uri:parse(Request#request.uri) of
+        {ok, URI} ->
+            {ok, headers(Request, PayloadHash, URI)};
+        {error, _} = Error ->
+            Error
+    end.
+
+headers(Request, PayloadHash, URI) ->
     RequestTimestamp = local_time(),
-    URI = aws_lib_uri:parse(Request#request.uri),
-    {_, Host, _} = URI#uri.authority,
+    Host = aws_lib_uri:host(URI),
 
     Headers = append_headers(
         RequestTimestamp,
@@ -43,8 +51,8 @@ headers(Request, PayloadHash) ->
     ),
     RequestHash = request_hash(
         Request#request.method,
-        URI#uri.path,
-        URI#uri.query,
+        aws_lib_uri:path(URI),
+        aws_lib_uri:query(URI),
         Headers,
         PayloadHash
     ),
@@ -184,11 +192,15 @@ hmac_sign(Key, Message) ->
     binary_to_list(SignedValue).
 
 -spec local_time() -> string().
-%% @doc Return the current timestamp in GMT formatted in ISO8601 basic format.
+%% @doc Return the current UTC timestamp formatted in ISO8601 basic format. We
+%% read calendar:universal_time/0 directly rather than converting local time via
+%% local_time_to_universal_time_dst/1: that conversion returns two datetimes
+%% during a DST fall-back transition (the local hour is ambiguous) and none
+%% during a spring-forward gap, so matching a single [LocalTime] crashed with
+%% badmatch in the transition window.
 %% @end
 local_time() ->
-    [LocalTime] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-    local_time(LocalTime).
+    local_time(calendar:universal_time()).
 
 -spec local_time(calendar:datetime()) -> string().
 %% @doc Return the current timestamp in GMT formatted in ISO8601 basic format.
@@ -200,7 +212,7 @@ local_time({{Y, M, D}, {HH, MM, SS}}) ->
 %% @doc Return the sorted query string for the specified arguments.
 %% @end
 query_string(undefined) -> "";
-query_string(QueryArgs) -> aws_lib_uri:build_query_string(lists:keysort(1, QueryArgs)).
+query_string(QueryArgs) -> aws_lib_uri:compose_query(lists:keysort(1, QueryArgs)).
 
 -spec request_hash(
     Method :: method(),

@@ -20,7 +20,7 @@
 %% differ.
 %%
 %% Security invariants preserved verbatim from the original copies:
-%%   * R6 -- a resolved secret (password / PEM) is never logged or returned;
+%%   * a resolved secret (password / PEM) is never logged or returned;
 %%     resolve_arn/2 adapts aws_arn_util's 3-tuple to {ok, Binary} and discards
 %%     the threaded state.
 %%   * assume_role guardrail -- resolving any ARN requires a configured
@@ -84,8 +84,8 @@
 %%                 forces the assume_role guardrail, exactly like arn_keys.
 %%                 Omit for backends with no such param.
 %%   reasons    :: map()      -- backend-specific fixed reason binaries, keyed by
-%%                 the atoms below (so each backend keeps its own wording/R4
-%%                 contract). See reason/2.
+%%                 the atoms below (so each backend keeps its own fixed-response
+%%                 wording). See reason/2.
 -type opts() :: #{
     arn_keys := [binary()],
     ssl_option_keys := [binary()],
@@ -184,7 +184,7 @@ params_reference_arn(_Params, _Opts) ->
 %% Resolve an ARN using the request's threaded aws_state(). The 3-tuple
 %% {ok, Data, State1} from aws_arn_util:resolve_arn/2 is adapted back to the
 %% {ok, Binary} contract callers expect; the threaded state is request-scoped
-%% and discarded here. R6: the resolved secret is neither logged nor returned.
+%% and discarded here: the resolved secret is neither logged nor returned.
 %%
 %% Fail closed on the `none' sentinel: a request that referenced no ARN carries
 %% aws_state => none (a no-ARN branch), and must never resolve an ARN -- doing so
@@ -261,6 +261,10 @@ valid_ssl_value(<<"versions">>, V, Opts) when is_list(V), V =/= [] ->
     end;
 valid_ssl_value(<<"versions">>, _V, Opts) ->
     {error, input_invalid, reason(bad_ssl_versions, Opts)};
+valid_ssl_value(<<"fail_if_no_peer_cert">>, V, _Opts) when is_boolean(V) ->
+    ok;
+valid_ssl_value(<<"fail_if_no_peer_cert">>, _V, Opts) ->
+    {error, input_invalid, reason(bad_ssl_fail_if_no_peer_cert, Opts)};
 valid_ssl_value(<<"cacertfile_arn">>, V, Opts) ->
     nonempty_or(V, bad_ssl_cacert_arn, Opts);
 valid_ssl_value(<<"certfile_arn">>, V, Opts) ->
@@ -449,7 +453,7 @@ os_cacerts() ->
 
 %% Map an httpc transport error to a fixed category: a TLS/cert failure is
 %% tls_failed (with TlsReason), everything else connection_failed (ConnReason).
-%% The raw reason is never echoed (R4).
+%% The raw reason is never echoed.
 -spec classify_http_error(term(), binary(), binary()) ->
     {error, tls_failed | connection_failed, binary()}.
 classify_http_error(Reason, TlsReason, ConnReason) ->
@@ -525,7 +529,7 @@ connection_timeout_ms(#{default := Default, max := Max}) ->
 %%--------------------------------------------------------------------
 
 %% Fetch a backend-specific fixed reason binary. Each backend supplies its own
-%% wording (preserving its R4 response contract and existing tests) via the
+%% wording (preserving its fixed-response contract and existing tests) via the
 %% reasons map in opts().
 reason(Key, #{reasons := Reasons}) ->
     maps:get(Key, Reasons).
