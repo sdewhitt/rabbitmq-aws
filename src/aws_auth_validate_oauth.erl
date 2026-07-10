@@ -436,16 +436,14 @@ do_fetch_jwks(#{jwks_uri := undefined, issuer := IssuerUrl, timeout := Timeout},
 
 %% Fetch {issuer}/.well-known/openid-configuration, JSON-decode, extract jwks_uri.
 discover_jwks_uri(IssuerUrl, SslOpts, Timeout, Profile) ->
-    %% Build the discovery URL by appending the well-known path.
-    %% Strip any trailing slash from the issuer to avoid double-slash paths
-    %% (e.g. "https://idp.example.com//" which some IdPs reject with 404).
-    DiscoveryUrlStr =
-        strip_trailing_slash(maps:get(url_string, IssuerUrl)) ++
-            "/.well-known/openid-configuration",
     case aws_auth_validate_net:resolve_and_pin(IssuerUrl, net_policy()) of
         {error, _, _} = Err ->
             Err;
         {ok, PinnedUrl, Host} ->
+            %% Build the discovery URL by appending the well-known path to the
+            %% pinned URL. Strip any trailing slash from the issuer to avoid
+            %% double-slash paths (e.g. "https://idp.example.com//" which some
+            %% IdPs reject with 404).
             PinnedDiscoveryStr =
                 strip_trailing_slash(maps:get(url_string, PinnedUrl)) ++
                     "/.well-known/openid-configuration",
@@ -458,7 +456,7 @@ discover_jwks_uri(IssuerUrl, SslOpts, Timeout, Profile) ->
             Request = {PinnedDiscoveryStr, [{"host", Host}]},
             case httpc:request(get, Request, HttpOpts, [{body_format, binary}], Profile) of
                 {ok, {{_Vsn, 200, _Phrase}, _Headers, Body}} ->
-                    parse_discovery_doc(Body, DiscoveryUrlStr);
+                    parse_discovery_doc(Body);
                 {ok, {{_Vsn, _Code, _Phrase}, _Headers, _Body}} ->
                     {error, auth_failed, ?REASON_DISCOVERY};
                 {error, Reason} ->
@@ -467,7 +465,7 @@ discover_jwks_uri(IssuerUrl, SslOpts, Timeout, Profile) ->
     end.
 
 %% Parse the OIDC discovery document and extract jwks_uri.
-parse_discovery_doc(Body, _DiscoveryUrlStr) ->
+parse_discovery_doc(Body) ->
     case rabbit_json:try_decode(Body) of
         {ok, Map} when is_map(Map) ->
             case maps:get(<<"jwks_uri">>, Map, undefined) of

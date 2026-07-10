@@ -7,6 +7,11 @@
 
 -export([assume_role/2]).
 
+%% Export all for unit tests
+-ifdef(TEST).
+-compile(export_all).
+-endif.
+
 -spec assume_role(string() | binary(), aws_lib:aws_state()) ->
     {ok, aws_lib:aws_state()} | {error, term()}.
 assume_role(RoleArn, State) when is_binary(RoleArn) ->

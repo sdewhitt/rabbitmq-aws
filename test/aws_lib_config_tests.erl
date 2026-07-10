@@ -6,7 +6,7 @@
 mock_gun_imdsv2_failure() ->
     meck:expect(gun, open, fun(_, _, _) -> {ok, fake_conn} end),
     meck:expect(gun, await_up, fun(_, _) -> {ok, http} end),
-    meck:expect(gun, put, fun(_, _, _, _) -> fake_stream end),
+    meck:expect(gun, put, fun(_, _, _, _, _) -> fake_stream end),
     meck:expect(gun, get, fun(_, _, _) -> fake_stream end),
     meck:expect(gun, await, fun(_, _, _) -> {response, fin, 404, []} end),
     meck:expect(gun, close, fun(_) -> ok end).
@@ -651,7 +651,7 @@ load_imdsv2_token_test_() ->
                 meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
                 meck:expect(gun, close, fun(_) -> ok end),
                 meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
-                meck:expect(gun, put, fun(_, _, _, _) -> stream_ref end),
+                meck:expect(gun, put, fun(_, _, _, _, _) -> stream_ref end),
                 meck:expect(gun, await, fun(_, _, _) -> {response, nofin, 400, headers} end),
                 meck:expect(gun, await_body, fun(_, _, _) ->
                     {ok, <<"Missing or Invalid Parameters – The PUT request is not valid.">>}
@@ -664,7 +664,7 @@ load_imdsv2_token_test_() ->
                 meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
                 meck:expect(gun, close, fun(_) -> ok end),
                 meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
-                meck:expect(gun, put, fun(_, _, _, _) -> stream_ref end),
+                meck:expect(gun, put, fun(_, _, _, _, _) -> stream_ref end),
                 meck:expect(gun, await, fun(_, _, _) -> {response, nofin, 200, headers} end),
                 meck:expect(gun, await_body, fun(_, _, _) -> {error, timeout} end),
                 ?assertEqual(undefined, aws_lib_config:load_imdsv2_token())
@@ -674,7 +674,7 @@ load_imdsv2_token_test_() ->
                 meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
                 meck:expect(gun, close, fun(_) -> ok end),
                 meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
-                meck:expect(gun, put, fun(_, _, _, _) -> stream_ref end),
+                meck:expect(gun, put, fun(_, _, _, _, _) -> stream_ref end),
                 meck:expect(gun, await, fun(_, _, _) -> {response, nofin, 200, headers} end),
                 meck:expect(gun, await_body, fun(_, _, _) -> {ok, list_to_binary(IMDSv2Token)} end),
                 ?assertEqual(IMDSv2Token, aws_lib_config:load_imdsv2_token())
@@ -706,7 +706,7 @@ maybe_imdsv2_token_headers_test_() ->
                 meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
                 meck:expect(gun, close, fun(_) -> ok end),
                 meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
-                meck:expect(gun, put, fun(_, _, _, _) -> stream_ref end),
+                meck:expect(gun, put, fun(_, _, _, _, _) -> stream_ref end),
                 meck:expect(gun, await, fun(_, _, _) -> {response, nofin, 200, headers} end),
                 meck:expect(gun, await_body, fun(_, _, _) -> {ok, list_to_binary(IMDSv2Token)} end),
                 {ok, Headers, _S1} = aws_lib_config:maybe_imdsv2_token_headers(S),

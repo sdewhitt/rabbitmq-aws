@@ -288,3 +288,154 @@ flush_seen() ->
         {seen, Arn, Key} -> {Arn, Key}
     after 1000 -> erlang:error(resolve_arn_not_called)
     end.
+
+%%--------------------------------------------------------------------
+%% Connection reuse across the boot ARN-resolution pass (issue #107).
+%%
+%% These exercise the full path from process_arn_config through
+%% api_get_request down to gun, counting gun:open calls to prove that
+%% same-host ARNs reuse one connection. gun is mocked; no real network.
+%%--------------------------------------------------------------------
+
+connection_reuse_boot_test_() ->
+    {foreach, fun conn_reuse_setup/0, fun conn_reuse_teardown/1, [
+        fun same_host_arns_reuse_one_connection/0,
+        fun different_host_arns_reopen/0,
+        fun connection_closed_at_end_of_pass/0
+    ]}.
+
+conn_reuse_setup() ->
+    ok = meck:new(gun, []),
+    ok = meck:new(aws_iam, [no_link]),
+    ok = meck:new(aws_lib_config, [passthrough]),
+    ok = meck:new(?HANDLER, [non_strict, no_link]),
+    %% Provide valid credentials so ensure_credentials_valid does not hit IMDS.
+    meck:expect(aws_lib_config, credentials, fun(Config) ->
+        Creds = #aws_credentials{
+            access_key = "AKID",
+            secret_key = "SECRET",
+            security_token = undefined,
+            expiration = {{3016, 1, 1}, {0, 0, 0}}
+        },
+        {ok, Creds, Config}
+    end),
+    %% Resolve the region deterministically. Without this, do_refresh_credentials
+    %% resolves an undefined region via aws_lib_config:region/1, which falls
+    %% through to the EC2 metadata service when no region is configured in the
+    %% environment. The mocked gun then returns the response body as the
+    %% availability zone, corrupting the endpoint host. This is host-dependent:
+    %% it passes where ~/.aws/config supplies a region but fails in CI where none
+    %% is set.
+    meck:expect(aws_lib_config, region, fun(Config) ->
+        {ok, "us-east-1", Config}
+    end),
+    %% Assume-role succeeds trivially.
+    meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end),
+    %% Handler always succeeds.
+    meck:expect(?HANDLER, run, fun(_Data, _Key, _Sub) -> ok end),
+    ok.
+
+conn_reuse_teardown(_) ->
+    catch meck:unload(?HANDLER),
+    catch meck:unload(gun),
+    catch meck:unload(aws_iam),
+    catch meck:unload(aws_lib_config),
+    ok.
+
+%% Two S3 ARNs in the same region hit the same host (s3.us-east-1.amazonaws.com).
+%% The boot pass should open one connection and reuse it for both resolves.
+same_host_arns_reuse_one_connection() ->
+    Conn = spawn_link(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+    meck:expect(gun, close, fun(_) -> ok end),
+    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+    meck:expect(gun, get, fun(_, _, _) -> stream_ref end),
+    meck:expect(gun, await, fun(_, _, _) ->
+        {response, nofin, 200, [{<<"content-type">>, <<"application/xml">>}]}
+    end),
+    meck:expect(gun, await_body, fun(_, _, _) ->
+        {ok, <<"<data>cert-pem</data>">>}
+    end),
+    ArnConfig = [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"},
+        {arns, [
+            {?HANDLER, "arn:aws:s3:::bucket/cert1.pem", ssl_cacertfile, [ssl_options, cacertfile]},
+            {?HANDLER, "arn:aws:s3:::bucket/cert2.pem", ssl_certfile, [ssl_options, certfile]}
+        ]}
+    ],
+    Result = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
+    ?assertMatch({ok, {iam_role_result, assumed}}, Result),
+    ?assertEqual(1, meck:num_calls(gun, open, '_')),
+    Conn ! stop.
+
+%% An S3 ARN and a Secrets Manager ARN hit different hosts (s3.us-east-1 vs
+%% secretsmanager.us-east-1). The pass should close the first connection and
+%% open a second for the different host.
+different_host_arns_reopen() ->
+    Conn = spawn_link(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+    meck:expect(gun, close, fun(_) -> ok end),
+    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+    meck:expect(gun, get, fun(_, _, _) -> stream_ref end),
+    meck:expect(gun, post, fun(_, _, _, _, _) -> stream_ref end),
+    %% Secrets Manager replies with JSON; maybe_decode_body decodes it into the
+    %% string-keyed proplist aws_sms:find_secret/1 matches (issue #131 fixed the
+    %% earlier double-decode, so aws_sms no longer decodes it a second time).
+    meck:expect(gun, await, fun(_, _, _) ->
+        {response, nofin, 200, [{<<"content-type">>, <<"application/x-amz-json-1.1">>}]}
+    end),
+    meck:expect(gun, await_body, fun(_, _, _) ->
+        {ok, <<"{\"SecretString\": \"secret-value\"}">>}
+    end),
+    ArnConfig = [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"},
+        {arns, [
+            {?HANDLER, "arn:aws:s3:::bucket/cert.pem", ssl_cacertfile, [ssl_options, cacertfile]},
+            {?HANDLER, "arn:aws:secretsmanager:us-east-1:123456789012:secret:key", ssl_keyfile, [
+                ssl_options, keyfile
+            ]}
+        ]}
+    ],
+    Result = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
+    ?assertMatch({ok, {iam_role_result, assumed}}, Result),
+    %% Two different hosts -> two opens.
+    ?assertEqual(2, meck:num_calls(gun, open, '_')),
+    %% Two closes: ensure_open closes the S3 connection when it switches to the
+    %% Secrets Manager host, and the end-of-pass close tears the second one down.
+    ?assertEqual(2, meck:num_calls(gun, close, '_')),
+    Conn ! stop.
+
+%% The connection is closed at the end of the pass (not leaked).
+connection_closed_at_end_of_pass() ->
+    Conn = spawn_link(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+    meck:expect(gun, close, fun(_) -> ok end),
+    meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+    meck:expect(gun, get, fun(_, _, _) -> stream_ref end),
+    meck:expect(gun, await, fun(_, _, _) ->
+        {response, nofin, 200, [{<<"content-type">>, <<"application/xml">>}]}
+    end),
+    meck:expect(gun, await_body, fun(_, _, _) ->
+        {ok, <<"<data>cert-pem</data>">>}
+    end),
+    ArnConfig = [
+        {assume_role_arn, "arn:aws:iam::123456789012:role/r"},
+        {arns, [
+            {?HANDLER, "arn:aws:s3:::bucket/cert.pem", ssl_cacertfile, [ssl_options, cacertfile]}
+        ]}
+    ],
+    _ = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
+    ?assertEqual(1, meck:num_calls(gun, close, '_')),
+    Conn ! stop.

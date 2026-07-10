@@ -11,6 +11,8 @@
     new/0, new/1,
     get_region/1,
     set_region/2,
+    get_timeout/1,
+    set_timeout/2,
     get_credentials/1,
     get/3, get/4, get/5,
     put/5, put/6,
@@ -20,7 +22,6 @@
     set_credentials/3,
     set_credentials/4,
     has_credentials/1,
-    parse_uri/1,
     ensure_credentials_valid/1,
     ensure_imdsv2_token_valid/1,
     expired_imdsv2_token/1,
@@ -33,7 +34,9 @@
     direct_request/7,
     endpoint/4,
     sign_headers/10,
-    instance_volumes/1
+    instance_volumes/1,
+    enable_connection_reuse/1,
+    close_reuse_connection/1
 ]).
 
 -export_type([aws_state/0]).
@@ -47,7 +50,7 @@
 -include_lib("kernel/include/logger.hrl").
 
 -opaque aws_state() :: #aws_state{}.
--type connection_handle() :: {pid(), string()}.
+-type connection_handle() :: {aws_lib_httpc:conn(), string()}.
 
 %%====================================================================
 %% State construction and accessors
@@ -79,6 +82,22 @@ get_region(#aws_state{config = #aws_config{region = Region}}) ->
 set_region(Region, State = #aws_state{config = Config}) ->
     {ok, State#aws_state{config = Config#aws_config{region = Region}}}.
 
+-spec get_timeout(State :: aws_state()) -> timeout().
+%% @doc Get the AWS API request timeout (ms) from the state, falling back to
+%% ?DEFAULT_API_TIMEOUT when the state does not set one.
+%% @end
+get_timeout(#aws_state{config = #aws_config{timeout = undefined}}) ->
+    ?DEFAULT_API_TIMEOUT;
+get_timeout(#aws_state{config = #aws_config{timeout = Timeout}}) ->
+    Timeout.
+
+-spec set_timeout(Timeout :: timeout(), State :: aws_state()) -> {ok, aws_state()}.
+%% @doc Set the AWS API request timeout (ms) in the state. Applied to requests
+%% that do not pass an explicit `timeout' option.
+%% @end
+set_timeout(Timeout, State = #aws_state{config = Config}) ->
+    {ok, State#aws_state{config = Config#aws_config{timeout = Timeout}}}.
+
 -spec get_credentials(State :: aws_state()) -> {ok, aws_credentials()} | {error, undefined}.
 %% @doc Get the credentials from the state.
 %% @end
@@ -86,6 +105,27 @@ get_credentials(#aws_state{credentials = undefined}) ->
     {error, undefined};
 get_credentials(#aws_state{credentials = Creds}) ->
     {ok, Creds}.
+
+-spec enable_connection_reuse(State :: aws_state()) -> aws_state().
+%% @doc Arm the state for connection reuse: subsequent api_get_request /
+%% api_post_request calls that target the same Host:Port reuse a single
+%% connection across calls instead of opening a fresh one each time. The caller
+%% MUST call close_reuse_connection/1 when the unit of work is complete.
+%% @end
+enable_connection_reuse(State) ->
+    State#aws_state{reuse_conn = none}.
+
+-spec close_reuse_connection(State :: aws_state()) -> aws_state().
+%% @doc Close any connection held in the reuse slot and clear it, returning the
+%% state to one-shot mode. Safe to call when no connection is held.
+%% @end
+close_reuse_connection(#aws_state{reuse_conn = undefined} = State) ->
+    State;
+close_reuse_connection(#aws_state{reuse_conn = none} = State) ->
+    State#aws_state{reuse_conn = undefined};
+close_reuse_connection(#aws_state{reuse_conn = {Conn, _Host, _Port}} = State) ->
+    aws_lib_httpc:close(Conn),
+    State#aws_state{reuse_conn = undefined}.
 
 %%====================================================================
 %% Legacy functions - to be updated
@@ -190,17 +230,17 @@ open_connection(Service, Options, State0) ->
 
     Host = endpoint_host(Region, Service),
     Port = 443,
-    case create_gun_connection(Host, Port, Options) of
-        {ok, GunPid} ->
-            {ok, {GunPid, Service}, State1};
+    case aws_lib_httpc:open(Host, Port, gun_open_opts(Port, Options)) of
+        {ok, Conn} ->
+            {ok, {Conn, Service}, State1};
         {error, _Reason} = Error ->
             Error
     end.
 
 %% Close a direct connection
 -spec close_connection(Handle :: connection_handle()) -> ok.
-close_connection({GunPid, _Service}) ->
-    gun:close(GunPid).
+close_connection({Conn, _Service}) ->
+    aws_lib_httpc:close(Conn).
 
 -spec direct_request(
     Handle :: connection_handle(),
@@ -240,22 +280,29 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
             Host = endpoint_host(Region, Service),
             URI = create_uri(Host, Path),
             BodyHash = proplists:get_value(payload_hash, Options),
-            SignedHeaders = sign_headers(
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Region,
-                Service,
-                Method,
-                URI,
-                Headers,
-                Body,
-                BodyHash
-            ),
-            case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options) of
-                {ok, Response} ->
-                    {ok, Response, State1};
-                Error ->
+            case
+                sign_headers(
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Region,
+                    Service,
+                    Method,
+                    URI,
+                    Headers,
+                    Body,
+                    BodyHash
+                )
+            of
+                {ok, SignedHeaders} ->
+                    Options1 = ensure_timeout_option(Options, State1),
+                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options1) of
+                        {ok, Response} ->
+                            {ok, Response, State1};
+                        Error ->
+                            Error
+                    end;
+                {error, _} = Error ->
                     Error
             end;
         undefined ->
@@ -273,7 +320,7 @@ direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) 
     Headers :: headers(),
     Body :: body(),
     BodyHash :: iodata() | undefined
-) -> headers().
+) -> {ok, headers()} | {error, {malformed_uri, string()}}.
 sign_headers(
     AccessKey, SecretKey, SecurityToken, Region, Service, Method, URI, Headers, Body, BodyHash
 ) ->
@@ -397,6 +444,35 @@ ensure_credentials_valid(State) ->
     State :: aws_state()
 ) -> {ok, {headers(), term()}, aws_state()} | result_error().
 perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, State0) ->
+    case prepare_signed_request(Service, Method, Headers, Path, Body, Options, Host, State0) of
+        {ok, URI, SignedHeaders, Options1, State1} ->
+            case gun_request(Method, URI, SignedHeaders, Body, Options1) of
+                {ok, Response} ->
+                    {ok, Response, State1};
+                Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec prepare_signed_request(
+    Service :: string(),
+    Method :: method(),
+    Headers :: headers(),
+    Path :: path(),
+    Body :: body(),
+    Options :: http_options(),
+    Host :: string() | undefined,
+    State :: aws_state()
+) ->
+    {ok, URI :: string(), headers(), http_options(), aws_state()}
+    | {error, term()}.
+%% Ensure credentials, resolve the region, build the endpoint URI, and sign the
+%% request headers. Shared by the one-shot path (perform_request_direct/8) and
+%% the connection-reusing retry path (perform_request_reuse/8); it performs no
+%% network I/O of its own beyond a possible credential refresh.
+prepare_signed_request(Service, Method, Headers, Path, Body, Options, Host, State0) ->
     % Ensure we have credentials
     State1 =
         case has_credentials(State0) of
@@ -424,22 +500,24 @@ perform_request_direct(Service, Method, Headers, Path, Body, Options, Host, Stat
                 end,
 
             URI = endpoint(Region, Host, Service, Path),
-            SignedHeaders = sign_headers(
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Region,
-                Service,
-                Method,
-                URI,
-                Headers,
-                Body,
-                undefined
-            ),
-            case gun_request(Method, URI, SignedHeaders, Body, Options) of
-                {ok, Response} ->
-                    {ok, Response, State1};
-                Error ->
+            case
+                sign_headers(
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Region,
+                    Service,
+                    Method,
+                    URI,
+                    Headers,
+                    Body,
+                    undefined
+                )
+            of
+                {ok, SignedHeaders} ->
+                    Options1 = ensure_timeout_option(Options, State1),
+                    {ok, URI, SignedHeaders, Options1, State1};
+                {error, _} = Error ->
                     Error
             end;
         undefined ->
@@ -545,21 +623,29 @@ get_content_type(Headers) ->
     parse_content_type(Value).
 
 -spec expired_credentials(Expiration :: calendar:datetime()) -> boolean().
-%% @doc Indicates if the date that is passed in has expired.
+%% @doc Indicates whether the given expiration is at or within the refresh
+%% buffer window. Credentials are treated as expired a few minutes before they
+%% actually lapse (?CREDENTIAL_REFRESH_BUFFER_SECONDS) so they are refreshed
+%% proactively rather than after a request has already started with credentials
+%% that expire mid-flight.
 %% end
 expired_credentials(undefined) ->
     false;
 expired_credentials(Expiration) ->
     Now = calendar:datetime_to_gregorian_seconds(local_time()),
     Expires = calendar:datetime_to_gregorian_seconds(Expiration),
-    Now >= Expires.
+    Now >= (Expires - ?CREDENTIAL_REFRESH_BUFFER_SECONDS).
 
 -spec local_time() -> calendar:datetime().
-%% @doc Return the current local time.
+%% @doc Return the current UTC time. Callers compare this against UTC expiration
+%% timestamps, so it must be UTC. We read calendar:universal_time/0 directly
+%% rather than converting local time via local_time_to_universal_time_dst/1:
+%% that conversion returns two datetimes during a DST fall-back transition (the
+%% local hour is ambiguous) and none during a spring-forward gap, so matching a
+%% single [Value] crashed with badmatch in the transition window.
 %% @end
 local_time() ->
-    [Value] = calendar:local_time_to_universal_time_dst(calendar:local_time()),
-    Value.
+    calendar:universal_time().
 
 -spec maybe_decode_body(ContentType :: {nonempty_string(), nonempty_string()}, Body :: body()) ->
     list() | body().
@@ -567,14 +653,30 @@ local_time() ->
 %% @end
 maybe_decode_body(_, <<>>) ->
     <<>>;
-maybe_decode_body({"application", "x-amz-json-1.0"}, Body) ->
-    aws_lib_json:decode(Body);
-maybe_decode_body({"application", "json"}, Body) ->
-    aws_lib_json:decode(Body);
-maybe_decode_body({_, "xml"}, Body) ->
+maybe_decode_body({"application", Subtype}, Body) ->
+    case is_json_subtype(Subtype) of
+        true -> aws_lib_json:decode(Body);
+        false -> maybe_decode_xml(Subtype, Body)
+    end;
+maybe_decode_body({_, Subtype}, Body) ->
+    maybe_decode_xml(Subtype, Body).
+
+maybe_decode_xml("xml", Body) ->
     aws_lib_xml:parse(Body);
-maybe_decode_body(_ContentType, Body) ->
+maybe_decode_xml(_Subtype, Body) ->
     Body.
+
+%% Recognise the JSON subtypes AWS services return. Covers plain `json', every
+%% AWS JSON protocol version (`x-amz-json-1.0', `x-amz-json-1.1', and any future
+%% `x-amz-json-*'), and the RFC 6839 structured `+json' suffix. Secrets Manager
+%% and other services use the JSON 1.1 protocol, so matching only 1.0/plain left
+%% those responses undecoded (issue #99).
+is_json_subtype("json") ->
+    true;
+is_json_subtype("x-amz-json-" ++ _Version) ->
+    true;
+is_json_subtype(Subtype) ->
+    lists:suffix("+json", Subtype).
 
 -spec parse_content_type(ContentType :: string()) -> {Type :: string(), Subtype :: string()}.
 %% @doc parse a content type string returning a tuple of type/subtype
@@ -720,18 +822,47 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     {ok, list(), aws_state()} | {error, term()}.
 %% @doc Invoke an API call to an AWS service with retries.
 %% @end
-api_request_with_retries(_Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State) when
+api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
+    %% Open a single connection and reuse it across the whole retry sequence
+    %% instead of opening a fresh TCP+TLS connection per attempt (issue #91).
+    %% When the state carries a reuse_conn (cross-request reuse, issue #107),
+    %% seed from it so the first attempt avoids a fresh handshake; otherwise
+    %% start with `undefined' (nothing open yet, opened lazily on first attempt).
+    Conn0 = seed_conn_from_state(State),
+    api_request_with_retries(
+        Service, Method, Path, Body, Headers, Retries, WaitTime, State, Conn0
+    ).
+
+-spec api_request_with_retries(
+    Service :: string(),
+    Method :: method(),
+    Path :: path(),
+    Body :: body(),
+    Headers :: headers(),
+    Retries :: integer(),
+    WaitTime :: integer(),
+    State :: aws_state(),
+    Conn :: aws_lib_httpc:conn() | undefined
+) ->
+    {ok, list(), aws_state()} | {error, term()}.
+api_request_with_retries(
+    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State, Conn
+) when
     Retries =< 0
 ->
+    close_if_open(Conn),
     ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
     {error, "AWS service is unavailable"};
-api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State0) ->
+api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0) ->
     case ensure_credentials_valid(State0) of
         {ok, State1} ->
-            case request(Service, Method, Path, Body, Headers, State1) of
+            {Result, Conn1} =
+                perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, Conn0),
+            case Result of
                 {ok, {_Headers, Payload}, State2} ->
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
-                    {ok, Payload, State2};
+                    State3 = finish_conn_success(Conn1, State2),
+                    {ok, Payload, State3};
                 {error, Message, Response} ->
                     %% Message may be a status string (from format_response/1
                     %% on an HTTP error) or a tuple such as
@@ -748,46 +879,155 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
                     end,
                     ?LOG_WARNING("Will retry AWS request, remaining retries: ~b", [Retries]),
                     timer:sleep(WaitTime),
+                    %% perform_request_reuse/8 hands back a live connection after
+                    %% an HTTP-level error (reused on the next attempt) or
+                    %% `undefined' after a transport failure (reopened next attempt).
                     api_request_with_retries(
-                        Service, Method, Path, Body, Headers, Retries - 1, WaitTime, State1
+                        Service, Method, Path, Body, Headers, Retries - 1, WaitTime, State1, Conn1
                     )
             end;
         {error, Reason} ->
+            close_if_open(Conn0),
             {error, {credentials, Reason}}
     end.
 
-%% Gun HTTP client functions
+%% Perform one request attempt on a reusable connection. Opens a connection when
+%% none is carried (or the carried one targets a different host) and reuses the
+%% carried one otherwise. Returns the same result shape as request/6 together
+%% with the connection slot to carry into the next attempt: a live
+%% {Conn, Host, Port} after an HTTP-level error (so the retry reuses it), or
+%% `undefined' after a transport failure (so the retry reopens). The connection
+%% is opened with `retry => 0' so a dropped socket terminates the Gun process; a
+%% request on a since-dead connection then fails fast through gun:await's process
+%% monitor ({error, {down, _}}) and is reopened on the next attempt.
+-spec perform_request_reuse(
+    Service :: string(),
+    Method :: method(),
+    Headers :: headers(),
+    Path :: path(),
+    Body :: body(),
+    Options :: http_options(),
+    State :: aws_state(),
+    ConnSlot :: {aws_lib_httpc:conn(), string(), inet:port_number()} | undefined
+) ->
+    {
+        {ok, {headers(), term()}, aws_state()} | result_error(),
+        {aws_lib_httpc:conn(), string(), inet:port_number()} | undefined
+    }.
+perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, ConnSlot0) ->
+    case prepare_signed_request(Service, Method, Headers, Path, Body, Options, undefined, State0) of
+        {ok, URI, SignedHeaders, Options1, State1} ->
+            case aws_lib_uri:parse(URI) of
+                {ok, Uri} ->
+                    Host = aws_lib_uri:host(Uri),
+                    Port = aws_lib_uri:port(Uri),
+                    Target = aws_lib_uri:target(Uri),
+                    OpenOpts = (gun_open_opts(Port, Options1))#{retry => 0},
+                    case ensure_open(ConnSlot0, Host, Port, OpenOpts) of
+                        {ok, Conn1} ->
+                            Timeout = proplists:get_value(
+                                timeout, Options1, ?DEFAULT_API_TIMEOUT
+                            ),
+                            Response = aws_lib_httpc:request(
+                                Conn1, Method, Target, SignedHeaders, Body, Timeout
+                            ),
+                            classify_reuse_response(
+                                format_response(Response), State1, {Conn1, Host, Port}
+                            );
+                        {error, Reason} ->
+                            {format_response({error, Reason}), undefined}
+                    end;
+                {error, _Reason} = Error ->
+                    {format_response(Error), ConnSlot0}
+            end;
+        {error, _} = Error ->
+            {Error, ConnSlot0}
+    end.
+
+%% Attach the connection slot to carry forward based on the request outcome:
+%% success or an HTTP-level error leaves the connection intact; a transport
+%% failure (format_response/1's {error, _, undefined}) makes it unusable.
+classify_reuse_response({ok, Result}, State, ConnSlot) ->
+    {{ok, Result, State}, ConnSlot};
+classify_reuse_response({error, _Reason, undefined} = Err, _State, {Conn, _, _}) ->
+    aws_lib_httpc:close(Conn),
+    {Err, undefined};
+classify_reuse_response({error, _Message, _Payload} = Err, _State, ConnSlot) ->
+    {Err, ConnSlot}.
+
+%% Return a usable connection to Host:Port. If the carried slot targets the same
+%% host, reuse it; if it targets a different host (cross-service boot pass),
+%% close the old one and open fresh; if none is carried, open fresh. A carried
+%% connection is reused as-is: if it has since died, gun:await's process monitor
+%% surfaces a transport error and the next attempt reopens.
+ensure_open(undefined, Host, Port, OpenOpts) ->
+    aws_lib_httpc:open(Host, Port, OpenOpts);
+ensure_open({Conn, Host, Port}, Host, Port, _OpenOpts) ->
+    {ok, Conn};
+ensure_open({OldConn, _OldHost, _OldPort}, Host, Port, OpenOpts) ->
+    aws_lib_httpc:close(OldConn),
+    aws_lib_httpc:open(Host, Port, OpenOpts).
+
+close_if_open(undefined) -> ok;
+close_if_open({Conn, _Host, _Port}) -> aws_lib_httpc:close(Conn).
+
+%% Seed the retry loop's connection slot from the state's reuse_conn. In
+%% one-shot mode (reuse_conn = undefined, the default) this returns `undefined'
+%% and the loop opens fresh on the first attempt. In reuse mode (none or a
+%% cached {Conn, Host, Port}) the state's slot is handed in so the first attempt
+%% avoids a handshake when possible.
+seed_conn_from_state(#aws_state{reuse_conn = undefined}) ->
+    undefined;
+seed_conn_from_state(#aws_state{reuse_conn = none}) ->
+    undefined;
+seed_conn_from_state(#aws_state{reuse_conn = ConnSlot}) ->
+    ConnSlot.
+
+%% On success: in reuse mode, write the live connection back into the state so
+%% the next api_*_request call in the same unit of work reuses it. In one-shot
+%% mode (reuse_conn = undefined), close the connection.
+finish_conn_success(ConnSlot, #aws_state{reuse_conn = undefined} = State) ->
+    close_if_open(ConnSlot),
+    State;
+finish_conn_success(ConnSlot, State) ->
+    State#aws_state{reuse_conn = ConnSlot}.
+
+%% Add the state's AWS API timeout to the request options unless the caller
+%% already passed an explicit `timeout'. A per-request `timeout' option therefore
+%% takes precedence over the per-state value (aws_lib:set_timeout/2), which in
+%% turn falls back to ?DEFAULT_API_TIMEOUT via get_timeout/1.
+ensure_timeout_option(Options, State) ->
+    case proplists:is_defined(timeout, Options) of
+        true -> Options;
+        false -> [{timeout, get_timeout(State)} | Options]
+    end.
+
+%% Gun HTTP client functions. The Gun lifecycle itself lives in aws_lib_httpc;
+%% these functions build the AWS-API-specific request (URI parsing, connection
+%% options from Options) and shape the result via format_response/1.
 gun_request(Method, URI, Headers, Body, Options) ->
-    {Host, Port, Path} = parse_uri(URI),
-    %% A connection failure is returned as {error, Reason} (not raised) so it
-    %% flows through format_response/1 into the {error, _, _} shape the retry
-    %% loop in api_request_with_retries/8 matches, rather than escaping it.
-    case create_gun_connection(Host, Port, Options) of
-        {ok, GunPid} ->
-            Reply = direct_gun_request(GunPid, Method, Path, Headers, Body, Options),
-            gun:close(GunPid),
-            Reply;
+    %% A parse or connection failure is returned as {error, Reason} (not raised)
+    %% so it flows through format_response/1 into the {error, _, _} shape the
+    %% retry loop in api_request_with_retries/8 matches, rather than escaping it.
+    case aws_lib_uri:parse(URI) of
+        {ok, Uri} ->
+            Host = aws_lib_uri:host(Uri),
+            Port = aws_lib_uri:port(Uri),
+            %% target/1 carries the query: Path is the Gun request line.
+            Path = aws_lib_uri:target(Uri),
+            OpenOpts = gun_open_opts(Port, Options),
+            Response = aws_lib_httpc:request(
+                Host, Port, Method, Path, Headers, Body, OpenOpts
+            ),
+            format_response(Response);
         {error, _Reason} = Error ->
             format_response(Error)
     end.
 
-do_gun_request(ConnPid, get, Path, Headers, _Body) ->
-    gun:get(ConnPid, Path, Headers);
-do_gun_request(ConnPid, post, Path, Headers, Body) ->
-    gun:post(ConnPid, Path, Headers, Body, #{});
-do_gun_request(ConnPid, put, Path, Headers, Body) ->
-    gun:put(ConnPid, Path, Headers, Body, #{});
-do_gun_request(ConnPid, head, Path, Headers, _Body) ->
-    gun:head(ConnPid, Path, Headers, #{});
-do_gun_request(ConnPid, delete, Path, Headers, _Body) ->
-    gun:delete(ConnPid, Path, Headers, #{});
-do_gun_request(ConnPid, patch, Path, Headers, Body) ->
-    gun:patch(ConnPid, Path, Headers, Body, #{});
-do_gun_request(ConnPid, options, Path, Headers, _Body) ->
-    gun:options(ConnPid, Path, Headers, #{}).
-
-create_gun_connection(Host, Port, Options) ->
-    % Map HTTP version to Gun protocols, always include http as fallback
+%% Build aws_lib_httpc open options from the request Options and target port:
+%% derive Gun protocols from the requested HTTP version, use TLS on port 443,
+%% and thread the connect and request timeouts through.
+gun_open_opts(Port, Options) ->
     HttpVersion = proplists:get_value(version, Options, "HTTP/1.1"),
     Protocols =
         case HttpVersion of
@@ -798,61 +1038,22 @@ create_gun_connection(Host, Port, Options) ->
             % Default: try HTTP/2, fallback to HTTP/1.1
             _ -> [http2, http]
         end,
-    ConnectTimeout = proplists:get_value(connect_timeout, Options, infinity),
-    Opts = #{
-        transport =>
-            if
-                Port == 443 -> tls;
-                true -> tcp
-            end,
+    Transport =
+        if
+            Port == 443 -> tls;
+            true -> tcp
+        end,
+    #{
+        transport => Transport,
         protocols => Protocols,
-        connect_timeout => ConnectTimeout
-    },
-    case gun:open(Host, Port, Opts) of
-        {ok, ConnPid} ->
-            case gun:await_up(ConnPid, ConnectTimeout) of
-                {ok, _Protocol} ->
-                    {ok, ConnPid};
-                {error, Reason} ->
-                    gun:close(ConnPid),
-                    {error, {gun_connection_failed, Reason}}
-            end;
-        {error, Reason} ->
-            {error, {gun_open_failed, Reason}}
-    end.
+        connect_timeout => proplists:get_value(connect_timeout, Options, infinity),
+        timeout => proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT)
+    }.
 
 create_uri(Host, Path) when is_list(Path) ->
     "https://" ++ Host ++ Path;
 create_uri(Host, {Bucket, Key}) ->
     "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
-
-parse_uri(URI) ->
-    case string:split(URI, "://", leading) of
-        [Scheme, Rest] ->
-            case string:split(Rest, "/", leading) of
-                [HostPort] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/"};
-                [HostPort, Path] ->
-                    {Host, Port} = parse_host_port(HostPort, Scheme),
-                    {Host, Port, "/" ++ Path}
-            end
-    end.
-
-parse_host_port(HostPort, Scheme) ->
-    DefaultPort =
-        case Scheme of
-            "https" -> 443;
-            "http" -> 80;
-            % Fallback to HTTPS
-            _ -> 443
-        end,
-    case string:split(HostPort, ":", trailing) of
-        [Host] ->
-            {Host, DefaultPort};
-        [Host, PortStr] ->
-            {Host, list_to_integer(PortStr)}
-    end.
 
 status_text(200) -> "OK";
 status_text(206) -> "Partial Content";
@@ -865,48 +1066,22 @@ status_text(500) -> "Internal Server Error";
 status_text(Code) -> integer_to_list(Code).
 
 -spec direct_gun_request(
-    GunPid :: pid(),
+    Conn :: aws_lib_httpc:conn(),
     Method :: method(),
-    Path :: path(),
+    Path :: path() | {term(), path()},
     Headers :: headers(),
     Body :: body(),
     Options :: list()
 ) -> result().
-direct_gun_request(GunPid, Method, {_, Path}, Headers, Body, Options) ->
-    direct_gun_request(GunPid, Method, [$/ | Path], Headers, Body, Options);
-direct_gun_request(GunPid, Method, Path, Headers, Body, Options) ->
-    HeadersBin = lists:map(
-        fun({Key, Value}) ->
-            {list_to_binary(Key), list_to_binary(Value)}
-        end,
-        Headers
-    ),
-    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_HTTP_TIMEOUT),
-    Response =
-        try
-            StreamRef = do_gun_request(GunPid, Method, Path, HeadersBin, Body),
-            case gun:await(GunPid, StreamRef, Timeout) of
-                {response, fin, Status, RespHeaders} ->
-                    {ok, {{http_version, Status, status_text(Status)}, RespHeaders, <<>>}};
-                {response, nofin, Status, RespHeaders} ->
-                    %% await_body/3 can return {error, timeout} (and other
-                    %% {error, _} reasons); surface it cleanly rather than
-                    %% letting a hard match turn it into a {badmatch, _} term.
-                    case gun:await_body(GunPid, StreamRef, Timeout) of
-                        {ok, RespBody} ->
-                            {ok, {
-                                {http_version, Status, status_text(Status)}, RespHeaders, RespBody
-                            }};
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
-                {error, Reason} ->
-                    {error, Reason}
-            end
-        catch
-            _:Error ->
-                {error, Error}
-        end,
+%% Issue a request on an already-open connection (the two-step API). The Gun
+%% lifecycle lives in aws_lib_httpc; this resolves the request timeout and
+%% shapes the result. A {_, Path} tuple (S3 bucket/key) is normalized to an
+%% absolute path first.
+direct_gun_request(Conn, Method, {_, Path}, Headers, Body, Options) ->
+    direct_gun_request(Conn, Method, [$/ | Path], Headers, Body, Options);
+direct_gun_request(Conn, Method, Path, Headers, Body, Options) ->
+    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
+    Response = aws_lib_httpc:request(Conn, Method, Path, Headers, Body, Timeout),
     format_response(Response).
 
 -spec parse_volumes_response(term()) -> {'ok', volumes_list()} | {'error', 'parse_error'}.

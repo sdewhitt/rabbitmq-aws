@@ -46,5 +46,39 @@ parse_test_() ->
             Response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<test>value</test>",
             Expectation = [{"test", "value"}],
             ?assertEqual(Expectation, aws_lib_xml:parse(Response))
+        end},
+        %% Repeated siblings are preserved as repeated keys, so a caller can
+        %% iterate them (proplists:get_value would see only the first).
+        {"repeated siblings are preserved as a list", fun() ->
+            Response = "<set><item>a</item><item>b</item><item>c</item></set>",
+            Expectation = [{"set", [{"item", "a"}, {"item", "b"}, {"item", "c"}]}],
+            ?assertEqual(Expectation, aws_lib_xml:parse(Response))
+        end},
+        %% Attributes on a text element: text moves under '#text' beside the
+        %% '@attributes' entry (issue #101).
+        {"attributes on a text element", fun() ->
+            Response = "<node id=\"7\" region=\"us-east-1\">hello</node>",
+            Expectation = [
+                {"node", [
+                    {'@attributes', [{"id", "7"}, {"region", "us-east-1"}]},
+                    {'#text', "hello"}
+                ]}
+            ],
+            ?assertEqual(Expectation, aws_lib_xml:parse(Response))
+        end},
+        %% Attributes on an element with children: '@attributes' heads the child
+        %% proplist.
+        {"attributes on an element with children", fun() ->
+            Response = "<node id=\"7\"><child>x</child></node>",
+            Expectation = [
+                {"node", [{'@attributes', [{"id", "7"}]}, {"child", "x"}]}
+            ],
+            ?assertEqual(Expectation, aws_lib_xml:parse(Response))
+        end},
+        %% Attribute-only (empty) element.
+        {"attribute-only element", fun() ->
+            Response = "<node id=\"7\"/>",
+            Expectation = [{"node", [{'@attributes', [{"id", "7"}]}]}],
+            ?assertEqual(Expectation, aws_lib_xml:parse(Response))
         end}
     ].
