@@ -21,7 +21,8 @@
     instance_id/1,
     load_imdsv2_token/0,
     instance_metadata_request_headers/1,
-    region/1
+    region/1,
+    endpoint_url/1
 ]).
 
 %% Export all for unit tests
@@ -168,6 +169,42 @@ region(Profile, Config) ->
         _ ->
             {ok, ?DEFAULT_REGION, Config}
     end.
+
+-spec endpoint_url(Service :: string()) -> string() | undefined.
+%% @doc Return the endpoint-URL override for the given AWS service, or
+%%      `undefined' when none is configured. This matches the AWS CLI v2 and
+%%      official SDK convention for local-development endpoints (LocalStack,
+%%      moto, and similar): the per-service ``AWS_ENDPOINT_URL_<SERVICE>``
+%%      variable takes precedence over the global ``AWS_ENDPOINT_URL``.
+%%
+%%      The service name is upper-cased and its hyphens are replaced with
+%%      underscores to form the variable suffix, so the "acm-pca" service maps
+%%      to ``AWS_ENDPOINT_URL_ACM_PCA``.
+%% @end
+endpoint_url(Service) ->
+    case os:getenv("AWS_ENDPOINT_URL_" ++ service_env_suffix(Service)) of
+        Value when is_list(Value), Value =/= "" ->
+            Value;
+        _ ->
+            case os:getenv("AWS_ENDPOINT_URL") of
+                Value when is_list(Value), Value =/= "" -> Value;
+                _ -> undefined
+            end
+    end.
+
+%% Map a service name to the AWS_ENDPOINT_URL_<SERVICE> variable suffix:
+%% upper-cased with hyphens turned into underscores (e.g. "acm-pca" ->
+%% "ACM_PCA"), matching the AWS SDK convention.
+service_env_suffix(Service) ->
+    string:uppercase(
+        lists:map(
+            fun
+                ($-) -> $_;
+                (C) -> C
+            end,
+            Service
+        )
+    ).
 
 -spec instance_id(aws_config()) -> {'ok', string(), aws_config()} | {'error', 'undefined'}.
 %% @doc Return the instance ID from the EC2 metadata service.

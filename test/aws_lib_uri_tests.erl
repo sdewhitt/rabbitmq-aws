@@ -56,6 +56,31 @@ target_test_() ->
         end}
     ].
 
+%% transport/1 derives the Gun transport from the scheme (not the port), so an
+%% https endpoint on a non-standard port still uses TLS and an http override
+%% stays plaintext.
+transport_test_() ->
+    [
+        {"https uses TLS transport", fun() ->
+            {ok, U} = aws_lib_uri:parse("https://s3.amazonaws.com/bucket/key"),
+            ?assertEqual(tls, aws_lib_uri:transport(U))
+        end},
+        {"http uses TCP transport", fun() ->
+            {ok, U} = aws_lib_uri:parse("http://localhost:4566/bucket/key"),
+            ?assertEqual(4566, aws_lib_uri:port(U)),
+            ?assertEqual(tcp, aws_lib_uri:transport(U))
+        end},
+        {"https on a non-443 port still uses TLS", fun() ->
+            {ok, U} = aws_lib_uri:parse("https://localhost:8443/x"),
+            ?assertEqual(8443, aws_lib_uri:port(U)),
+            ?assertEqual(tls, aws_lib_uri:transport(U))
+        end},
+        {"a mixed-case scheme is handled", fun() ->
+            {ok, U} = aws_lib_uri:parse("HTTPS://EXAMPLE.COM/x"),
+            ?assertEqual(tls, aws_lib_uri:transport(U))
+        end}
+    ].
+
 %% Malformed input must return an error tuple, never crash (issue #100).
 parse_malformed_test_() ->
     [
