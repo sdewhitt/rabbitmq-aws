@@ -24,14 +24,28 @@ fetch_secret(Arn, Region, State) ->
 make_request(RequestBody, Headers, State) ->
     case aws_lib:api_post_request("secretsmanager", "/", RequestBody, Headers, State) of
         {ok, ResponseBody, State1} ->
-            case rabbit_json:decode(ResponseBody) of
-                #{<<"SecretString">> := SecretValue} ->
-                    {ok, SecretValue, State1};
-                #{<<"SecretBinary">> := SecretBinary} ->
-                    {ok, base64:decode(SecretBinary), State1};
-                _ ->
-                    {error, no_secret_value}
+            case find_secret(ResponseBody) of
+                {ok, Secret} ->
+                    {ok, Secret, State1};
+                {error, _} = Error ->
+                    Error
             end;
         {error, _} = Error ->
             Error
+    end.
+
+%% api_post_request already decodes the JSON body (aws_lib_json:decode) into a
+%% string-keyed proplist, so match it directly rather than decoding a second
+%% time (issue #131).
+find_secret(ResponseBody) ->
+    case lists:keyfind("SecretString", 1, ResponseBody) of
+        {"SecretString", SecretValue} ->
+            {ok, rabbit_data_coercion:to_utf8_binary(SecretValue)};
+        false ->
+            case lists:keyfind("SecretBinary", 1, ResponseBody) of
+                {"SecretBinary", SecretBinary} ->
+                    {ok, base64:decode(SecretBinary)};
+                false ->
+                    {error, no_secret_value}
+            end
     end.
