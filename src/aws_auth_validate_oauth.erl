@@ -388,12 +388,14 @@ parse_grant_fields(Body, Acc, TokenUrl) ->
     %% Precedence: a MISSING required field (undefined) is reported as the
     %% generic "requires client_id and client_secret_arn" first; only a PRESENT
     %% but malformed value gets the field-specific reason.
+    %% Guards may not call the local is_nonempty_binary/1, so the non-empty
+    %% binary test is inlined here (is_binary/1 + byte_size/1 are guard BIFs).
     if
         ClientId =:= undefined orelse SecretArn =:= undefined ->
             {error, input_invalid, ?REASON_MISSING_GRANT_FIELDS};
-        not is_nonempty_binary(ClientId) ->
+        not (is_binary(ClientId) andalso byte_size(ClientId) > 0) ->
             {error, input_invalid, ?REASON_BAD_CLIENT_ID};
-        not is_nonempty_binary(SecretArn) ->
+        not (is_binary(SecretArn) andalso byte_size(SecretArn) > 0) ->
             {error, input_invalid, ?REASON_BAD_CLIENT_SECRET_ARN};
         true ->
             case parse_scopes(maps:get(<<"scopes">>, Body, undefined)) of
