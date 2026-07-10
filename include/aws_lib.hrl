@@ -163,10 +163,12 @@
     | {ok, {status_code(), body()}}
     | {error, term()}.
 
--type result_ok() :: {ok, {ResponseHeaders :: headers(), Response :: list()}}.
+%% The response payload is the decoded body: a proplist for JSON/XML content
+%% types, or the raw binary when the body could not be decoded.
+-type result_ok() :: {ok, {ResponseHeaders :: headers(), Response :: list() | binary()}}.
 -type result_error() ::
     {'error', Message :: reason_phrase(),
-        {ResponseHeaders :: headers(), Response :: list()} | undefined}
+        {ResponseHeaders :: headers(), Response :: list() | binary()} | undefined}
     | {'error', {credentials, Reason :: string()}}
     | {'error', string()}.
 -type result() :: result_ok() | result_error().

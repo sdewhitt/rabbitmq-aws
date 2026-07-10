@@ -113,7 +113,7 @@ request_on_conn_test_() ->
             end},
             {"the method selects the matching gun function", fun() ->
                 meck:expect(gun, put, fun(_, _, _, _, _) -> stream end),
-                %% 200 is in aws_lib:status_text/1's table, so its reason phrase
+                %% 200 is in aws_lib_response:status_text/1's table, so its reason phrase
                 %% is a known string; this also exercises the put/5 dispatch.
                 meck:expect(gun, await, fun(_, _, _) -> {response, fin, 200, []} end),
                 ?assertEqual(

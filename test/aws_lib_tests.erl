@@ -270,76 +270,6 @@ expired_credentials_test_() ->
         ]
     }.
 
-format_response_test_() ->
-    [
-        {"ok", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 200, "Ok"},
-                    [{<<"Content-Type">>, <<"text/xml">>}],
-                    "<test>Value</test>"
-                }},
-            Expectation = {ok, {[{<<"Content-Type">>, <<"text/xml">>}], [{"test", "Value"}]}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"error", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 500, "Internal Server Error"},
-                    [{"Content-Type", "text/xml"}],
-                    "<error>Boom</error>"
-                }},
-            Expectation =
-                {error, "Internal Server Error",
-                    {[{"Content-Type", "text/xml"}], [{"error", "Boom"}]}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"201 Created is a success", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 201, "Created"},
-                    [{<<"Content-Type">>, <<"text/xml">>}],
-                    "<test>Value</test>"
-                }},
-            Expectation = {ok, {[{<<"Content-Type">>, <<"text/xml">>}], [{"test", "Value"}]}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"204 No Content is a success", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 204, "No Content"},
-                    [],
-                    <<>>
-                }},
-            Expectation = {ok, {[], <<>>}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"3xx redirect is an error (gun does not follow redirects)", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 302, "Found"},
-                    [{<<"content-type">>, <<"text/plain">>}],
-                    <<"moved">>
-                }},
-            Expectation = {error, "Found", {[{<<"content-type">>, <<"text/plain">>}], <<"moved">>}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end}
-    ].
-
-get_content_type_test_() ->
-    [
-        {"from headers caps", fun() ->
-            Headers = [{"Content-Type", "text/xml"}],
-            Expectation = {"text", "xml"},
-            ?assertEqual(Expectation, aws_lib:get_content_type(Headers))
-        end},
-        {"from headers lower", fun() ->
-            Headers = [{"content-type", "text/xml"}],
-            Expectation = {"text", "xml"},
-            ?assertEqual(Expectation, aws_lib:get_content_type(Headers))
-        end}
-    ].
-
 has_credentials_test_() ->
     {
         foreach,
@@ -374,69 +304,6 @@ local_time_test_() ->
             end}
         ]
     }.
-
-maybe_decode_body_test_() ->
-    [
-        {"application/x-amz-json-1.0", fun() ->
-            ContentType = {"application", "x-amz-json-1.0"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/x-amz-json-1.1", fun() ->
-            %% The JSON 1.1 protocol (e.g. Secrets Manager) must decode too (#99).
-            ContentType = {"application", "x-amz-json-1.1"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/json", fun() ->
-            ContentType = {"application", "json"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/*+json structured suffix", fun() ->
-            ContentType = {"application", "vnd.api+json"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"text/xml", fun() ->
-            ContentType = {"text", "xml"},
-            Body = "<test><node>value</node></test>",
-            Expectation = [{"test", [{"node", "value"}]}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"text/html [unsupported]", fun() ->
-            ContentType = {"text", "html"},
-            Body = "<html><head></head><body></body></html>",
-            ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/octet-stream is not decoded", fun() ->
-            %% A non-JSON application/* subtype must fall through undecoded, not
-            %% be treated as JSON.
-            ContentType = {"application", "octet-stream"},
-            Body = <<"raw bytes">>,
-            ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
-        end}
-    ].
-
-parse_content_type_test_() ->
-    [
-        {"application/x-amz-json-1.0", fun() ->
-            Expectation = {"application", "x-amz-json-1.0"},
-            ?assertEqual(Expectation, aws_lib:parse_content_type("application/x-amz-json-1.0"))
-        end},
-        {"application/xml", fun() ->
-            Expectation = {"application", "xml"},
-            ?assertEqual(Expectation, aws_lib:parse_content_type("application/xml"))
-        end},
-        {"text/xml;charset=UTF-8", fun() ->
-            Expectation = {"text", "xml"},
-            ?assertEqual(Expectation, aws_lib:parse_content_type("text/xml"))
-        end}
-    ].
 
 perform_request_test_() ->
     {
@@ -737,6 +604,75 @@ api_get_request_test_() ->
                         ]}},
                     Result
                 ),
+                meck:validate(gun)
+            end},
+            {"a non-retriable 4xx returns immediately without burning retries", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                meck:expect(gun, open, fun(_, _, _) -> {ok, spawn(fun() -> ok end)} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A 400 with a non-throttling error code is not retriable
+                %% (issue #80): the request must be made exactly once and the
+                %% decoded error returned to the caller immediately.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual(
+                    {error,
+                        {service_error, [
+                            {"Error", [{"Code", "InvalidParameterValue"}]}
+                        ]}},
+                    Result
+                ),
+                %% Exactly one attempt: not retried.
+                ?assertEqual(1, meck:num_calls(gun, await, '_')),
+                meck:validate(gun)
+            end},
+            {"a throttling 4xx is retried rather than returned immediately", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                meck:expect(gun, open, fun(_, _, _) -> {ok, spawn(fun() -> ok end)} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A 400 whose body indicates throttling is retriable: the first
+                %% attempt throttles, the second succeeds.
+                meck:expect(
+                    gun,
+                    await,
+                    3,
+                    meck:seq([
+                        {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]},
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    ])
+                ),
+                meck:expect(
+                    gun,
+                    await_body,
+                    3,
+                    meck:seq([
+                        {ok, <<"{\"__type\": \"ThrottlingException\"}">>},
+                        {ok, <<"{\"data\": \"value\"}">>}
+                    ])
+                ),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertMatch({ok, [{"data", "value"}], _State}, Result),
+                %% Two attempts: throttling was retried.
+                ?assertEqual(2, meck:num_calls(gun, await, '_')),
                 meck:validate(gun)
             end},
             {"a decoded error survives a later transport failure", fun() ->

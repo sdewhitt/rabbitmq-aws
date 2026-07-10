@@ -20,9 +20,9 @@
 %% handle.
 -module(aws_lib_httpc).
 
--export([open/3, request/6, request/7, close/1]).
+-export([open/3, request/6, request/7, close/1, response_status/1]).
 
--export_type([conn/0]).
+-export_type([conn/0, response/0]).
 
 -include("aws_lib.hrl").
 
@@ -46,7 +46,7 @@
 }.
 
 %% The response tuple this module produces, consumed by
-%% aws_lib:format_response/1 and the metadata-service callers. NOTE: the first
+%% aws_lib_response:format_response/1 and the metadata-service callers. NOTE: the first
 %% status-line element is the literal atom `http_version', not an
 %% http_version() string -- this is the shape the plugin has always built, so it
 %% is typed as-is rather than as aws_lib.hrl's status_line() (whose first element
@@ -100,7 +100,7 @@ open(Host, Port, Opts) ->
 %% @doc Issue one request on an existing connection and read the full response.
 %% Headers are normalized to binaries; the await/await_body dance is performed
 %% here so its error handling lives in one place. Returns the status-line-shaped
-%% tuple aws_lib:format_response/1 accepts, or {error, Reason} for any transport
+%% tuple aws_lib_response:format_response/1 accepts, or {error, Reason} for any transport
 %% or body-read failure (including a raise, which is caught).
 %% @end
 request(Conn, Method, Path, Headers, Body, Timeout) ->
@@ -109,7 +109,9 @@ request(Conn, Method, Path, Headers, Body, Timeout) ->
         StreamRef = do_gun_request(Conn, Method, Path, HeadersBin, Body),
         case gun:await(Conn, StreamRef, Timeout) of
             {response, fin, Status, RespHeaders} ->
-                {ok, {{http_version, Status, aws_lib:status_text(Status)}, RespHeaders, <<>>}};
+                {ok, {
+                    {http_version, Status, aws_lib_response:status_text(Status)}, RespHeaders, <<>>
+                }};
             {response, nofin, Status, RespHeaders} ->
                 %% await_body/3 can return {error, timeout} (and other {error, _}
                 %% reasons); surface it cleanly rather than letting a hard match
@@ -117,7 +119,7 @@ request(Conn, Method, Path, Headers, Body, Timeout) ->
                 case gun:await_body(Conn, StreamRef, Timeout) of
                     {ok, RespBody} ->
                         {ok, {
-                            {http_version, Status, aws_lib:status_text(Status)},
+                            {http_version, Status, aws_lib_response:status_text(Status)},
                             RespHeaders,
                             RespBody
                         }};
@@ -131,6 +133,19 @@ request(Conn, Method, Path, Headers, Body, Timeout) ->
         _:Error ->
             {error, Error}
     end.
+
+-spec response_status(response()) -> {http, status_code()} | transport_error.
+%% @doc The status of a response/0: `{http, StatusCode}' for a completed HTTP
+%% exchange, or `transport_error' for a transport-level failure that never
+%% produced a status line. Lives here, where the response/0 shape is built, so
+%% callers classify the outcome without matching the raw tuple (whose status
+%% line uses the literal atom `http_version', a shape a caller-side match on the
+%% aws_lib.hrl status_line() type cannot see as inhabited).
+%% @end
+response_status({ok, {{http_version, StatusCode, _Reason}, _Headers, _Body}}) ->
+    {http, StatusCode};
+response_status({error, _Reason}) ->
+    transport_error.
 
 -spec request(
     Host :: string(),
