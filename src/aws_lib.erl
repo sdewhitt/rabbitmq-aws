@@ -830,7 +830,7 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     %% start with `undefined' (nothing open yet, opened lazily on first attempt).
     Conn0 = seed_conn_from_state(State),
     api_request_with_retries(
-        Service, Method, Path, Body, Headers, Retries, WaitTime, State, Conn0
+        Service, Method, Path, Body, Headers, Retries, WaitTime, State, Conn0, undefined
     ).
 
 -spec api_request_with_retries(
@@ -842,18 +842,24 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     Retries :: integer(),
     WaitTime :: integer(),
     State :: aws_state(),
-    Conn :: aws_lib_httpc:conn() | undefined
+    Conn :: aws_lib_httpc:conn() | undefined,
+    LastError :: result_error() | undefined
 ) ->
     {ok, list(), aws_state()} | {error, term()}.
 api_request_with_retries(
-    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State, Conn
+    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State, Conn, LastError
 ) when
     Retries =< 0
 ->
     close_if_open(Conn),
     ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
-    {error, "AWS service is unavailable"};
-api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0) ->
+    %% Surface the last attempt's decoded AWS error so the caller can act on the
+    %% service error code (throttling vs invalid parameter vs access denied)
+    %% rather than a generic string (issue #82).
+    {error, exhausted_error(LastError)};
+api_request_with_retries(
+    Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0, LastError
+) ->
     case ensure_credentials_valid(State0) of
         {ok, State1} ->
             {Result, Conn1} =
@@ -863,7 +869,7 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
                     State3 = finish_conn_success(Conn1, State2),
                     {ok, Payload, State3};
-                {error, Message, Response} ->
+                {error, Message, Response} = Error ->
                     %% Message may be a status string (from format_response/1
                     %% on an HTTP error) or a tuple such as
                     %% {gun_open_failed, Reason} on a connection failure, so
@@ -882,14 +888,54 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
                     %% perform_request_reuse/8 hands back a live connection after
                     %% an HTTP-level error (reused on the next attempt) or
                     %% `undefined' after a transport failure (reopened next attempt).
+                    %% Carry the most informative error forward so retry
+                    %% exhaustion can return it: a decoded service-error body from
+                    %% an earlier attempt is kept even if a later attempt fails at
+                    %% the transport level with no body.
                     api_request_with_retries(
-                        Service, Method, Path, Body, Headers, Retries - 1, WaitTime, State1, Conn1
+                        Service,
+                        Method,
+                        Path,
+                        Body,
+                        Headers,
+                        Retries - 1,
+                        WaitTime,
+                        State1,
+                        Conn1,
+                        keep_informative_error(LastError, Error)
                     )
             end;
         {error, Reason} ->
             close_if_open(Conn0),
             {error, {credentials, Reason}}
     end.
+
+%% Keep the more informative of two retry errors: an error carrying a decoded
+%% AWS error body (an HTTP 4xx/5xx) wins over one without (a transport failure,
+%% which format_response/1 shapes as {error, _, undefined}). This preserves a
+%% service error seen on an earlier attempt when a later attempt fails at the
+%% transport level, so retry exhaustion still surfaces the useful detail.
+keep_informative_error(_LastError, {error, _Message, {_Headers, _Body}} = NewError) ->
+    %% The new error has a decoded body: it is at least as informative.
+    NewError;
+keep_informative_error({error, _Message, {_Headers, _Body}} = LastError, _NewError) ->
+    %% The new error has no body but a prior one did: keep the prior error.
+    LastError;
+keep_informative_error(_LastError, NewError) ->
+    NewError.
+
+%% Build the caller-facing error at retry exhaustion. When an attempt produced a
+%% decoded AWS error body (an HTTP 4xx/5xx), surface that body under
+%% `service_error' so the caller can inspect the AWS error code. A transport
+%% failure carries no body (or there was no attempt), so fall back to a generic
+%% reason. The decoded body is a proplist for JSON/XML responses but may be a
+%% raw binary for other content types, hence the list()|binary() element.
+-spec exhausted_error(result_error() | undefined) ->
+    {service_error, list() | binary()} | {service_error, retries_exhausted}.
+exhausted_error({error, _Message, {_Headers, DecodedBody}}) ->
+    {service_error, DecodedBody};
+exhausted_error(_) ->
+    {service_error, retries_exhausted}.
 
 %% Perform one request attempt on a reusable connection. Opens a connection when
 %% none is carried (or the carried one targets a different host) and reuses the
