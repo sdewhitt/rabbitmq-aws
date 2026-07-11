@@ -637,8 +637,86 @@ api_get_request_test_() ->
                     fun(_Pid, _, _) -> {error, "network error"} end
                 ),
 
+                %% A transport failure carries no decoded body, so retry
+                %% exhaustion reports the generic reason.
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, "AWS service is unavailable"}, Result),
+                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                meck:validate(gun)
+            end},
+            {"a persistent HTTP error surfaces the decoded AWS error body", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                meck:expect(gun, open, fun(_, _, _) -> {ok, spawn(fun() -> ok end)} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% Every attempt returns an HTTP 400 with a decoded JSON error
+                %% body; after retries are exhausted the caller must receive that
+                %% decoded body under service_error, not a generic string.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<
+                        "{\"Error\": {\"Code\": \"ThrottlingException\", "
+                        "\"Message\": \"Rate exceeded\"}}"
+                    >>}
+                end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual(
+                    {error,
+                        {service_error, [
+                            {"Error", [
+                                {"Code", "ThrottlingException"},
+                                {"Message", "Rate exceeded"}
+                            ]}
+                        ]}},
+                    Result
+                ),
+                meck:validate(gun)
+            end},
+            {"a decoded error survives a later transport failure", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                meck:expect(gun, open, fun(_, _, _) -> {ok, spawn(fun() -> ok end)} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% The first attempt returns an HTTP 400 with a decoded error
+                %% body; every later attempt fails at the transport level (no
+                %% body). Retry exhaustion must still surface the decoded body
+                %% from the first attempt, not the bodiless transport error.
+                meck:expect(
+                    gun,
+                    await,
+                    3,
+                    meck:seq([
+                        {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]},
+                        {error, "network error"},
+                        {error, "network error"},
+                        {error, "network error"},
+                        {error, "network error"}
+                    ])
+                ),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual(
+                    {error,
+                        {service_error, [
+                            {"Error", [{"Code", "InvalidParameterValue"}]}
+                        ]}},
+                    Result
+                ),
                 meck:validate(gun)
             end},
             {"AWS service API request succeeded after a transient error", fun() ->
@@ -696,7 +774,7 @@ api_get_request_test_() ->
                 meck:expect(gun, close, fun(_) -> ok end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, "AWS service is unavailable"}, Result),
+                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
                 meck:validate(gun)
             end},
             {"gun:await_up failure re-enters the retry loop rather than raising", fun() ->
@@ -712,7 +790,7 @@ api_get_request_test_() ->
                 meck:expect(gun, await_up, fun(_, _) -> {error, timeout} end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, "AWS service is unavailable"}, Result),
+                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
                 meck:validate(gun)
             end}
         ]
