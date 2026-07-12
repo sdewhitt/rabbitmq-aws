@@ -72,4 +72,4 @@ missing_secret_reports_error() ->
     Result = aws_sms:fetch_secret(
         "arn:aws:secretsmanager:us-east-1:1:secret:s", "us-east-1", state()
     ),
-    ?assertEqual({error, no_secret_value}, Result).
+    ?assertMatch({error, no_secret_value, _State}, Result).

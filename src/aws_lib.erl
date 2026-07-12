@@ -693,7 +693,7 @@ ensure_imdsv2_token_valid(State0) ->
     Service :: string(),
     Path :: path(),
     State :: aws_state()
-) -> {ok, list(), aws_state()} | {error, term()}.
+) -> {ok, list(), aws_state()} | {error, term(), aws_state()}.
 %% @doc Invoke an API call to an AWS service.
 %% @end
 api_get_request(Service, Path, State) ->
@@ -715,7 +715,7 @@ api_get_request(Service, Path, State) ->
     Body :: body(),
     Headers :: headers(),
     State :: aws_state()
-) -> {ok, list(), aws_state()} | {error, term()}.
+) -> {ok, list(), aws_state()} | {error, term(), aws_state()}.
 %% @doc Perform a HTTP Post request to the AWS API for the specified service. The
 %%      response will automatically be decoded if it is either in JSON or XML
 %%      format.
@@ -750,8 +750,8 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
                         Error ->
                             Error
                     end;
-                Error ->
-                    Error
+                {error, Reason, _State1} ->
+                    {error, Reason}
             end;
         Error ->
             Error
@@ -771,7 +771,7 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     WaitTime :: integer(),
     State :: aws_state()
 ) ->
-    {ok, list(), aws_state()} | {error, term()}.
+    {ok, list(), aws_state()} | {error, term(), aws_state()}.
 %% @doc Invoke an API call to an AWS service with retries.
 %% @end
 api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
@@ -797,18 +797,21 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     Conn :: aws_lib_httpc:conn() | undefined,
     LastError :: result_error() | undefined
 ) ->
-    {ok, list(), aws_state()} | {error, term()}.
+    {ok, list(), aws_state()} | {error, term(), aws_state()}.
 api_request_with_retries(
-    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State, Conn, LastError
+    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, State, Conn, LastError
 ) when
     Retries =< 0
 ->
-    close_if_open(Conn),
     ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
+    %% Reconcile the carried connection into the returned state: in reuse mode a
+    %% still-live connection is handed back, a transport-dropped one (undefined)
+    %% clears the slot; in one-shot mode it is closed.
+    State1 = finish_conn(Conn, State),
     %% Surface the last attempt's decoded AWS error so the caller can act on the
     %% service error code (throttling vs invalid parameter vs access denied)
     %% rather than a generic string (issue #82).
-    {error, exhausted_error(LastError)};
+    {error, exhausted_error(LastError), State1};
 api_request_with_retries(
     Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0, LastError
 ) ->
@@ -819,7 +822,7 @@ api_request_with_retries(
             case Result of
                 {ok, {_Headers, Payload}, State2} ->
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
-                    State3 = finish_conn_success(Conn1, State2),
+                    State3 = finish_conn(Conn1, State2),
                     {ok, Payload, State3};
                 {error, Message, Response} = Error ->
                     %% Message may be a status string (from format_response/1
@@ -838,11 +841,14 @@ api_request_with_retries(
                     case Verdict of
                         not_retriable ->
                             %% A 4xx client error that will not succeed on retry
-                            %% (issue #80): close the connection and return the
-                            %% decoded error to the caller immediately rather than
-                            %% burning the remaining retries.
-                            close_if_open(Conn1),
-                            {error, exhausted_error(Error)};
+                            %% (issue #80): return the decoded error to the caller
+                            %% immediately rather than burning the remaining
+                            %% retries. The exchange completed cleanly, so in
+                            %% reuse mode the connection is handed back for the
+                            %% next request; in one-shot mode finish_conn/2 closes
+                            %% it.
+                            State3 = finish_conn(Conn1, State1),
+                            {error, exhausted_error(Error), State3};
                         retriable ->
                             ?LOG_WARNING(
                                 "Will retry AWS request, remaining retries: ~b", [Retries]
@@ -871,8 +877,8 @@ api_request_with_retries(
                     end
             end;
         {error, Reason} ->
-            close_if_open(Conn0),
-            {error, {credentials, Reason}}
+            State1 = finish_conn(Conn0, State0),
+            {error, {credentials, Reason}, State1}
     end.
 
 %% Keep the more informative of two retry errors: an error carrying a decoded
@@ -1017,13 +1023,23 @@ seed_conn_from_state(#aws_state{reuse_conn = none}) ->
 seed_conn_from_state(#aws_state{reuse_conn = ConnSlot}) ->
     ConnSlot.
 
-%% On success: in reuse mode, write the live connection back into the state so
-%% the next api_*_request call in the same unit of work reuses it. In one-shot
-%% mode (reuse_conn = undefined), close the connection.
-finish_conn_success(ConnSlot, #aws_state{reuse_conn = undefined} = State) ->
+%% Reconcile the retry loop's connection slot into the returned state at every
+%% terminal path (success, a not_retriable error, retry exhaustion, a
+%% credentials failure). In one-shot mode (reuse_conn = undefined), close the
+%% connection. In reuse mode, write a still-live slot back into the state so the
+%% next api_*_request call in the same unit of work reuses it; a transport
+%% failure left `undefined', so record `none' (reuse mode, no connection) rather
+%% than `undefined' (which would silently drop the state out of reuse mode).
+%% Handing back a connection after a cleanly completed 4xx keeps the reuse slot
+%% in sync with reality: the connection is as usable as after a 2xx, and the
+%% caller's state no longer references a connection this call already closed
+%% (issue #80).
+finish_conn(ConnSlot, #aws_state{reuse_conn = undefined} = State) ->
     close_if_open(ConnSlot),
     State;
-finish_conn_success(ConnSlot, State) ->
+finish_conn(undefined, State) ->
+    State#aws_state{reuse_conn = none};
+finish_conn(ConnSlot, State) ->
     State#aws_state{reuse_conn = ConnSlot}.
 
 %% Add the state's AWS API timeout to the request options unless the caller

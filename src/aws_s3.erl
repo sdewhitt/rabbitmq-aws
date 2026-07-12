@@ -8,7 +8,7 @@
 -export([fetch_object/2]).
 
 -spec fetch_object(string(), aws_lib:aws_state()) ->
-    {ok, binary(), aws_lib:aws_state()} | {error, term()}.
+    {ok, binary(), aws_lib:aws_state()} | {error, term(), aws_lib:aws_state()}.
 fetch_object(Resource, State) ->
     %% Note: splits on the first / only
     %% https://www.erlang.org/doc/apps/stdlib/string.html#split/2
@@ -17,6 +17,6 @@ fetch_object(Resource, State) ->
     case aws_lib:api_get_request("s3", Path, State) of
         {ok, _Body, _State1} = Response ->
             Response;
-        {error, _} = Error ->
+        {error, _Reason, _State1} = Error ->
             Error
     end.

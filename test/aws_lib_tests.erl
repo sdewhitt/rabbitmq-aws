@@ -471,7 +471,7 @@ signing_failure_retries_test_() ->
                     Result = aws_lib:api_request_with_retries(
                         "ec2", get, "/", "", [], 1, 0, State
                     ),
-                    ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                    ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                     meck:validate(aws_lib_sign)
                 end
             }
@@ -604,7 +604,7 @@ api_get_request_test_() ->
                 %% A transport failure carries no decoded body, so retry
                 %% exhaustion reports the generic reason.
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                 meck:validate(gun)
             end},
             {"a persistent HTTP error surfaces the decoded AWS error body", fun() ->
@@ -631,14 +631,15 @@ api_get_request_test_() ->
                 end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual(
+                ?assertMatch(
                     {error,
                         {service_error, [
                             {"Error", [
                                 {"Code", "ThrottlingException"},
                                 {"Message", "Rate exceeded"}
                             ]}
-                        ]}},
+                        ]},
+                        _State},
                     Result
                 ),
                 meck:validate(gun)
@@ -664,11 +665,12 @@ api_get_request_test_() ->
                 end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual(
+                ?assertMatch(
                     {error,
                         {service_error, [
                             {"Error", [{"Code", "InvalidParameterValue"}]}
-                        ]}},
+                        ]},
+                        _State},
                     Result
                 ),
                 %% Exactly one attempt: not retried.
@@ -743,11 +745,12 @@ api_get_request_test_() ->
                 end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual(
+                ?assertMatch(
                     {error,
                         {service_error, [
                             {"Error", [{"Code", "InvalidParameterValue"}]}
-                        ]}},
+                        ]},
+                        _State},
                     Result
                 ),
                 meck:validate(gun)
@@ -807,7 +810,7 @@ api_get_request_test_() ->
                 meck:expect(gun, close, fun(_) -> ok end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                 meck:validate(gun)
             end},
             {"gun:await_up failure re-enters the retry loop rather than raising", fun() ->
@@ -823,7 +826,7 @@ api_get_request_test_() ->
                 meck:expect(gun, await_up, fun(_, _) -> {error, timeout} end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                 meck:validate(gun)
             end}
         ]
@@ -1013,6 +1016,44 @@ connection_reuse_across_retries_test_() ->
                     {open_opts, Opts} -> ?assertEqual(0, maps:get(retry, Opts))
                 after 1000 -> ?assert(false)
                 end,
+                Conn ! stop,
+                meck:validate(gun)
+            end},
+            {"a not_retriable 4xx in reuse mode hands the connection back", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State1} = aws_lib:set_region("us-east-1", State0),
+                %% Reuse mode: the connection after a cleanly completed 4xx is as
+                %% usable as after a 2xx, so it must be handed back in the state's
+                %% reuse_conn rather than closed (issue #80 review).
+                State = aws_lib:enable_connection_reuse(State1),
+
+                Conn = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A 400 with a non-throttling error code is not retriable.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                end),
+
+                {error, {service_error, _}, StateOut} = aws_lib:api_get_request(
+                    "AWS", "API", State
+                ),
+                %% Exactly one attempt: not retried.
+                ?assertEqual(1, meck:num_calls(gun, await, '_')),
+                %% The connection was handed back, not closed.
+                ?assertEqual(0, meck:num_calls(gun, close, '_')),
+                ?assertMatch({Conn, _Host, _Port}, StateOut#aws_state.reuse_conn),
                 Conn ! stop,
                 meck:validate(gun)
             end}

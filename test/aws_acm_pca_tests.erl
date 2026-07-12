@@ -60,4 +60,4 @@ missing_certificate_reports_error() ->
     end),
     Arn = "arn:aws:acm-pca:us-east-1:1:certificate-authority/ca",
     Result = aws_acm_pca:fetch_certificate(Arn, "us-east-1", state()),
-    ?assertEqual({error, no_certificate}, Result).
+    ?assertMatch({error, no_certificate, _State}, Result).

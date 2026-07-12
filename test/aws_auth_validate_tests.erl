@@ -542,7 +542,7 @@ assume_role_configured_threads_assumed_credentials() ->
     end),
     ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
         Self ! {resolve_key, assume_role_test_access_key(State)},
-        {error, stop_here}
+        {error, stop_here, State}
     end),
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(base_body(#{}))),
     ?assertEqual(1, meck:num_calls(aws_iam, assume_role, '_')),
@@ -683,7 +683,7 @@ cacert_arn_resolution_test_() ->
                 %% Password ARN resolves; CA-cert ARN does not.
                 meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
                     case lists:prefix("arn:aws:cacert", Arn) of
-                        true -> {error, not_found};
+                        true -> {error, not_found, State};
                         false -> {ok, <<"pw">>, State}
                     end
                 end),
