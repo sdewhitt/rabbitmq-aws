@@ -45,7 +45,9 @@ classify_response_test_() ->
         end},
         {"the botocore throttling code families are covered", fun() ->
             %% One representative per marker family from botocore's
-            %% _THROTTLED_ERROR_CODES.
+            %% _THROTTLED_ERROR_CODES, plus the transient codes from its
+            %% _TRANSIENT_ERROR_CODES (RequestTimeout, RequestTimeoutException,
+            %% PriorRequestNotComplete) that botocore also retries.
             Codes = [
                 "TooManyRequestsException",
                 "ProvisionedThroughputExceededException",
@@ -53,6 +55,8 @@ classify_response_test_() ->
                 "BandwidthLimitExceeded",
                 "RequestThrottled",
                 "SlowDown",
+                "RequestTimeout",
+                "RequestTimeoutException",
                 "PriorRequestNotComplete"
             ],
             lists:foreach(

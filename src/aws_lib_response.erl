@@ -22,13 +22,15 @@
 
 -include("aws_lib.hrl").
 
-%% Substring markers, matched case-insensitively, that identify a throttling
-%% error code. This is botocore's _THROTTLED_ERROR_CODES
-%% (botocore/retries/standard.py) collapsed into lowercase substrings:
-%% `throttl' covers Throttling, ThrottlingException, ThrottledException,
-%% RequestThrottledException, RequestThrottled, and EC2ThrottledException;
-%% `limitexceeded' covers RequestLimitExceeded, BandwidthLimitExceeded, and
-%% LimitExceededException; the rest map one to one.
+%% Substring markers, matched case-insensitively, that identify an error code
+%% botocore retries: its _THROTTLED_ERROR_CODES together with its
+%% _TRANSIENT_ERROR_CODES (botocore/retries/standard.py), collapsed into
+%% lowercase substrings. `throttl' covers Throttling, ThrottlingException,
+%% ThrottledException, RequestThrottledException, RequestThrottled, and
+%% EC2ThrottledException; `limitexceeded' covers RequestLimitExceeded,
+%% BandwidthLimitExceeded, and LimitExceededException; `requesttimeout' covers
+%% the transient RequestTimeout and RequestTimeoutException;
+%% `priorrequestnotcomplete' appears in both lists; the rest map one to one.
 -define(THROTTLING_MARKERS, [
     <<"throttl">>,
     <<"toomanyrequests">>,
@@ -36,6 +38,7 @@
     <<"limitexceeded">>,
     <<"transactioninprogress">>,
     <<"slowdown">>,
+    <<"requesttimeout">>,
     <<"priorrequestnotcomplete">>
 ]).
 
