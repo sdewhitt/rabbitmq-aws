@@ -204,7 +204,7 @@ get_content_type(Headers) ->
 
 -spec maybe_decode_body(ContentType :: {nonempty_string(), nonempty_string()}, Body :: body()) ->
     list() | body().
-%% @doc Attempt to decode the response body by its MIME
+%% @doc Attempt to decode the response body according to its MIME content type.
 %% @end
 maybe_decode_body(_, <<>>) ->
     <<>>;
@@ -234,7 +234,7 @@ is_json_subtype(Subtype) ->
     lists:suffix("+json", Subtype).
 
 -spec parse_content_type(ContentType :: string()) -> {Type :: string(), Subtype :: string()}.
-%% @doc parse a content type string returning a tuple of type/subtype
+%% @doc Parse a content type string, returning a tuple of the type and subtype.
 %% @end
 parse_content_type(ContentType) when is_binary(ContentType) ->
     parse_content_type(binary_to_list(ContentType));
