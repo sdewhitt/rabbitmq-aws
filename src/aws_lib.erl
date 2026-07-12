@@ -847,6 +847,14 @@ api_request_with_retries(
                             %% reuse mode the connection is handed back for the
                             %% next request; in one-shot mode finish_conn/2 closes
                             %% it.
+                            %% Log at ERROR level so log-level alerting still sees
+                            %% a permanent failure: before issue #80 short-circuited
+                            %% the retry loop, this failure would have exhausted the
+                            %% retries and reached the ?LOG_ERROR clause above.
+                            ?LOG_ERROR(
+                                "Request to AWS service has failed with a permanent error: ~tp",
+                                [Message]
+                            ),
                             State3 = finish_conn(Conn1, State1),
                             {error, exhausted_error(Error), State3};
                         retriable ->
