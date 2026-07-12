@@ -136,11 +136,9 @@ errortype_header_values(Headers) ->
     [Value || {Name, Value} <- Headers, is_errortype_header(Name)].
 
 is_errortype_header(Name) ->
-    try string:lowercase(rabbit_data_coercion:to_utf8_binary(Name)) of
-        ?ERRORTYPE_HEADER -> true;
+    case safe_lowercase(Name) of
+        {ok, ?ERRORTYPE_HEADER} -> true;
         _ -> false
-    catch
-        _:_ -> false
     end.
 
 %% Collect the values stored under AWS error-code keys anywhere in a decoded
@@ -165,22 +163,29 @@ error_code_values_for(Key, Value) ->
     end.
 
 %% Case-insensitive substring match of the throttling markers against an error
-%% code or a raw body. to_utf8_binary/1 keeps multi-byte codepoints intact
-%% where a bare iolist_to_binary/1 would fail on non-latin1 input; a value that
-%% is not chardata at all (e.g. a nested proplist under an error-code key)
-%% makes it throw, which simply means "not throttling".
+%% code or a raw body. A value that is not chardata (e.g. a nested proplist
+%% under an error-code key) fails to coerce and is treated as "not throttling".
 contains_throttling_marker(Value) ->
-    try string:lowercase(rabbit_data_coercion:to_utf8_binary(Value)) of
-        Text when is_binary(Text) ->
+    case safe_lowercase(Value) of
+        {ok, Text} ->
             lists:any(
                 fun(Marker) -> binary:match(Text, Marker) =/= nomatch end,
                 ?THROTTLING_MARKERS
             );
-        _ ->
+        error ->
             false
+    end.
+
+%% Lowercase a value for case-insensitive comparison, returning `{ok, Binary}'
+%% or `error' when it is not chardata. to_utf8_binary/1 keeps multi-byte
+%% codepoints intact where a bare iolist_to_binary/1 would fail on non-latin1
+%% input; a value that is not chardata at all makes it throw, which the catch
+%% turns into `error'. string:lowercase/1 on a binary always returns a binary.
+safe_lowercase(Value) ->
+    try
+        {ok, string:lowercase(rabbit_data_coercion:to_utf8_binary(Value))}
     catch
-        _:_ ->
-            false
+        _:_ -> error
     end.
 
 -spec get_content_type(Headers :: headers()) -> {Type :: string(), Subtype :: string()}.
