@@ -110,7 +110,7 @@ request(Conn, Method, Path, Headers, Body, Timeout) ->
         case gun:await(Conn, StreamRef, Timeout) of
             {response, fin, Status, RespHeaders} ->
                 {ok, {
-                    {http_version, Status, aws_lib_response:status_text(Status)}, RespHeaders, <<>>
+                    {http_version, Status, status_text(Status)}, RespHeaders, <<>>
                 }};
             {response, nofin, Status, RespHeaders} ->
                 %% await_body/3 can return {error, timeout} (and other {error, _}
@@ -119,7 +119,7 @@ request(Conn, Method, Path, Headers, Body, Timeout) ->
                 case gun:await_body(Conn, StreamRef, Timeout) of
                     {ok, RespBody} ->
                         {ok, {
-                            {http_version, Status, aws_lib_response:status_text(Status)},
+                            {http_version, Status, status_text(Status)},
                             RespHeaders,
                             RespBody
                         }};
@@ -204,3 +204,17 @@ do_gun_request(Conn, patch, Path, Headers, Body) ->
     gun:patch(Conn, Path, Headers, Body, #{});
 do_gun_request(Conn, options, Path, Headers, _Body) ->
     gun:options(Conn, Path, Headers, #{}).
+
+%% The reason phrase for a status code, used to build the status line Gun does
+%% not carry. Response construction, so it lives here alongside the rest of the
+%% response/0 shaping rather than in aws_lib_response, which only interprets a
+%% response.
+status_text(200) -> "OK";
+status_text(206) -> "Partial Content";
+status_text(400) -> "Bad Request";
+status_text(401) -> "Unauthorized";
+status_text(403) -> "Forbidden";
+status_text(404) -> "Not Found";
+status_text(416) -> "Range Not Satisfiable";
+status_text(500) -> "Internal Server Error";
+status_text(Code) -> integer_to_list(Code).

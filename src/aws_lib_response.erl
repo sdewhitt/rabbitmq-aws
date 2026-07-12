@@ -16,8 +16,7 @@
     classify_response/2,
     get_content_type/1,
     maybe_decode_body/2,
-    parse_content_type/1,
-    status_text/1
+    parse_content_type/1
 ]).
 
 -include("aws_lib.hrl").
@@ -238,15 +237,3 @@ parse_content_type(ContentType) ->
     Parts = string:tokens(ContentType, ";"),
     [Type, Subtype] = string:tokens(lists:nth(1, Parts), "/"),
     {Type, Subtype}.
-
-%% The reason phrase for a status code, used by aws_lib_httpc to build the
-%% status line Gun does not carry.
-status_text(200) -> "OK";
-status_text(206) -> "Partial Content";
-status_text(400) -> "Bad Request";
-status_text(401) -> "Unauthorized";
-status_text(403) -> "Forbidden";
-status_text(404) -> "Not Found";
-status_text(416) -> "Range Not Satisfiable";
-status_text(500) -> "Internal Server Error";
-status_text(Code) -> integer_to_list(Code).
