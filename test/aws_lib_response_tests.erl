@@ -115,15 +115,33 @@ classify_response_test_() ->
             >>,
             ?assertEqual(not_retriable, Classify(Resp(400, <<"application/json">>, Body)))
         end},
-        {"an undecodable body falls back to a raw substring match", fun() ->
+        {"an undecodable body is not substring-searched for markers", fun() ->
+            %% An undecodable body (text/plain, text/html) carries no structured
+            %% error code, so a marker in its text must not trigger a retry: a
+            %% proxy or ALB 4xx error page containing `throttl' is a permanent
+            %% error, not throttling.
             ?assertEqual(
-                retriable,
+                not_retriable,
                 Classify(Resp(400, <<"text/plain">>, <<"Throttling: rate exceeded">>))
             ),
             ?assertEqual(
                 not_retriable,
                 Classify(Resp(400, <<"text/plain">>, <<"no such resource">>))
             )
+        end},
+        {"an undecodable body is retriable via its X-Amzn-Errortype header", fun() ->
+            %% The status rules aside, an undecodable body still retries when the
+            %% throttling code arrives in the X-Amzn-Errortype header.
+            Response =
+                {ok, {
+                    {http_version, 400, "msg"},
+                    [
+                        {<<"content-type">>, <<"text/plain">>},
+                        {<<"X-Amzn-Errortype">>, <<"ThrottlingException">>}
+                    ],
+                    <<"Throttling: rate exceeded">>
+                }},
+            ?assertEqual(retriable, Classify(Response))
         end},
         {"a non-string value under an error-code key does not crash", fun() ->
             %% An object under `code' is collected as a candidate value; it is

@@ -115,11 +115,18 @@ classify_status(transport_error, _Formatted) ->
 %% taken from the X-Amzn-Errortype header when present alongside the values
 %% stored under the AWS error-code body keys; matching the error code rather
 %% than the whole body keeps a marker inside a message or resource name from
-%% triggering a retry. A body that could not be decoded (still a raw binary)
-%% falls back to a substring search of the raw bytes.
+%% triggering a retry. A body that could not be decoded (still a raw binary,
+%% e.g. text/plain or text/html) carries no structured error code, so only its
+%% X-Amzn-Errortype header is consulted: substring-searching the raw bytes
+%% would retry a permanent error whenever an unrelated 4xx page (a proxy or ALB
+%% error page) happened to contain a marker such as `throttl'. A genuinely
+%% transient failure with such a body is still retried via the 5xx or 429
+%% status rules in classify_status/2.
 -spec is_throttling_error(headers(), list() | body()) -> boolean().
 is_throttling_error(Headers, Body) when is_binary(Body) ->
-    lists:any(fun contains_throttling_marker/1, errortype_header_values(Headers) ++ [Body]);
+    %% Body itself is not consulted: an undecodable body carries no structured
+    %% error code, so classification rests on the header and the status rules.
+    lists:any(fun contains_throttling_marker/1, errortype_header_values(Headers));
 is_throttling_error(Headers, Decoded) ->
     Candidates = errortype_header_values(Headers) ++ error_code_values(Decoded),
     lists:any(fun contains_throttling_marker/1, Candidates).
