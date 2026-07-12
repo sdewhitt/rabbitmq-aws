@@ -724,16 +724,18 @@ api_get_request_test_() ->
                 meck:expect(gun, close, fun(_) -> ok end),
                 meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
                 meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
-                %% The first attempt returns an HTTP 400 with a decoded error
-                %% body; every later attempt fails at the transport level (no
-                %% body). Retry exhaustion must still surface the decoded body
-                %% from the first attempt, not the bodiless transport error.
+                %% The first attempt returns a retriable HTTP 503 with a decoded
+                %% error body; every later attempt fails at the transport level
+                %% (no body). The 503 keeps the loop retrying so the transport
+                %% failures are consumed, exercising keep_informative_error/2:
+                %% retry exhaustion must still surface the decoded body from the
+                %% first attempt, not the bodiless transport error.
                 meck:expect(
                     gun,
                     await,
                     3,
                     meck:seq([
-                        {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]},
+                        {response, nofin, 503, [{<<"content-type">>, <<"application/json">>}]},
                         {error, "network error"},
                         {error, "network error"},
                         {error, "network error"},
@@ -741,18 +743,21 @@ api_get_request_test_() ->
                     ])
                 ),
                 meck:expect(gun, await_body, fun(_Pid, _, _) ->
-                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                    {ok, <<"{\"Error\": {\"Code\": \"InternalError\"}}">>}
                 end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
                 ?assertMatch(
                     {error,
                         {service_error, [
-                            {"Error", [{"Code", "InvalidParameterValue"}]}
+                            {"Error", [{"Code", "InternalError"}]}
                         ]},
                         _State},
                     Result
                 ),
+                %% All attempts are consumed: the initial 503 plus the four
+                %% transport failures across the retry budget.
+                ?assertEqual(?MAX_RETRIES, meck:num_calls(gun, await, '_')),
                 meck:validate(gun)
             end},
             {"AWS service API request succeeded after a transient error", fun() ->
