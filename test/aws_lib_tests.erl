@@ -441,6 +441,43 @@ perform_request_test_() ->
         ]
     }.
 
+signing_failure_retries_test_() ->
+    {
+        foreach,
+        fun() ->
+            setup(),
+            meck:new(aws_lib_sign, [passthrough]),
+            [aws_lib_sign]
+        end,
+        fun(Mods) ->
+            teardown(ok),
+            meck:unload(Mods)
+        end,
+        [
+            {
+                "a signing failure exhausts retries instead of crashing",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State} = aws_lib:set_region("us-east-1", State0),
+                    %% A signing failure makes prepare_signed_request/8 return a
+                    %% 2-tuple {error, Reason}; the retry loop must shape it into
+                    %% the 3-tuple result it matches on rather than raising a
+                    %% case_clause (issue #80 review).
+                    meck:expect(aws_lib_sign, headers, fun(_Request, _BodyHash) ->
+                        {error, {malformed_uri, "bad"}}
+                    end),
+                    Result = aws_lib:api_request_with_retries(
+                        "ec2", get, "/", "", [], 1, 0, State
+                    ),
+                    ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                    meck:validate(aws_lib_sign)
+                end
+            }
+        ]
+    }.
+
 sign_headers_test_() ->
     {
         foreach,

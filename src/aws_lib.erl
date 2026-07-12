@@ -968,7 +968,11 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
                     {aws_lib_response:format_response(Error), ConnSlot0, retriable}
             end;
         {error, _} = Error ->
-            {Error, ConnSlot0, retriable}
+            %% Shape the 2-tuple error through format_response/1 into the
+            %% 3-tuple result the retry loop matches on; returning the raw
+            %% {error, Reason} here would raise a case_clause in
+            %% api_request_with_retries/10.
+            {aws_lib_response:format_response(Error), ConnSlot0, retriable}
     end.
 
 %% Attach the connection slot and retry verdict to carry forward based on the
