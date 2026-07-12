@@ -158,11 +158,6 @@
 }).
 -type request() :: #request{}.
 
--type httpc_result() ::
-    {ok, {status_line(), headers(), body()}}
-    | {ok, {status_code(), body()}}
-    | {error, term()}.
-
 %% The response payload is the decoded body: a proplist for JSON/XML content
 %% types, or the raw binary when the body could not be decoded.
 -type result_ok() :: {ok, {ResponseHeaders :: headers(), Response :: list() | binary()}}.

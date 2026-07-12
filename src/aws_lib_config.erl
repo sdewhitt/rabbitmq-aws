@@ -833,8 +833,6 @@ maybe_get_role_from_instance_metadata_with_conn(ConnPid, Config) ->
             Error
     end.
 
-%% -spec parse_az_response(httpc_result()) ->
-%%     {ok, Region :: string()} | {error, Reason :: atom()}.
 %% @doc Parse the response from the Availability Zone query to the
 %%      Instance Metadata service, returning the Region if successful.
 %% end.
