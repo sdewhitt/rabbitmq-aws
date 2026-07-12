@@ -230,7 +230,9 @@ open_connection(Service, Options, State0) ->
 
     Host = endpoint_host(Region, Service),
     Port = 443,
-    case aws_lib_httpc:open(Host, Port, gun_open_opts(Port, Options)) of
+    %% The legacy two-step API always targets the real AWS endpoint over TLS; it
+    %% does not honour the endpoint-url override (see endpoint/4).
+    case aws_lib_httpc:open(Host, Port, gun_open_opts(tls, Options)) of
         {ok, Conn} ->
             {ok, {Conn, Service}, State1};
         {error, _Reason} = Error ->
@@ -530,10 +532,33 @@ prepare_signed_request(Service, Method, Headers, Path, Body, Options, Host, Stat
     Service :: string(),
     Path :: string()
 ) -> string().
+%% @doc Construct the request URI for the service, region, and path.
+%%
+%% An explicit `Host' (the request/8 Endpoint parameter) always wins and is used
+%% verbatim over HTTPS, preserving the pre-existing behaviour. Otherwise, when an
+%% ``AWS_ENDPOINT_URL``/``AWS_ENDPOINT_URL_<SERVICE>`` override is configured for
+%% local development, the request targets that base URL (its scheme, host, and
+%% port), with the AWS request path appended. With no explicit host and no
+%% override, the request targets the standard regional HTTPS endpoint.
+%% @end
 endpoint(Region, undefined, Service, Path) ->
-    lists:flatten(["https://", endpoint_host(Region, Service), Path]);
+    case aws_lib_config:endpoint_url(Service) of
+        undefined ->
+            lists:flatten(["https://", endpoint_host(Region, Service), Path]);
+        Override ->
+            lists:flatten([strip_trailing_slash(Override), Path])
+    end;
 endpoint(_, Host, _, Path) ->
     lists:flatten(["https://", Host, Path]).
+
+%% Drop a single trailing slash from an endpoint-URL override so joining it with
+%% a request path (which always starts with "/") does not produce a double slash.
+strip_trailing_slash(Url) ->
+    case lists:reverse(Url) of
+        [$/ | Rest] -> lists:reverse(Rest);
+        _ -> Url
+    end.
+
 %% @doc Construct the endpoint hostname for the request based upon the service
 %%      and region.
 %% @end
@@ -968,7 +993,7 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
                     Host = aws_lib_uri:host(Uri),
                     Port = aws_lib_uri:port(Uri),
                     Target = aws_lib_uri:target(Uri),
-                    OpenOpts = (gun_open_opts(Port, Options1))#{retry => 0},
+                    OpenOpts = (gun_open_opts(aws_lib_uri:transport(Uri), Options1))#{retry => 0},
                     case ensure_open(ConnSlot0, Host, Port, OpenOpts) of
                         {ok, Conn1} ->
                             Timeout = proplists:get_value(
@@ -1061,7 +1086,7 @@ gun_request(Method, URI, Headers, Body, Options) ->
             Port = aws_lib_uri:port(Uri),
             %% target/1 carries the query: Path is the Gun request line.
             Path = aws_lib_uri:target(Uri),
-            OpenOpts = gun_open_opts(Port, Options),
+            OpenOpts = gun_open_opts(aws_lib_uri:transport(Uri), Options),
             Response = aws_lib_httpc:request(
                 Host, Port, Method, Path, Headers, Body, OpenOpts
             ),
@@ -1070,10 +1095,13 @@ gun_request(Method, URI, Headers, Body, Options) ->
             format_response(Error)
     end.
 
-%% Build aws_lib_httpc open options from the request Options and target port:
-%% derive Gun protocols from the requested HTTP version, use TLS on port 443,
-%% and thread the connect and request timeouts through.
-gun_open_opts(Port, Options) ->
+%% Build aws_lib_httpc open options from the request Options and Transport:
+%% derive Gun protocols from the requested HTTP version, use the given transport
+%% (TLS or plain TCP), and thread the connect and request timeouts through. The
+%% transport is scheme-driven (see aws_lib_uri:transport/1) rather than derived
+%% from the port, so an https endpoint on a non-443 port still uses TLS and an
+%% http override stays plaintext.
+gun_open_opts(Transport, Options) when Transport =:= tls; Transport =:= tcp ->
     HttpVersion = proplists:get_value(version, Options, "HTTP/1.1"),
     Protocols =
         case HttpVersion of
@@ -1083,11 +1111,6 @@ gun_open_opts(Port, Options) ->
             "HTTP/1.0" -> [http];
             % Default: try HTTP/2, fallback to HTTP/1.1
             _ -> [http2, http]
-        end,
-    Transport =
-        if
-            Port == 443 -> tls;
-            true -> tcp
         end,
     #{
         transport => Transport,

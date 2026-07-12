@@ -80,6 +80,7 @@ endpoint_test_() ->
             )
         end},
         {"unspecified", fun() ->
+            os:unsetenv("AWS_ENDPOINT_URL"),
             Region = "us-east-3",
             Service = "dynamodb",
             Path = "/",
@@ -88,6 +89,61 @@ endpoint_test_() ->
             ?assertEqual(
                 Expectation, aws_lib:endpoint(Region, Host, Service, Path)
             )
+        end}
+    ].
+
+%% With no explicit host, endpoint/4 honours the AWS_ENDPOINT_URL override so
+%% requests can target a local development endpoint. The override's scheme, host,
+%% and port are used, with the AWS request path appended, and a trailing slash on
+%% the override is not doubled up with the path.
+endpoint_override_test_() ->
+    Region = "us-east-1",
+    Service = "s3",
+    Path = "/bucket/key",
+    {foreach,
+        fun() ->
+            os:unsetenv("AWS_ENDPOINT_URL"),
+            os:unsetenv("AWS_ENDPOINT_URL_S3"),
+            ok
+        end,
+        fun(_) ->
+            os:unsetenv("AWS_ENDPOINT_URL"),
+            os:unsetenv("AWS_ENDPOINT_URL_S3"),
+            ok
+        end,
+        [
+            {"global override sets scheme, host, and port", fun() ->
+                os:putenv("AWS_ENDPOINT_URL", "http://localhost:4566"),
+                ?assertEqual(
+                    "http://localhost:4566/bucket/key",
+                    aws_lib:endpoint(Region, undefined, Service, Path)
+                )
+            end},
+            {"a trailing slash on the override is not doubled", fun() ->
+                os:putenv("AWS_ENDPOINT_URL", "http://localhost:4566/"),
+                ?assertEqual(
+                    "http://localhost:4566/bucket/key",
+                    aws_lib:endpoint(Region, undefined, Service, Path)
+                )
+            end},
+            {"an explicit host still wins over the override", fun() ->
+                os:putenv("AWS_ENDPOINT_URL", "http://localhost:4566"),
+                ?assertEqual(
+                    "https://myhost:9/bucket/key",
+                    aws_lib:endpoint(Region, "myhost:9", Service, Path)
+                )
+            end}
+        ]}.
+
+%% gun_open_opts/2 takes the transport verbatim (scheme-driven upstream), so the
+%% resulting Gun options carry TLS or plain TCP as given.
+gun_open_opts_transport_test_() ->
+    [
+        {"tls transport", fun() ->
+            ?assertMatch(#{transport := tls}, aws_lib:gun_open_opts(tls, []))
+        end},
+        {"tcp transport", fun() ->
+            ?assertMatch(#{transport := tcp}, aws_lib:gun_open_opts(tcp, []))
         end}
     ].
 
@@ -578,6 +634,10 @@ api_get_request_test_() ->
             setup(),
             meck:new(gun, []),
             meck:new(aws_lib_config, []),
+            %% aws_lib_config is a strict mock here; endpoint/4 consults
+            %% endpoint_url/1, so it must be expected. No override: target the
+            %% default AWS endpoint.
+            meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
             [gun, aws_lib_config]
         end,
         fun(Mods) ->
@@ -806,6 +866,10 @@ connection_reuse_across_retries_test_() ->
             setup(),
             meck:new(gun, []),
             meck:new(aws_lib_config, []),
+            %% aws_lib_config is a strict mock here; endpoint/4 consults
+            %% endpoint_url/1, so it must be expected. No override: target the
+            %% default AWS endpoint.
+            meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
             [gun, aws_lib_config]
         end,
         fun(Mods) ->

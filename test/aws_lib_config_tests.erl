@@ -13,6 +13,57 @@ mock_gun_imdsv2_failure() ->
 
 -include("aws_lib.hrl").
 
+%% endpoint_url/1 resolves the local-development endpoint override: the
+%% per-service AWS_ENDPOINT_URL_<SERVICE> variable takes precedence over the
+%% global AWS_ENDPOINT_URL, and the service name maps to the suffix by
+%% upper-casing and turning hyphens into underscores. The foreach clears both
+%% variables before and after each case so they never leak between tests.
+endpoint_url_test_() ->
+    Clear = fun() ->
+        os:unsetenv("AWS_ENDPOINT_URL"),
+        os:unsetenv("AWS_ENDPOINT_URL_S3"),
+        os:unsetenv("AWS_ENDPOINT_URL_SECRETSMANAGER"),
+        os:unsetenv("AWS_ENDPOINT_URL_ACM_PCA")
+    end,
+    {foreach,
+        fun() ->
+            Clear(),
+            ok
+        end,
+        fun(_) ->
+            Clear(),
+            ok
+        end,
+        [
+            {"undefined when no override is set", fun() ->
+                ?assertEqual(undefined, aws_lib_config:endpoint_url("s3"))
+            end},
+            {"the global override applies to any service", fun() ->
+                os:putenv("AWS_ENDPOINT_URL", "http://localhost:4566"),
+                ?assertEqual("http://localhost:4566", aws_lib_config:endpoint_url("s3")),
+                ?assertEqual(
+                    "http://localhost:4566", aws_lib_config:endpoint_url("secretsmanager")
+                )
+            end},
+            {"a per-service override wins over the global one", fun() ->
+                os:putenv("AWS_ENDPOINT_URL", "http://localhost:4566"),
+                os:putenv("AWS_ENDPOINT_URL_S3", "http://localhost:9000"),
+                ?assertEqual("http://localhost:9000", aws_lib_config:endpoint_url("s3")),
+                %% A service without its own override still falls back to the global.
+                ?assertEqual(
+                    "http://localhost:4566", aws_lib_config:endpoint_url("secretsmanager")
+                )
+            end},
+            {"the service name maps hyphens to underscores", fun() ->
+                os:putenv("AWS_ENDPOINT_URL_ACM_PCA", "http://localhost:4567"),
+                ?assertEqual("http://localhost:4567", aws_lib_config:endpoint_url("acm-pca"))
+            end},
+            {"an empty override value is treated as unset", fun() ->
+                os:putenv("AWS_ENDPOINT_URL", ""),
+                ?assertEqual(undefined, aws_lib_config:endpoint_url("s3"))
+            end}
+        ]}.
+
 config_file_test_() ->
     [
         {"from environment variable", fun() ->
