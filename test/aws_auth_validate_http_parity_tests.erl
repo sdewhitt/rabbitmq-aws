@@ -143,6 +143,14 @@ join_tags_parity_test_() ->
 %% exported pure functions, so this pins our classify_response/2 against that
 %% grammar directly. If someone loosens or tightens our parser, this flags it
 %% against the contract we are mirroring.
+%%
+%% LIMITATION: unlike the query-encoding tests above, this side is NOT
+%% differential. The Ok/Bad corpora below are a hand-written restatement of the
+%% upstream grammar, not a call into upstream, so an upstream change to the
+%% allow/deny parsing does NOT fail these tests. When bumping the RabbitMQ
+%% dependency, re-read user_login_authentication/2 and req/2 and re-sync these
+%% corpora by hand. A durable fix would require upstream to export a pure
+%% response-parsing predicate to assert against directly.
 
 %% authn (user_path): `deny'[ reason...] or `allow'[ tags...] succeed; anything
 %% else fails.
