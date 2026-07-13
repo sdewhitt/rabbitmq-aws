@@ -689,7 +689,14 @@ with_default_sni(SslOpts, Host) ->
 %% fields rabbit_auth_backend_http sends so a conformant server returns a 2xx
 %% (allow or deny) rather than a 400 for missing params. The username is an
 %% obvious placeholder so an operator reading their auth-server logs can see it
-%% was a validation probe, not a real login attempt.
+%% was a validation probe, not a real login attempt. The authz paths carry a
+%% `tags' field (empty for the tagless probe user), matching what upstream's
+%% check_vhost_access/check_resource_access/check_topic_access always send via
+%% join_tags/1; a server that requires the field must still see it.
+%%
+%% NOTE: the parity test feeds params_for/1 to both sides, so it proves the two
+%% ENCODERS agree but cannot catch this field set drifting from upstream's; keep
+%% these lists in step with the fields those upstream functions send by hand.
 query_for(Key) ->
     uri_string:compose_query(params_for(Key)).
 
@@ -699,14 +706,20 @@ query_for(Key) ->
 params_for(<<"user_path">>) ->
     [{"username", ?PROBE_USER}];
 params_for(<<"vhost_path">>) ->
-    [{"username", ?PROBE_USER}, {"vhost", ?PROBE_VHOST}, {"ip", "127.0.0.1"}];
+    [
+        {"username", ?PROBE_USER},
+        {"vhost", ?PROBE_VHOST},
+        {"ip", "127.0.0.1"},
+        {"tags", ""}
+    ];
 params_for(<<"resource_path">>) ->
     [
         {"username", ?PROBE_USER},
         {"vhost", ?PROBE_VHOST},
         {"resource", "queue"},
         {"name", "validation-probe"},
-        {"permission", "read"}
+        {"permission", "read"},
+        {"tags", ""}
     ];
 params_for(<<"topic_path">>) ->
     [
@@ -715,6 +728,7 @@ params_for(<<"topic_path">>) ->
         {"resource", "topic"},
         {"name", "validation-probe"},
         {"permission", "read"},
+        {"tags", ""},
         {"routing_key", "#"}
     ].
 
