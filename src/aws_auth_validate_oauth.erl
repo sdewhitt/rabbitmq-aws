@@ -41,10 +41,14 @@
 %% does NOT assert scope authorization; that stays an over-trust caveat for the
 %% customer docs, same as the LDAP dn_lookup_base and HTTP reachability checks.
 %%
-%% (An alternative broker-side `client_credentials' grant tier also exists,
-%% activated by `token_endpoint'; it resolves a client secret ARN and fetches a
-%% token. The customer-supplied `access_token' path here is the preferred, no-
-%% secret way to get end-to-end signature verification.)
+%% A broker-side `client_credentials' grant (the broker fetching a token itself
+%% from a supplied token_endpoint + client_secret_arn) was considered and
+%% deliberately NOT implemented: it validates a client capability rather than
+%% the broker's resource-server config, duplicates what the customer already did
+%% to obtain the token they supply here, and would introduce a secret-exfil
+%% surface (caller supplies both the secret ARN and an arbitrary destination
+%% URL). The customer-supplied `access_token' path gives the same end-to-end
+%% signature confidence with no secret transiting the endpoint.
 %%
 %% Category mapping:
 %%   * input_invalid    (400) -- bad URL / bad ssl_options / ARN resolve fail /
@@ -83,9 +87,6 @@
     in_cidr/2,
     url_allowed/1,
     is_valid_jwks/1,
-    parse_scopes/1,
-    build_grant_body/3,
-    has_access_token/1,
     parse_access_token/1,
     token_header/1,
     verify_token/3,
@@ -150,16 +151,6 @@
 -define(REASON_CONNECTION, <<"could not connect to OAuth endpoint">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_ENDPOINT, <<"endpoint did not return a valid JWKS document">>).
-%% client_credentials token-fetch tier (optional, activates when token_endpoint
-%% is present). Fixed R4 reasons: no URL, client_id, secret, or token echoed.
--define(REASON_BAD_TOKEN_ENDPOINT, <<"token_endpoint is not a valid https URL">>).
--define(REASON_MISSING_GRANT_FIELDS, <<
-    "token_endpoint requires client_id and client_secret_arn"
->>).
--define(REASON_BAD_CLIENT_ID, <<"client_id must be a non-empty string">>).
--define(REASON_BAD_CLIENT_SECRET_ARN, <<"client_secret_arn must be a non-empty string">>).
--define(REASON_BAD_SCOPES, <<"scopes must be a string or a list of non-empty strings">>).
--define(REASON_GRANT_REJECTED, <<"token endpoint rejected the client_credentials grant">>).
 -define(REASON_DISCOVERY, <<"issuer discovery did not return a valid OpenID configuration">>).
 %% Customer-supplied access-token verification (optional, activates when
 %% access_token is present). Fixed R4 reasons: no token content, claim value,
@@ -222,10 +213,6 @@
 ssl_opts() ->
     #{
         arn_keys => [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
-        %% client_secret_arn is a top-level (non-ssl_options) ARN-backed secret:
-        %% referencing it forces the assume_role guardrail just like a TLS ARN.
-        %% The key matches how parse_grant/2 stores it in the accumulator (atom).
-        param_arn_keys => [client_secret_arn],
         ssl_option_keys => ?SSL_OPTION_KEYS,
         sni_key => <<"sni">>,
         client_cert => true,
@@ -271,12 +258,6 @@ allowed_fields() ->
         <<"issuer">>,
         <<"resource_server_id">>,
         <<"ssl_options">>,
-        %% Optional client_credentials token-fetch tier. Present token_endpoint
-        %% activates the grant; client_id + client_secret_arn are then required.
-        <<"token_endpoint">>,
-        <<"client_id">>,
-        <<"client_secret_arn">>,
-        <<"scopes">>,
         %% Optional customer-supplied access token. Present access_token
         %% activates signature + exp/nbf/aud verification against the fetched
         %% JWKS. Carries no secret (the customer minted it out of band).
@@ -333,15 +314,12 @@ parse_input(Body) ->
         fun parse_urls/2,
         fun parse_resource_server_id/2,
         fun parse_ssl_options/2,
-        %% parse_grant is pure: it shape-checks the optional client_credentials
-        %% fields but performs no ARN resolution or network I/O.
-        fun parse_grant/2,
         %% parse_access_token is pure: it shape-checks the optional customer-
         %% supplied token and pre-decodes its header so the alg allowlist can be
         %% enforced without network I/O. No verification happens here.
         fun parse_access_token/2,
-        %% SSRF guard runs in the pure phase so a disallowed target (including the
-        %% token_endpoint) is rejected before any ARN resolution or outbound request.
+        %% SSRF guard runs in the pure phase so a disallowed target is rejected
+        %% before any ARN resolution or outbound request.
         fun guard_urls/2
     ],
     parse_input(Steps, Body, #{timeout => connection_timeout_ms()}).
@@ -435,75 +413,6 @@ parse_ssl_options(Body, Acc) ->
         maps:get(<<"ssl_options">>, Body, undefined), Acc, ssl_opts()
     ).
 
-%% Parse the optional client_credentials token-fetch fields (pure phase; no ARN
-%% resolution, no network). The tier ACTIVATES only when token_endpoint is
-%% present; then client_id and client_secret_arn are REQUIRED. When absent, the
-%% accumulator carries grant => none and behaviour is unchanged (pure JWKS
-%% reachability). The client_secret_arn is stored under the atom key
-%% `client_secret_arn' so resolve_request_state/1 (via param_arn_keys) detects
-%% the ARN reference and enforces the assume_role guardrail. The secret VALUE is
-%% NOT resolved here.
-parse_grant(Body, Acc) ->
-    case maps:get(<<"token_endpoint">>, Body, undefined) of
-        undefined ->
-            {ok, Acc#{grant => none}};
-        TokenEndpointRaw ->
-            case parse_optional_url(TokenEndpointRaw) of
-                {ok, TokenUrl} ->
-                    parse_grant_fields(Body, Acc, TokenUrl);
-                _ ->
-                    {error, input_invalid, ?REASON_BAD_TOKEN_ENDPOINT}
-            end
-    end.
-
-parse_grant_fields(Body, Acc, TokenUrl) ->
-    ClientId = maps:get(<<"client_id">>, Body, undefined),
-    SecretArn = maps:get(<<"client_secret_arn">>, Body, undefined),
-    %% Precedence: a MISSING required field (undefined) is reported as the
-    %% generic "requires client_id and client_secret_arn" first; only a PRESENT
-    %% but malformed value gets the field-specific reason.
-    %% Guards may not call the local is_nonempty_binary/1, so the non-empty
-    %% binary test is inlined here (is_binary/1 + byte_size/1 are guard BIFs).
-    if
-        ClientId =:= undefined orelse SecretArn =:= undefined ->
-            {error, input_invalid, ?REASON_MISSING_GRANT_FIELDS};
-        not (is_binary(ClientId) andalso byte_size(ClientId) > 0) ->
-            {error, input_invalid, ?REASON_BAD_CLIENT_ID};
-        not (is_binary(SecretArn) andalso byte_size(SecretArn) > 0) ->
-            {error, input_invalid, ?REASON_BAD_CLIENT_SECRET_ARN};
-        true ->
-            case parse_scopes(maps:get(<<"scopes">>, Body, undefined)) of
-                {ok, Scopes} ->
-                    {ok, Acc#{
-                        grant => #{
-                            token_endpoint => TokenUrl,
-                            client_id => ClientId,
-                            scopes => Scopes
-                        },
-                        %% Stored top-level so param_arn_keys detects the ARN.
-                        client_secret_arn => SecretArn
-                    }};
-                {error, _, _} = Err ->
-                    Err
-            end
-    end.
-
-%% scopes may be absent (none), a single space-delimited string, or a list of
-%% non-empty strings. Normalize to a single space-delimited binary (or none).
-parse_scopes(undefined) ->
-    {ok, none};
-parse_scopes(V) when is_binary(V), byte_size(V) > 0 ->
-    {ok, V};
-parse_scopes(List) when is_list(List), List =/= [] ->
-    case lists:all(fun is_nonempty_binary/1, List) of
-        true -> {ok, iolist_to_binary(lists:join(<<" ">>, List))};
-        false -> {error, input_invalid, ?REASON_BAD_SCOPES}
-    end;
-parse_scopes(_) ->
-    {error, input_invalid, ?REASON_BAD_SCOPES}.
-
-is_nonempty_binary(V) -> is_binary(V) andalso byte_size(V) > 0.
-
 %% Parse the optional customer-supplied access_token (pure phase; no network,
 %% no crypto beyond a header base64url-decode). When absent, the accumulator
 %% carries token => none and behaviour is unchanged. When present it must be a
@@ -596,18 +505,13 @@ guard_urls(_Body, Acc) ->
     end.
 
 %% Collect every URL that must pass the pure SSRF guard: the JWKS/issuer
-%% endpoint(s) and, when the client_credentials tier is active, the token
-%% endpoint too. undefined slots are dropped.
+%% endpoint(s). undefined slots are dropped.
 collect_guard_urls(Acc) ->
-    JwksIssuer = [
+    [
         U
      || U <- [maps:get(jwks_uri, Acc, undefined), maps:get(issuer, Acc, undefined)],
         U =/= undefined
-    ],
-    case maps:get(grant, Acc, none) of
-        #{token_endpoint := TokenUrl} -> [TokenUrl | JwksIssuer];
-        _ -> JwksIssuer
-    end.
+    ].
 
 check_urls([]) ->
     ok;
@@ -648,19 +552,14 @@ do_oauth_validate(Params) ->
                     {error, _, _} = Err ->
                         Err;
                     {ok, SslOpts} ->
-                        %% Always validate the JWKS source first (reachability +
-                        %% well-formedness), capturing its keys. Then, in order:
-                        %%   1. if a customer-supplied access_token is present,
-                        %%      verify it against those keys (no network), and
-                        %%   2. if a client_credentials grant is configured,
-                        %%      fetch a token from the token endpoint.
-                        %% Any layer's failure short-circuits.
+                        %% Validate the JWKS source first (reachability +
+                        %% well-formedness), capturing its keys. If a
+                        %% customer-supplied access_token is present, verify it
+                        %% against those keys (no extra network). Either step's
+                        %% failure short-circuits.
                         case do_fetch_jwks(Params, SslOpts, Profile) of
                             {ok, Keys} ->
-                                case maybe_verify_token(Params, Keys) of
-                                    ok -> maybe_fetch_token(Params, SslOpts, Profile);
-                                    {error, _, _} = Err -> Err
-                                end;
+                                maybe_verify_token(Params, Keys);
                             {error, _, _} = Err ->
                                 Err
                         end
@@ -674,100 +573,14 @@ do_oauth_validate(Params) ->
             end
     end.
 
-%% When the client_credentials tier is inactive (grant => none), JWKS
-%% reachability alone is the result. When active, resolve the client secret
-%% (ARN, under the assume_role guardrail) and POST the grant to the pinned
-%% token endpoint.
-maybe_fetch_token(#{grant := none}, _SslOpts, _Profile) ->
-    ok;
-maybe_fetch_token(#{grant := Grant, timeout := Timeout} = Params, SslOpts, Profile) ->
-    case resolve_client_secret(Params) of
-        {error, _, _} = Err ->
-            Err;
-        {ok, Secret} ->
-            do_token_grant(Grant, Secret, SslOpts, Profile, Timeout)
-    end.
-
-%% Resolve client_secret_arn via the shared ARN path. The threaded aws_state was
-%% built by resolve_request_state/1 under the configured assume_role (mandatory
-%% because client_secret_arn is a param_arn_key). A resolve failure collapses to
-%% input_invalid with a fixed reason -- neither the ARN nor the secret is echoed.
-resolve_client_secret(#{client_secret_arn := Arn} = Params) ->
-    State = maps:get(aws_state, Params, none),
-    case aws_auth_validate_ssl:resolve_arn(Arn, State) of
-        {ok, Secret} when is_binary(Secret) -> {ok, Secret};
-        {error, _} -> {error, input_invalid, ?REASON_BAD_CLIENT_SECRET_ARN}
-    end.
-
-%% POST grant_type=client_credentials to the pinned token endpoint. The resolved
-%% secret is used ONLY to build the form body and is never logged or returned.
-%% A 200 carrying a non-empty access_token -> ok; an IdP rejection (any non-200,
-%% or a 200 without a usable token) -> auth_failed. Connection/TLS errors are
-%% classified as elsewhere. No redirects are followed.
-do_token_grant(
-    #{token_endpoint := TokenUrl, client_id := ClientId, scopes := Scopes},
-    Secret,
-    SslOpts,
-    Profile,
-    Timeout
-) ->
-    case aws_auth_validate_net:resolve_and_pin(TokenUrl, net_policy()) of
-        {error, _, _} = Err ->
-            Err;
-        {ok, PinnedUrl, Host} ->
-            UrlStr = maps:get(url_string, PinnedUrl),
-            FormBody = build_grant_body(ClientId, Secret, Scopes),
-            HttpOpts =
-                [
-                    {timeout, Timeout},
-                    {connect_timeout, Timeout},
-                    {autoredirect, false}
-                ] ++ ssl_http_opt(Host, SslOpts),
-            Headers = [{"host", Host}],
-            ContentType = "application/x-www-form-urlencoded",
-            Request = {UrlStr, Headers, ContentType, FormBody},
-            case httpc:request(post, Request, HttpOpts, [{body_format, binary}], Profile) of
-                {ok, {{_Vsn, 200, _Phrase}, _RespHeaders, RespBody}} ->
-                    case has_access_token(RespBody) of
-                        true -> ok;
-                        false -> {error, auth_failed, ?REASON_GRANT_REJECTED}
-                    end;
-                {ok, {{_Vsn, _Code, _Phrase}, _RespHeaders, _RespBody}} ->
-                    {error, auth_failed, ?REASON_GRANT_REJECTED};
-                {error, Reason} ->
-                    classify_http_error(Reason)
-            end
-    end.
-
-%% Build the x-www-form-urlencoded grant body. Every value is percent-encoded so
-%% the secret cannot break out of the field or corrupt the request. The returned
-%% binary is handed straight to httpc and is not retained or logged.
-build_grant_body(ClientId, Secret, Scopes) ->
-    Base = [
-        {"grant_type", "client_credentials"},
-        {"client_id", binary_to_list(ClientId)},
-        {"client_secret", binary_to_list(Secret)}
-    ],
-    Pairs =
-        case Scopes of
-            none -> Base;
-            _ -> Base ++ [{"scope", binary_to_list(Scopes)}]
-        end,
-    Encoded = [K ++ "=" ++ percent_encode(V) || {K, V} <- Pairs],
-    list_to_binary(lists:join("&", Encoded)).
-
-%% RFC 3986 percent-encoding for application/x-www-form-urlencoded values.
-percent_encode(Str) ->
-    uri_string:quote(Str).
-
 %%--------------------------------------------------------------------
 %% Customer-supplied access-token verification (no network)
 %%--------------------------------------------------------------------
 %%
-%% Runs after the JWKS is fetched and before any client_credentials grant. The
-%% customer minted the token out of band, so no secret transits this endpoint.
-%% Verification reuses the broker's own crypto library (jose) so the signature
-%% decision matches what rabbit_auth_backend_oauth2 computes.
+%% Runs after the JWKS is fetched. The customer minted the token out of band, so
+%% no secret transits this endpoint. Verification reuses the broker's own crypto
+%% library (jose) so the signature decision matches what
+%% rabbit_auth_backend_oauth2 computes.
 
 %% When no access_token was supplied (token => none), this layer is a no-op.
 maybe_verify_token(#{token := none}, _Keys) ->
@@ -902,20 +715,6 @@ check_token_audience(Claims, ResourceServerId) ->
 
 audience_result(true) -> ok;
 audience_result(false) -> {error, auth_failed, ?REASON_TOKEN_AUDIENCE}.
-
-%% True when the token response is a JSON object carrying a non-empty
-%% access_token string. The token itself is inspected only for presence and is
-%% never logged or returned (R6).
-has_access_token(Body) when is_binary(Body) ->
-    case rabbit_json:try_decode(Body) of
-        {ok, Map} when is_map(Map) ->
-            case maps:get(<<"access_token">>, Map, undefined) of
-                Tok when is_binary(Tok), byte_size(Tok) > 0 -> true;
-                _ -> false
-            end;
-        _ ->
-            false
-    end.
 
 %% Determine the JWKS URI (given directly or derived via issuer discovery)
 %% and fetch + validate it.
