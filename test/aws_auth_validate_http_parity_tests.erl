@@ -4,7 +4,7 @@
 %% -*- mode: erlang; -*-
 
 %% Parity tests between the HTTP validation backend and the real
-%% rabbit_auth_backend_http it validates.
+%% rabbit_auth_backend_http that it validates.
 %%
 %% The validation backend does not reimplement an upstream parser (unlike the
 %% LDAP query DSL), so there is no single equal-both-implementations check like
@@ -44,8 +44,8 @@
 %% For every probe path type, the query string our backend sends must encode
 %% byte-for-byte the same as rabbit_auth_backend_http:q/1 given the same params.
 %% If upstream ever changes its encoding (e.g. space as %20 instead of +, or a
-%% different escaping of `/'), the probe would send params a conformant auth
-%% server parses differently and this fails.
+%% different escaping of `/'), the probe would send params that a conformant
+%% auth server parses differently and this fails.
 query_encoding_parity_test_() ->
     case upstream_q_usable() of
         false ->
