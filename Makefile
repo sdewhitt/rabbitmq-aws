@@ -9,7 +9,7 @@ define PROJECT_ENV
 endef
 
 DEPS = rabbit_common rabbit rabbitmq_management gun jose
-TEST_DEPS = meck proper rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_auth_backend_ldap
+TEST_DEPS = meck proper rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_auth_backend_ldap rabbitmq_auth_backend_http
 LOCAL_DEPS = crypto inets ssl xmerl public_key eldap
 
 PLT_APPS = rabbit
