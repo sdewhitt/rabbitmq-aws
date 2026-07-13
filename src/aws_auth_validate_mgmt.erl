@@ -202,6 +202,10 @@ status_for_category(query_invalid) -> 400;
 status_for_category(auth_failed) -> 422;
 status_for_category(config_conflict) -> 422;
 status_for_category(authz_unverified) -> 422;
+%% Token-verification refinements of auth_failed; same 422 status, distinct
+%% category so callers can branch transient-vs-config without parsing message.
+status_for_category(token_expired) -> 422;
+status_for_category(token_invalid) -> 422;
 %% A category outside the backend behaviour's documented set is our fault, not
 %% the caller's, so map it to 500 rather than crashing with a function_clause
 %% (which the with_semaphore/6 catch would also surface as a 500).
