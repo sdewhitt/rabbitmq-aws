@@ -608,11 +608,13 @@ is_tls_error(Term) ->
 %% echo the body: a mismatch returns the fixed ?REASON_ENDPOINT.
 %%
 %% Grammar (mirrors rabbit_auth_backend_http's own parsing in
-%% user_login_authentication/2 (authn) and req/2 (authz), which lowercase the
-%% trimmed body then match):
-%%   * user_path (authn): exactly `deny', or anything beginning with `allow'
-%%     (an `allow' optionally followed by space-separated tags).
-%%   * vhost/resource/topic_path (authz): exactly `allow' or `deny'.
+%% user_login_authentication/2 (authn) and req/2 (authz)). Both match a raw
+%% `"deny " ++ Reason' body before lowercasing the trimmed body and matching
+%% the bare verdicts, so a well-formed deny may carry a human-readable reason:
+%%   * user_path (authn): `deny' (optionally followed by whitespace and a
+%%     reason), or `allow' (optionally followed by space-separated tags).
+%%   * vhost/resource/topic_path (authz): exactly `allow', or `deny' (optionally
+%%     followed by whitespace and a reason).
 classify_response(Key, Body) ->
     case response_matches_contract(Key, normalize_resp(Body)) of
         true -> ok;
@@ -627,24 +629,30 @@ normalize_resp(Body) when is_binary(Body) ->
 normalize_resp(_) ->
     <<>>.
 
-%% user_path authenticates, so it accepts allow-with-tags (prefix match), the
-%% same as the real backend's `"allow" ++ Rest' clause. The authz paths only
-%% ever return a bare allow/deny.
+%% user_path authenticates, so it accepts allow-with-tags, the same as the real
+%% backend's `"allow" ++ Rest' clause. Both authn and authz accept a `deny' that
+%% carries a reason, mirroring the backend's `"deny " ++ Reason' clause. The
+%% authz paths never return allow-with-tags, so allow must be bare there.
 response_matches_contract(<<"user_path">>, Resp) ->
-    Resp =:= <<"deny">> orelse is_allow_prefix(Resp);
+    is_keyword_prefix(<<"deny">>, Resp) orelse is_keyword_prefix(<<"allow">>, Resp);
 response_matches_contract(_AuthzPath, Resp) ->
-    Resp =:= <<"allow">> orelse Resp =:= <<"deny">>.
+    Resp =:= <<"allow">> orelse is_keyword_prefix(<<"deny">>, Resp).
 
-%% True when Resp is `allow' or `allow' followed by a whitespace-delimited tag
-%% list (e.g. `allow administrator management'). A bare `allowxyz' is rejected:
-%% the real backend tolerates it, but for a config-validation signal we want the
+%% True when Resp is exactly Keyword, or Keyword followed by a whitespace-
+%% delimited remainder (an `allow' tag list, or a `deny' reason). A near-miss
+%% like `allowxyz' or `denied' is rejected: the real backend tolerates a bare
+%% `"allow" ++ Rest', but for a config-validation signal we require the
 %% canonical separator so a near-miss body is flagged rather than waved through.
-is_allow_prefix(<<"allow">>) ->
-    true;
-is_allow_prefix(<<"allow", Sep, _/binary>>) ->
-    Sep =:= $\s orelse Sep =:= $\t;
-is_allow_prefix(_) ->
-    false.
+is_keyword_prefix(Keyword, Resp) ->
+    KwSize = byte_size(Keyword),
+    case Resp of
+        Keyword ->
+            true;
+        <<Keyword:KwSize/binary, Sep, _/binary>> ->
+            Sep =:= $\s orelse Sep =:= $\t;
+        _ ->
+            false
+    end.
 
 %% Build the httpc Request tuple for the configured method. For GET the query
 %% goes in the URL; for POST it is a form-encoded body, matching

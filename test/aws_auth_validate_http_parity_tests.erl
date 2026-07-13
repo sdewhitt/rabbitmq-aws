@@ -111,22 +111,27 @@ join_tags_parity_test_() ->
 %%--------------------------------------------------------------------
 %%
 %% The broker's allow/deny parsing is inline in user_login_authentication/2
-%% (authn: bare `deny', or `allow' + space-separated tags) and req/2 (authz:
-%% bare `allow' / `deny'), both after lowercasing the trimmed body. Those are
-%% not exported pure functions, so this pins our classify_response/2 against
-%% that grammar directly. If someone loosens or tightens our parser, this flags
-%% it against the contract we are mirroring.
+%% (authn: a raw `"deny " ++ Reason', then bare `deny', or `allow' +
+%% space-separated tags) and req/2 (authz: a raw `"deny " ++ Reason', then bare
+%% `allow' / `deny'), both after lowercasing the trimmed body. Those are not
+%% exported pure functions, so this pins our classify_response/2 against that
+%% grammar directly. If someone loosens or tightens our parser, this flags it
+%% against the contract we are mirroring.
 
-%% authn (user_path): `deny' or `allow'[ tags...] succeed; anything else fails.
+%% authn (user_path): `deny'[ reason...] or `allow'[ tags...] succeed; anything
+%% else fails.
 response_grammar_authn_test_() ->
     Ok = [
         <<"allow">>,
         <<"allow administrator">>,
         <<"allow a b c">>,
         <<"deny">>,
+        %% a deny may carry a reason, mirroring the broker's `"deny " ++ Reason'
+        <<"deny insufficient permissions">>,
         %% trimming + case-insensitivity, as the broker lowercases the trimmed body
         <<"  ALLOW  ">>,
-        <<"Deny">>
+        <<"Deny">>,
+        <<"DENY too bad">>
     ],
     Bad = [<<"allowed">>, <<"allowxyz">>, <<"denied">>, <<"maybe">>, <<>>, <<"allow-tag">>],
     [?_assertEqual(ok, ?BACKEND:classify_response(<<"user_path">>, B)) || B <- Ok] ++
@@ -135,11 +140,11 @@ response_grammar_authn_test_() ->
          || B <- Bad
         ].
 
-%% authz (vhost/resource/topic_path): only bare `allow' / `deny' succeed; the
-%% allow-with-tags form is authn-only and must NOT be accepted here.
+%% authz (vhost/resource/topic_path): bare `allow', or `deny'[ reason...],
+%% succeed; the allow-with-tags form is authn-only and must NOT be accepted here.
 response_grammar_authz_test_() ->
     Keys = [<<"vhost_path">>, <<"resource_path">>, <<"topic_path">>],
-    Ok = [<<"allow">>, <<"deny">>, <<"  ALLOW ">>],
+    Ok = [<<"allow">>, <<"deny">>, <<"deny not allowed here">>, <<"  ALLOW ">>],
     Bad = [<<"allow administrator">>, <<"allowed">>, <<"maybe">>, <<>>],
     [?_assertEqual(ok, ?BACKEND:classify_response(K, B)) || K <- Keys, B <- Ok] ++
         [
