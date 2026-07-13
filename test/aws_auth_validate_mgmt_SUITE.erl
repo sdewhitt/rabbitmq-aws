@@ -39,10 +39,7 @@
     success_returns_204/1,
     oauth_disabled_by_default_returns_404/1,
     oauth_success_returns_204/1,
-    oauth_response_no_secret/1,
-    iam_disabled_by_default_returns_404/1,
-    iam_success_returns_204/1,
-    iam_response_no_secret/1
+    oauth_response_no_secret/1
 ]).
 
 %% Invoked on the broker node via rpc to hold a semaphore slot.
@@ -58,15 +55,13 @@
 
 -define(API, "/aws/auth/validate/ldap").
 -define(OAUTH_API, "/aws/auth/validate/oauth").
--define(IAM_API, "/aws/auth/validate/iam").
 
 all() ->
     [
         {group, feature_disabled},
         {group, feature_enabled},
         {group, feature_enabled_custom_tag},
-        {group, oauth_method},
-        {group, iam_method}
+        {group, oauth_method}
     ].
 
 groups() ->
@@ -101,14 +96,6 @@ groups() ->
             oauth_disabled_by_default_returns_404,
             oauth_success_returns_204,
             oauth_response_no_secret
-        ]},
-        %% IAM method tests: opt-in behaviour (disabled by default -> 404), and
-        %% success/no-secret when enabled with mocked dispatch. The caller-
-        %% supplied token must never appear in the response (R6).
-        {iam_method, [], [
-            iam_disabled_by_default_returns_404,
-            iam_success_returns_204,
-            iam_response_no_secret
         ]}
     ].
 
@@ -151,14 +138,6 @@ init_per_group(oauth_method, Config) ->
     %% enabled_methods so the default (disabled) applies for the
     %% disabled-by-default case. Individual testcases that need the method
     %% enabled will toggle it in init_per_testcase.
-    setup_broker(Config, [
-        {auth_validation_enabled, true},
-        {auth_validation_max_concurrent, 1},
-        {auth_validation_max_body_size, 1024}
-    ]);
-init_per_group(iam_method, Config) ->
-    %% IAM is opt-in, same posture as oauth: enable validation but leave the
-    %% method disabled by default; testcases toggle it in init_per_testcase.
     setup_broker(Config, [
         {auth_validation_enabled, true},
         {auth_validation_max_concurrent, 1},
@@ -214,32 +193,6 @@ init_per_testcase(oauth_response_no_secret = TC, Config) ->
         Config, 0, ?MODULE, mock_dispatch_ok, []
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
-init_per_testcase(iam_success_returns_204 = TC, Config) ->
-    %% Enable the iam method and mock dispatch to return ok.
-    rabbit_ct_broker_helpers:rpc(
-        Config,
-        0,
-        application,
-        set_env,
-        [aws, auth_validation_enabled_methods, [{<<"iam">>, true}]]
-    ),
-    ok = rabbit_ct_broker_helpers:rpc(
-        Config, 0, ?MODULE, mock_dispatch_ok, []
-    ),
-    rabbit_ct_helpers:testcase_started(Config, TC);
-init_per_testcase(iam_response_no_secret = TC, Config) ->
-    %% Enable the iam method and mock dispatch to return ok.
-    rabbit_ct_broker_helpers:rpc(
-        Config,
-        0,
-        application,
-        set_env,
-        [aws, auth_validation_enabled_methods, [{<<"iam">>, true}]]
-    ),
-    ok = rabbit_ct_broker_helpers:rpc(
-        Config, 0, ?MODULE, mock_dispatch_ok, []
-    ),
-    rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC).
 
@@ -262,22 +215,6 @@ end_per_testcase(oauth_success_returns_204 = TC, Config) ->
     ),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(oauth_response_no_secret = TC, Config) ->
-    ok = rabbit_ct_broker_helpers:rpc(
-        Config, 0, ?MODULE, unmock_dispatch, []
-    ),
-    rabbit_ct_broker_helpers:rpc(
-        Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
-    ),
-    rabbit_ct_helpers:testcase_finished(Config, TC);
-end_per_testcase(iam_success_returns_204 = TC, Config) ->
-    ok = rabbit_ct_broker_helpers:rpc(
-        Config, 0, ?MODULE, unmock_dispatch, []
-    ),
-    rabbit_ct_broker_helpers:rpc(
-        Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
-    ),
-    rabbit_ct_helpers:testcase_finished(Config, TC);
-end_per_testcase(iam_response_no_secret = TC, Config) ->
     ok = rabbit_ct_broker_helpers:rpc(
         Config, 0, ?MODULE, unmock_dispatch, []
     ),
@@ -477,33 +414,6 @@ oauth_response_no_secret(Config) ->
     ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Secret)).
 
 %%--------------------------------------------------------------------
-%% IAM method group
-%%--------------------------------------------------------------------
-
-%% IAM is an opt-in method (in ?OPT_IN_METHODS). Without explicit enablement it
-%% defaults to disabled, so any PUT to /aws/auth/validate/iam returns 404.
-iam_disabled_by_default_returns_404(Config) ->
-    Body = iam_body(),
-    {ok, {{_, Code, _}, _, _}} = put_request(Config, ?IAM_API, Body),
-    ?assertEqual(404, Code).
-
-%% With the method enabled and dispatch mocked, the handler returns 204.
-iam_success_returns_204(Config) ->
-    Body = iam_body(),
-    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?IAM_API, Body),
-    ?assertEqual(204, Code),
-    ?assertEqual(<<>>, iolist_to_binary(ResBody)).
-
-%% The 204 response must carry no credential material. The IAM backend's secret
-%% is the caller-supplied bearer token; verify it never appears in the response
-%% (R6).
-iam_response_no_secret(Config) ->
-    Token = <<"iam-caller-jwt-DO-NOT-LEAK-abc.def.ghi">>,
-    Body = (iam_body())#{<<"token">> => Token},
-    {ok, {{_, _Code, _}, _, ResBody}} = put_request(Config, ?IAM_API, Body),
-    ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Token)).
-
-%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
@@ -588,12 +498,6 @@ put_request(Config, Path, BodyMap) ->
 
 oauth_body() ->
     #{
-        <<"jwks_uri">> => <<"https://idp.example.com/.well-known/jwks.json">>
-    }.
-
-iam_body() ->
-    #{
-        <<"token">> => <<"aaa.bbb.ccc">>,
         <<"jwks_uri">> => <<"https://idp.example.com/.well-known/jwks.json">>
     }.
 

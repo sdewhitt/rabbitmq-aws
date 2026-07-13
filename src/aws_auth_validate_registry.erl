@@ -36,8 +36,6 @@ lookup_backend(<<"http">>) ->
     {ok, aws_auth_validate_http};
 lookup_backend(<<"oauth">>) ->
     {ok, aws_auth_validate_oauth};
-lookup_backend(<<"iam">>) ->
-    {ok, aws_auth_validate_iam};
 lookup_backend(<<"tls">>) ->
     {ok, aws_auth_validate_tls};
 lookup_backend(_) ->
@@ -64,10 +62,7 @@ effective_allowed_fields(Module, Method) ->
 %% tls makes no outbound connection, but resolving a cacertfile ARN under the
 %% assume_role is still a capability worth enabling explicitly, so it is opt-in
 %% too: turning on ldap or the feature toggle does not bring it live.
-%% iam fetches a customer-supplied STS JWKS URL (an SSRF surface, guarded by
-%% aws_auth_validate_net) and verifies a caller-supplied token against it; it is
-%% opt-in for the same reasons as oauth.
--define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>, <<"iam">>, <<"tls">>]).
+-define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>, <<"tls">>]).
 
 -spec is_method_enabled(binary()) -> boolean().
 is_method_enabled(Method) ->
