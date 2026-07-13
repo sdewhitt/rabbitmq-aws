@@ -204,8 +204,8 @@ mock_resolve_arn(?BIND_PW_ARN, State) ->
     {ok, list_to_binary(?BIND_PW), State};
 mock_resolve_arn(?WRONG_PW_ARN, State) ->
     {ok, <<"definitely-wrong">>, State};
-mock_resolve_arn(_Other, _State) ->
-    {error, not_found}.
+mock_resolve_arn(_Other, State) ->
+    {error, not_found, State}.
 
 %%--------------------------------------------------------------------
 %% Functional tests
