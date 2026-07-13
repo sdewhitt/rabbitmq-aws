@@ -16,6 +16,7 @@
     parse/1,
     host/1,
     port/1,
+    transport/1,
     path/1,
     query/1,
     target/1,
@@ -66,6 +67,20 @@ default_port("https") -> 443;
 default_port("http") -> 80;
 %% Fall back to HTTPS for any other scheme, matching the plugin's HTTPS default.
 default_port(_) -> 443.
+
+-spec transport(uri()) -> tls | tcp.
+%% @doc The Gun transport implied by the scheme: `https' (and any unknown
+%% scheme, matching the plugin's HTTPS default) uses TLS, `http' uses plain TCP.
+%% Scheme-driven rather than port-driven, so an https endpoint on a non-443 port
+%% still uses TLS and an http endpoint on any port stays plaintext.
+%% @end
+transport(#{scheme := Scheme}) ->
+    transport_for_scheme(string:lowercase(unicode:characters_to_list(Scheme)));
+transport(_) ->
+    tls.
+
+transport_for_scheme("http") -> tcp;
+transport_for_scheme(_) -> tls.
 
 -spec path(uri()) -> string().
 %% @doc The path component as a list string, with an empty path normalized to
