@@ -8,7 +8,7 @@
 -export([fetch_certificate/3]).
 
 -spec fetch_certificate(string(), string(), aws_lib:aws_state()) ->
-    {ok, binary(), aws_lib:aws_state()} | {error, term()}.
+    {ok, binary(), aws_lib:aws_state()} | {error, term(), aws_lib:aws_state()}.
 fetch_certificate(CaArn, Region, State) ->
     {ok, State1} = aws_lib:set_region(Region, State),
     RequestBody = rabbit_json:encode(#{
@@ -30,8 +30,8 @@ make_request(RequestBody, Headers, State) ->
                 {"Certificate", Certificate} ->
                     {ok, rabbit_data_coercion:to_utf8_binary(Certificate), State1};
                 false ->
-                    {error, no_certificate}
+                    {error, no_certificate, State1}
             end;
-        {error, _} = Error ->
+        {error, _Reason, _State1} = Error ->
             Error
     end.

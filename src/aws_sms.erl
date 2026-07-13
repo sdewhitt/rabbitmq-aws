@@ -8,7 +8,7 @@
 -export([fetch_secret/3]).
 
 -spec fetch_secret(string(), string(), aws_lib:aws_state()) ->
-    {ok, binary(), aws_lib:aws_state()} | {error, term()}.
+    {ok, binary(), aws_lib:aws_state()} | {error, term(), aws_lib:aws_state()}.
 fetch_secret(Arn, Region, State) ->
     {ok, State1} = aws_lib:set_region(Region, State),
     RequestBody = rabbit_json:encode(#{
@@ -27,10 +27,10 @@ make_request(RequestBody, Headers, State) ->
             case find_secret(ResponseBody) of
                 {ok, Secret} ->
                     {ok, Secret, State1};
-                {error, _} = Error ->
-                    Error
+                {error, Reason} ->
+                    {error, Reason, State1}
             end;
-        {error, _} = Error ->
+        {error, _Reason, _State1} = Error ->
             Error
     end.
 

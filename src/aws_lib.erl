@@ -28,7 +28,6 @@
     local_time/0,
     api_get_request/3,
     api_post_request/5,
-    status_text/1,
     open_connection/2, open_connection/3,
     close_connection/1,
     direct_request/7,
@@ -616,37 +615,6 @@ do_refresh_credentials(State0) ->
             {error, Reason}
     end.
 
--spec format_response(Response :: httpc_result()) -> result().
-%% @doc Format the httpc response result, returning the request result data
-%% structure. The response body will attempt to be decoded by invoking the
-%% maybe_decode_body/2 method.
-%% @end
-%% Any 2xx is a success. Every other status (3xx redirects we do not follow,
-%% 4xx, 5xx) is an error: gun is not configured to follow redirects, so a 3xx
-%% is a request we could not complete.
-format_response({ok, {{_Version, StatusCode, _Message}, Headers, Body}}) when
-    StatusCode >= 200, StatusCode < 300
-->
-    {ok, {Headers, maybe_decode_body(get_content_type(Headers), Body)}};
-format_response({ok, {{_Version, _StatusCode, Message}, Headers, Body}}) ->
-    {error, Message, {Headers, maybe_decode_body(get_content_type(Headers), Body)}};
-format_response({error, Reason}) ->
-    {error, Reason, undefined}.
-
--spec get_content_type(Headers :: headers()) -> {Type :: string(), Subtype :: string()}.
-%% @doc Fetch the content type from the headers and return it as a tuple of
-%%      {Type, Subtype}.
-%% @end
-get_content_type(Headers) ->
-    Value =
-        case proplists:get_value(<<"content-type">>, Headers, undefined) of
-            undefined ->
-                proplists:get_value(<<"Content-Type">>, Headers, "text/xml");
-            Other ->
-                Other
-        end,
-    parse_content_type(Value).
-
 -spec expired_credentials(Expiration :: calendar:datetime()) -> boolean().
 %% @doc Indicates whether the given expiration is at or within the refresh
 %% buffer window. Credentials are treated as expired a few minutes before they
@@ -671,47 +639,6 @@ expired_credentials(Expiration) ->
 %% @end
 local_time() ->
     calendar:universal_time().
-
--spec maybe_decode_body(ContentType :: {nonempty_string(), nonempty_string()}, Body :: body()) ->
-    list() | body().
-%% @doc Attempt to decode the response body by its MIME
-%% @end
-maybe_decode_body(_, <<>>) ->
-    <<>>;
-maybe_decode_body({"application", Subtype}, Body) ->
-    case is_json_subtype(Subtype) of
-        true -> aws_lib_json:decode(Body);
-        false -> maybe_decode_xml(Subtype, Body)
-    end;
-maybe_decode_body({_, Subtype}, Body) ->
-    maybe_decode_xml(Subtype, Body).
-
-maybe_decode_xml("xml", Body) ->
-    aws_lib_xml:parse(Body);
-maybe_decode_xml(_Subtype, Body) ->
-    Body.
-
-%% Recognise the JSON subtypes AWS services return. Covers plain `json', every
-%% AWS JSON protocol version (`x-amz-json-1.0', `x-amz-json-1.1', and any future
-%% `x-amz-json-*'), and the RFC 6839 structured `+json' suffix. Secrets Manager
-%% and other services use the JSON 1.1 protocol, so matching only 1.0/plain left
-%% those responses undecoded (issue #99).
-is_json_subtype("json") ->
-    true;
-is_json_subtype("x-amz-json-" ++ _Version) ->
-    true;
-is_json_subtype(Subtype) ->
-    lists:suffix("+json", Subtype).
-
--spec parse_content_type(ContentType :: string()) -> {Type :: string(), Subtype :: string()}.
-%% @doc parse a content type string returning a tuple of type/subtype
-%% @end
-parse_content_type(ContentType) when is_binary(ContentType) ->
-    parse_content_type(binary_to_list(ContentType));
-parse_content_type(ContentType) ->
-    Parts = string:tokens(ContentType, ";"),
-    [Type, Subtype] = string:tokens(lists:nth(1, Parts), "/"),
-    {Type, Subtype}.
 
 -spec expired_imdsv2_token('undefined' | imdsv2token()) -> boolean().
 %% @doc Determine whether or not an Imdsv2Token has expired.
@@ -766,7 +693,7 @@ ensure_imdsv2_token_valid(State0) ->
     Service :: string(),
     Path :: path(),
     State :: aws_state()
-) -> {ok, list(), aws_state()} | {error, term()}.
+) -> {ok, list(), aws_state()} | {error, term(), aws_state()}.
 %% @doc Invoke an API call to an AWS service.
 %% @end
 api_get_request(Service, Path, State) ->
@@ -788,7 +715,7 @@ api_get_request(Service, Path, State) ->
     Body :: body(),
     Headers :: headers(),
     State :: aws_state()
-) -> {ok, list(), aws_state()} | {error, term()}.
+) -> {ok, list(), aws_state()} | {error, term(), aws_state()}.
 %% @doc Perform a HTTP Post request to the AWS API for the specified service. The
 %%      response will automatically be decoded if it is either in JSON or XML
 %%      format.
@@ -823,8 +750,8 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
                         Error ->
                             Error
                     end;
-                Error ->
-                    Error
+                {error, Reason, _State1} ->
+                    {error, Reason}
             end;
         Error ->
             Error
@@ -844,7 +771,7 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     WaitTime :: integer(),
     State :: aws_state()
 ) ->
-    {ok, list(), aws_state()} | {error, term()}.
+    {ok, list(), aws_state()} | {error, term(), aws_state()}.
 %% @doc Invoke an API call to an AWS service with retries.
 %% @end
 api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
@@ -870,29 +797,32 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     Conn :: aws_lib_httpc:conn() | undefined,
     LastError :: result_error() | undefined
 ) ->
-    {ok, list(), aws_state()} | {error, term()}.
+    {ok, list(), aws_state()} | {error, term(), aws_state()}.
 api_request_with_retries(
-    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, _State, Conn, LastError
+    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, State, Conn, LastError
 ) when
     Retries =< 0
 ->
-    close_if_open(Conn),
     ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
+    %% Reconcile the carried connection into the returned state: in reuse mode a
+    %% still-live connection is handed back, a transport-dropped one (undefined)
+    %% clears the slot; in one-shot mode it is closed.
+    State1 = finish_conn(Conn, State),
     %% Surface the last attempt's decoded AWS error so the caller can act on the
     %% service error code (throttling vs invalid parameter vs access denied)
     %% rather than a generic string (issue #82).
-    {error, exhausted_error(LastError)};
+    {error, exhausted_error(LastError), State1};
 api_request_with_retries(
     Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0, LastError
 ) ->
     case ensure_credentials_valid(State0) of
         {ok, State1} ->
-            {Result, Conn1} =
+            {Result, Conn1, Verdict} =
                 perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, Conn0),
             case Result of
                 {ok, {_Headers, Payload}, State2} ->
                     ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
-                    State3 = finish_conn_success(Conn1, State2),
+                    State3 = finish_conn(Conn1, State2),
                     {ok, Payload, State3};
                 {error, Message, Response} = Error ->
                     %% Message may be a status string (from format_response/1
@@ -908,31 +838,55 @@ api_request_with_retries(
                         _ ->
                             ok
                     end,
-                    ?LOG_WARNING("Will retry AWS request, remaining retries: ~b", [Retries]),
-                    timer:sleep(WaitTime),
-                    %% perform_request_reuse/8 hands back a live connection after
-                    %% an HTTP-level error (reused on the next attempt) or
-                    %% `undefined' after a transport failure (reopened next attempt).
-                    %% Carry the most informative error forward so retry
-                    %% exhaustion can return it: a decoded service-error body from
-                    %% an earlier attempt is kept even if a later attempt fails at
-                    %% the transport level with no body.
-                    api_request_with_retries(
-                        Service,
-                        Method,
-                        Path,
-                        Body,
-                        Headers,
-                        Retries - 1,
-                        WaitTime,
-                        State1,
-                        Conn1,
-                        keep_informative_error(LastError, Error)
-                    )
+                    case Verdict of
+                        not_retriable ->
+                            %% A 4xx client error that will not succeed on retry
+                            %% (issue #80): return the decoded error to the caller
+                            %% immediately rather than burning the remaining
+                            %% retries. The exchange completed cleanly, so in
+                            %% reuse mode the connection is handed back for the
+                            %% next request; in one-shot mode finish_conn/2 closes
+                            %% it.
+                            %% Log at ERROR level so log-level alerting still sees
+                            %% a permanent failure: before issue #80 short-circuited
+                            %% the retry loop, this failure would have exhausted the
+                            %% retries and reached the ?LOG_ERROR clause above.
+                            ?LOG_ERROR(
+                                "Request to AWS service has failed with a permanent error: ~tp",
+                                [Message]
+                            ),
+                            State3 = finish_conn(Conn1, State1),
+                            {error, exhausted_error(Error), State3};
+                        retriable ->
+                            ?LOG_WARNING(
+                                "Will retry AWS request, remaining retries: ~b", [Retries]
+                            ),
+                            timer:sleep(WaitTime),
+                            %% perform_request_reuse/8 hands back a live connection
+                            %% after an HTTP-level error (reused on the next
+                            %% attempt) or `undefined' after a transport failure
+                            %% (reopened next attempt). Carry the most informative
+                            %% error forward so retry exhaustion can return it: a
+                            %% decoded service-error body from an earlier attempt
+                            %% is kept even if a later attempt fails at the
+                            %% transport level with no body.
+                            api_request_with_retries(
+                                Service,
+                                Method,
+                                Path,
+                                Body,
+                                Headers,
+                                Retries - 1,
+                                WaitTime,
+                                State1,
+                                Conn1,
+                                keep_informative_error(LastError, Error)
+                            )
+                    end
             end;
         {error, Reason} ->
-            close_if_open(Conn0),
-            {error, {credentials, Reason}}
+            State1 = finish_conn(Conn0, State0),
+            {error, {credentials, Reason}, State1}
     end.
 
 %% Keep the more informative of two retry errors: an error carrying a decoded
@@ -983,7 +937,8 @@ exhausted_error(_) ->
 ) ->
     {
         {ok, {headers(), term()}, aws_state()} | result_error(),
-        {aws_lib_httpc:conn(), string(), inet:port_number()} | undefined
+        {aws_lib_httpc:conn(), string(), inet:port_number()} | undefined,
+        retriable | not_retriable
     }.
 perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, ConnSlot0) ->
     case prepare_signed_request(Service, Method, Headers, Path, Body, Options, undefined, State0) of
@@ -1002,29 +957,51 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
                             Response = aws_lib_httpc:request(
                                 Conn1, Method, Target, SignedHeaders, Body, Timeout
                             ),
+                            %% Classify from the raw response (it still carries
+                            %% the numeric status) and the formatted result (it
+                            %% carries the body decoded once by
+                            %% format_response/1).
+                            Formatted = aws_lib_response:format_response(Response),
                             classify_reuse_response(
-                                format_response(Response), State1, {Conn1, Host, Port}
+                                Formatted,
+                                aws_lib_response:classify_response(Response, Formatted),
+                                State1,
+                                {Conn1, Host, Port}
                             );
                         {error, Reason} ->
-                            {format_response({error, Reason}), undefined}
+                            {
+                                aws_lib_response:format_response({error, Reason}),
+                                undefined,
+                                retriable
+                            }
                     end;
                 {error, _Reason} = Error ->
-                    {format_response(Error), ConnSlot0}
+                    %% A malformed URI never becomes valid on retry, but it is not
+                    %% an AWS response either; preserve the pre-existing retry
+                    %% behaviour by treating it as retriable.
+                    {aws_lib_response:format_response(Error), ConnSlot0, retriable}
             end;
         {error, _} = Error ->
-            {Error, ConnSlot0}
+            %% Shape the 2-tuple error through format_response/1 into the
+            %% 3-tuple result the retry loop matches on; returning the raw
+            %% {error, Reason} here would raise a case_clause in
+            %% api_request_with_retries/10.
+            {aws_lib_response:format_response(Error), ConnSlot0, retriable}
     end.
 
-%% Attach the connection slot to carry forward based on the request outcome:
-%% success or an HTTP-level error leaves the connection intact; a transport
-%% failure (format_response/1's {error, _, undefined}) makes it unusable.
-classify_reuse_response({ok, Result}, State, ConnSlot) ->
-    {{ok, Result, State}, ConnSlot};
-classify_reuse_response({error, _Reason, undefined} = Err, _State, {Conn, _, _}) ->
+%% Attach the connection slot and retry verdict to carry forward based on the
+%% request outcome: success or an HTTP-level error leaves the connection intact;
+%% a transport failure (format_response/1's {error, _, undefined}) makes it
+%% unusable. The verdict from classify_response/1 rides through unchanged; a
+%% success is always reported as retriable but the caller ignores the verdict on
+%% the success branch.
+classify_reuse_response({ok, Result}, Verdict, State, ConnSlot) ->
+    {{ok, Result, State}, ConnSlot, Verdict};
+classify_reuse_response({error, _Reason, undefined} = Err, Verdict, _State, {Conn, _, _}) ->
     aws_lib_httpc:close(Conn),
-    {Err, undefined};
-classify_reuse_response({error, _Message, _Payload} = Err, _State, ConnSlot) ->
-    {Err, ConnSlot}.
+    {Err, undefined, Verdict};
+classify_reuse_response({error, _Message, _Payload} = Err, Verdict, _State, ConnSlot) ->
+    {Err, ConnSlot, Verdict}.
 
 %% Return a usable connection to Host:Port. If the carried slot targets the same
 %% host, reuse it; if it targets a different host (cross-service boot pass),
@@ -1054,13 +1031,23 @@ seed_conn_from_state(#aws_state{reuse_conn = none}) ->
 seed_conn_from_state(#aws_state{reuse_conn = ConnSlot}) ->
     ConnSlot.
 
-%% On success: in reuse mode, write the live connection back into the state so
-%% the next api_*_request call in the same unit of work reuses it. In one-shot
-%% mode (reuse_conn = undefined), close the connection.
-finish_conn_success(ConnSlot, #aws_state{reuse_conn = undefined} = State) ->
+%% Reconcile the retry loop's connection slot into the returned state at every
+%% terminal path (success, a not_retriable error, retry exhaustion, a
+%% credentials failure). In one-shot mode (reuse_conn = undefined), close the
+%% connection. In reuse mode, write a still-live slot back into the state so the
+%% next api_*_request call in the same unit of work reuses it; a transport
+%% failure left `undefined', so record `none' (reuse mode, no connection) rather
+%% than `undefined' (which would silently drop the state out of reuse mode).
+%% Handing back a connection after a cleanly completed 4xx keeps the reuse slot
+%% in sync with reality: the connection is as usable as after a 2xx, and the
+%% caller's state no longer references a connection this call already closed
+%% (issue #80).
+finish_conn(ConnSlot, #aws_state{reuse_conn = undefined} = State) ->
     close_if_open(ConnSlot),
     State;
-finish_conn_success(ConnSlot, State) ->
+finish_conn(undefined, State) ->
+    State#aws_state{reuse_conn = none};
+finish_conn(ConnSlot, State) ->
     State#aws_state{reuse_conn = ConnSlot}.
 
 %% Add the state's AWS API timeout to the request options unless the caller
@@ -1090,9 +1077,9 @@ gun_request(Method, URI, Headers, Body, Options) ->
             Response = aws_lib_httpc:request(
                 Host, Port, Method, Path, Headers, Body, OpenOpts
             ),
-            format_response(Response);
+            aws_lib_response:format_response(Response);
         {error, _Reason} = Error ->
-            format_response(Error)
+            aws_lib_response:format_response(Error)
     end.
 
 %% Build aws_lib_httpc open options from the request Options and Transport:
@@ -1124,16 +1111,6 @@ create_uri(Host, Path) when is_list(Path) ->
 create_uri(Host, {Bucket, Key}) ->
     "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
 
-status_text(200) -> "OK";
-status_text(206) -> "Partial Content";
-status_text(400) -> "Bad Request";
-status_text(401) -> "Unauthorized";
-status_text(403) -> "Forbidden";
-status_text(404) -> "Not Found";
-status_text(416) -> "Range Not Satisfiable";
-status_text(500) -> "Internal Server Error";
-status_text(Code) -> integer_to_list(Code).
-
 -spec direct_gun_request(
     Conn :: aws_lib_httpc:conn(),
     Method :: method(),
@@ -1151,7 +1128,7 @@ direct_gun_request(Conn, Method, {_, Path}, Headers, Body, Options) ->
 direct_gun_request(Conn, Method, Path, Headers, Body, Options) ->
     Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
     Response = aws_lib_httpc:request(Conn, Method, Path, Headers, Body, Timeout),
-    format_response(Response).
+    aws_lib_response:format_response(Response).
 
 -spec parse_volumes_response(term()) -> {'ok', volumes_list()} | {'error', 'parse_error'}.
 %% @doc Parse the DescribeVolumes XML response into a list of volume information.

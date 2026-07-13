@@ -112,8 +112,8 @@ run_arn_handlers([{Mod, Arn, SchemaKey, Args} | Rest], State) ->
                 {error, _} = Error ->
                     {error, Error, State1}
             end;
-        {error, _} = Error ->
-            {error, get_resolve_arn_error(Arn, SchemaKey, Error), State}
+        {error, Reason, State1} ->
+            {error, get_resolve_arn_error(Arn, SchemaKey, {error, Reason}), State1}
     end.
 
 get_resolve_arn_error(Arn, SchemaKey, {error, E} = Error) ->

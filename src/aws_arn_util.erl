@@ -12,7 +12,7 @@
 -endif.
 
 -spec resolve_arn(string(), aws_lib:aws_state()) ->
-    {ok, binary(), aws_lib:aws_state()} | {error, term()}.
+    {ok, binary(), aws_lib:aws_state()} | {error, term(), aws_lib:aws_state()}.
 resolve_arn(Arn, State) ->
     case parse_arn(Arn) of
         {ok, #{service := "s3", resource := Resource}} ->
@@ -23,9 +23,9 @@ resolve_arn(Arn, State) ->
             aws_acm_pca:fetch_certificate(Arn, Region, State);
         {ok, #{service := Service}} ->
             Reason = unsupported_service,
-            {error, {Reason, Service}};
-        {error, _} = Error ->
-            Error
+            {error, {Reason, Service}, State};
+        {error, Reason} ->
+            {error, Reason, State}
     end.
 
 -spec parse_arn(string()) -> {ok, map()} | {error, term()}.

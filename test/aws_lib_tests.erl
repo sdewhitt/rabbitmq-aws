@@ -270,76 +270,6 @@ expired_credentials_test_() ->
         ]
     }.
 
-format_response_test_() ->
-    [
-        {"ok", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 200, "Ok"},
-                    [{<<"Content-Type">>, <<"text/xml">>}],
-                    "<test>Value</test>"
-                }},
-            Expectation = {ok, {[{<<"Content-Type">>, <<"text/xml">>}], [{"test", "Value"}]}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"error", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 500, "Internal Server Error"},
-                    [{"Content-Type", "text/xml"}],
-                    "<error>Boom</error>"
-                }},
-            Expectation =
-                {error, "Internal Server Error",
-                    {[{"Content-Type", "text/xml"}], [{"error", "Boom"}]}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"201 Created is a success", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 201, "Created"},
-                    [{<<"Content-Type">>, <<"text/xml">>}],
-                    "<test>Value</test>"
-                }},
-            Expectation = {ok, {[{<<"Content-Type">>, <<"text/xml">>}], [{"test", "Value"}]}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"204 No Content is a success", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 204, "No Content"},
-                    [],
-                    <<>>
-                }},
-            Expectation = {ok, {[], <<>>}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end},
-        {"3xx redirect is an error (gun does not follow redirects)", fun() ->
-            Response =
-                {ok, {
-                    {"HTTP/1.1", 302, "Found"},
-                    [{<<"content-type">>, <<"text/plain">>}],
-                    <<"moved">>
-                }},
-            Expectation = {error, "Found", {[{<<"content-type">>, <<"text/plain">>}], <<"moved">>}},
-            ?assertEqual(Expectation, aws_lib:format_response(Response))
-        end}
-    ].
-
-get_content_type_test_() ->
-    [
-        {"from headers caps", fun() ->
-            Headers = [{"Content-Type", "text/xml"}],
-            Expectation = {"text", "xml"},
-            ?assertEqual(Expectation, aws_lib:get_content_type(Headers))
-        end},
-        {"from headers lower", fun() ->
-            Headers = [{"content-type", "text/xml"}],
-            Expectation = {"text", "xml"},
-            ?assertEqual(Expectation, aws_lib:get_content_type(Headers))
-        end}
-    ].
-
 has_credentials_test_() ->
     {
         foreach,
@@ -374,69 +304,6 @@ local_time_test_() ->
             end}
         ]
     }.
-
-maybe_decode_body_test_() ->
-    [
-        {"application/x-amz-json-1.0", fun() ->
-            ContentType = {"application", "x-amz-json-1.0"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/x-amz-json-1.1", fun() ->
-            %% The JSON 1.1 protocol (e.g. Secrets Manager) must decode too (#99).
-            ContentType = {"application", "x-amz-json-1.1"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/json", fun() ->
-            ContentType = {"application", "json"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/*+json structured suffix", fun() ->
-            ContentType = {"application", "vnd.api+json"},
-            Body = "{\"test\": true}",
-            Expectation = [{"test", true}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"text/xml", fun() ->
-            ContentType = {"text", "xml"},
-            Body = "<test><node>value</node></test>",
-            Expectation = [{"test", [{"node", "value"}]}],
-            ?assertEqual(Expectation, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"text/html [unsupported]", fun() ->
-            ContentType = {"text", "html"},
-            Body = "<html><head></head><body></body></html>",
-            ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
-        end},
-        {"application/octet-stream is not decoded", fun() ->
-            %% A non-JSON application/* subtype must fall through undecoded, not
-            %% be treated as JSON.
-            ContentType = {"application", "octet-stream"},
-            Body = <<"raw bytes">>,
-            ?assertEqual(Body, aws_lib:maybe_decode_body(ContentType, Body))
-        end}
-    ].
-
-parse_content_type_test_() ->
-    [
-        {"application/x-amz-json-1.0", fun() ->
-            Expectation = {"application", "x-amz-json-1.0"},
-            ?assertEqual(Expectation, aws_lib:parse_content_type("application/x-amz-json-1.0"))
-        end},
-        {"application/xml", fun() ->
-            Expectation = {"application", "xml"},
-            ?assertEqual(Expectation, aws_lib:parse_content_type("application/xml"))
-        end},
-        {"text/xml;charset=UTF-8", fun() ->
-            Expectation = {"text", "xml"},
-            ?assertEqual(Expectation, aws_lib:parse_content_type("text/xml"))
-        end}
-    ].
 
 perform_request_test_() ->
     {
@@ -574,6 +441,43 @@ perform_request_test_() ->
         ]
     }.
 
+signing_failure_retries_test_() ->
+    {
+        foreach,
+        fun() ->
+            setup(),
+            meck:new(aws_lib_sign, [passthrough]),
+            [aws_lib_sign]
+        end,
+        fun(Mods) ->
+            teardown(ok),
+            meck:unload(Mods)
+        end,
+        [
+            {
+                "a signing failure exhausts retries instead of crashing",
+                fun() ->
+                    State0 = set_test_credentials(
+                        "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    {ok, State} = aws_lib:set_region("us-east-1", State0),
+                    %% A signing failure makes prepare_signed_request/8 return a
+                    %% 2-tuple {error, Reason}; the retry loop must shape it into
+                    %% the 3-tuple result it matches on rather than raising a
+                    %% case_clause (issue #80 review).
+                    meck:expect(aws_lib_sign, headers, fun(_Request, _BodyHash) ->
+                        {error, {malformed_uri, "bad"}}
+                    end),
+                    Result = aws_lib:api_request_with_retries(
+                        "ec2", get, "/", "", [], 1, 0, State
+                    ),
+                    ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
+                    meck:validate(aws_lib_sign)
+                end
+            }
+        ]
+    }.
+
 sign_headers_test_() ->
     {
         foreach,
@@ -700,7 +604,7 @@ api_get_request_test_() ->
                 %% A transport failure carries no decoded body, so retry
                 %% exhaustion reports the generic reason.
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                 meck:validate(gun)
             end},
             {"a persistent HTTP error surfaces the decoded AWS error body", fun() ->
@@ -727,16 +631,87 @@ api_get_request_test_() ->
                 end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual(
+                ?assertMatch(
                     {error,
                         {service_error, [
                             {"Error", [
                                 {"Code", "ThrottlingException"},
                                 {"Message", "Rate exceeded"}
                             ]}
-                        ]}},
+                        ]},
+                        _State},
                     Result
                 ),
+                meck:validate(gun)
+            end},
+            {"a non-retriable 4xx returns immediately without burning retries", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                meck:expect(gun, open, fun(_, _, _) -> {ok, spawn(fun() -> ok end)} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A 400 with a non-throttling error code is not retriable
+                %% (issue #80): the request must be made exactly once and the
+                %% decoded error returned to the caller immediately.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                end),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertMatch(
+                    {error,
+                        {service_error, [
+                            {"Error", [{"Code", "InvalidParameterValue"}]}
+                        ]},
+                        _State},
+                    Result
+                ),
+                %% Exactly one attempt: not retried.
+                ?assertEqual(1, meck:num_calls(gun, await, '_')),
+                meck:validate(gun)
+            end},
+            {"a throttling 4xx is retried rather than returned immediately", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+
+                meck:expect(gun, open, fun(_, _, _) -> {ok, spawn(fun() -> ok end)} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A 400 whose body indicates throttling is retriable: the first
+                %% attempt throttles, the second succeeds.
+                meck:expect(
+                    gun,
+                    await,
+                    3,
+                    meck:seq([
+                        {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]},
+                        {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                    ])
+                ),
+                meck:expect(
+                    gun,
+                    await_body,
+                    3,
+                    meck:seq([
+                        {ok, <<"{\"__type\": \"ThrottlingException\"}">>},
+                        {ok, <<"{\"data\": \"value\"}">>}
+                    ])
+                ),
+
+                Result = aws_lib:api_get_request("AWS", "API", State),
+                ?assertMatch({ok, [{"data", "value"}], _State}, Result),
+                %% Two attempts: throttling was retried.
+                ?assertEqual(2, meck:num_calls(gun, await, '_')),
                 meck:validate(gun)
             end},
             {"a decoded error survives a later transport failure", fun() ->
@@ -749,16 +724,18 @@ api_get_request_test_() ->
                 meck:expect(gun, close, fun(_) -> ok end),
                 meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
                 meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
-                %% The first attempt returns an HTTP 400 with a decoded error
-                %% body; every later attempt fails at the transport level (no
-                %% body). Retry exhaustion must still surface the decoded body
-                %% from the first attempt, not the bodiless transport error.
+                %% The first attempt returns a retriable HTTP 503 with a decoded
+                %% error body; every later attempt fails at the transport level
+                %% (no body). The 503 keeps the loop retrying so the transport
+                %% failures are consumed, exercising keep_informative_error/2:
+                %% retry exhaustion must still surface the decoded body from the
+                %% first attempt, not the bodiless transport error.
                 meck:expect(
                     gun,
                     await,
                     3,
                     meck:seq([
-                        {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]},
+                        {response, nofin, 503, [{<<"content-type">>, <<"application/json">>}]},
                         {error, "network error"},
                         {error, "network error"},
                         {error, "network error"},
@@ -766,17 +743,21 @@ api_get_request_test_() ->
                     ])
                 ),
                 meck:expect(gun, await_body, fun(_Pid, _, _) ->
-                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                    {ok, <<"{\"Error\": {\"Code\": \"InternalError\"}}">>}
                 end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual(
+                ?assertMatch(
                     {error,
                         {service_error, [
-                            {"Error", [{"Code", "InvalidParameterValue"}]}
-                        ]}},
+                            {"Error", [{"Code", "InternalError"}]}
+                        ]},
+                        _State},
                     Result
                 ),
+                %% All attempts are consumed: the initial 503 plus the four
+                %% transport failures across the retry budget.
+                ?assertEqual(?MAX_RETRIES, meck:num_calls(gun, await, '_')),
                 meck:validate(gun)
             end},
             {"AWS service API request succeeded after a transient error", fun() ->
@@ -834,7 +815,7 @@ api_get_request_test_() ->
                 meck:expect(gun, close, fun(_) -> ok end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                 meck:validate(gun)
             end},
             {"gun:await_up failure re-enters the retry loop rather than raising", fun() ->
@@ -850,7 +831,7 @@ api_get_request_test_() ->
                 meck:expect(gun, await_up, fun(_, _) -> {error, timeout} end),
 
                 Result = aws_lib:api_get_request("AWS", "API", State),
-                ?assertEqual({error, {service_error, retries_exhausted}}, Result),
+                ?assertMatch({error, {service_error, retries_exhausted}, _State}, Result),
                 meck:validate(gun)
             end}
         ]
@@ -1040,6 +1021,44 @@ connection_reuse_across_retries_test_() ->
                     {open_opts, Opts} -> ?assertEqual(0, maps:get(retry, Opts))
                 after 1000 -> ?assert(false)
                 end,
+                Conn ! stop,
+                meck:validate(gun)
+            end},
+            {"a not_retriable 4xx in reuse mode hands the connection back", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State1} = aws_lib:set_region("us-east-1", State0),
+                %% Reuse mode: the connection after a cleanly completed 4xx is as
+                %% usable as after a 2xx, so it must be handed back in the state's
+                %% reuse_conn rather than closed (issue #80 review).
+                State = aws_lib:enable_connection_reuse(State1),
+
+                Conn = spawn(fun() ->
+                    receive
+                        stop -> ok
+                    end
+                end),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, Conn} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% A 400 with a non-throttling error code is not retriable.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 400, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InvalidParameterValue\"}}">>}
+                end),
+
+                {error, {service_error, _}, StateOut} = aws_lib:api_get_request(
+                    "AWS", "API", State
+                ),
+                %% Exactly one attempt: not retried.
+                ?assertEqual(1, meck:num_calls(gun, await, '_')),
+                %% The connection was handed back, not closed.
+                ?assertEqual(0, meck:num_calls(gun, close, '_')),
+                ?assertMatch({Conn, _Host, _Port}, StateOut#aws_state.reuse_conn),
                 Conn ! stop,
                 meck:validate(gun)
             end}
