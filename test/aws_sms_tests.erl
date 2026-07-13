@@ -12,7 +12,7 @@
 %% End-to-end guard for the Secrets Manager response path (issue #131).
 %%
 %% Secrets Manager replies with the `application/x-amz-json-1.1' content
-%% type, which aws_lib:maybe_decode_body/2 now decodes into a string-keyed
+%% type, which aws_lib_response:maybe_decode_body/2 now decodes into a string-keyed
 %% proplist (since #99). These cases mock gun so the real api_post_request
 %% path runs, then assert fetch_secret/3 returns the secret without a second
 %% decode. Before the fix a second rabbit_json:decode ran on the proplist and
@@ -72,4 +72,4 @@ missing_secret_reports_error() ->
     Result = aws_sms:fetch_secret(
         "arn:aws:secretsmanager:us-east-1:1:secret:s", "us-east-1", state()
     ),
-    ?assertEqual({error, no_secret_value}, Result).
+    ?assertMatch({error, no_secret_value, _State}, Result).

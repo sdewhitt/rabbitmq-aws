@@ -175,7 +175,7 @@ resolve_arn(_Arn, none) ->
 resolve_arn(Arn, State) when is_binary(Arn) ->
     case aws_arn_util:resolve_arn(binary_to_list(Arn), State) of
         {ok, Data, _State1} -> {ok, Data};
-        {error, _} = Error -> Error
+        {error, Reason, _State1} -> {error, Reason}
     end.
 
 %%--------------------------------------------------------------------

@@ -26,8 +26,8 @@ run(_KeyStr, providers_https_cacertfile, OAuth2Map, State) when is_map(OAuth2Map
                     Error ->
                         throw(apply_error(MapKey, Arn, Error))
                 end;
-            Error ->
-                throw(resolve_error(MapKey, Arn, Error))
+            {error, Reason, _StateAcc1} ->
+                throw(resolve_error(MapKey, Arn, {error, Reason}))
         end
     end,
     try
