@@ -63,28 +63,54 @@ query_encoding_parity_test_() ->
             ]
     end.
 
-%% Spot-check the encoding on the characters most likely to diverge (space,
-%% slash, reserved), independent of the fixed probe params, so a regression is
-%% attributable to encoding rather than to a params change.
+%% Spot-check the encoding of individual special characters, independent of the
+%% fixed probe params, so a regression is attributable to encoding rather than to
+%% a params change. uri_string:compose_query/1 is the encoder query_for/1
+%% delegates to, so this compares the two encoders directly.
+%%
+%% Two groups, because the encoders agree byte-for-byte on most characters but
+%% not all:
+%%   * AGREE -- space (both `+'), `/', `#', and reserved `&'/`=' encode
+%%     identically, so byte equality holds and pins that no regression appears.
+%%   * DIVERGE-BUT-SAFE -- `~' (upstream leaves literal, compose_query emits
+%%     %7E) and `*' (upstream emits %2A, compose_query leaves literal) differ in
+%%     bytes but decode to the same character, so a conformant auth server that
+%%     percent-decodes reads the same param either way. Asserting byte equality
+%%     here would be wrong; assert post-decode (semantic) equivalence instead,
+%%     which is the property that actually matters on the wire.
 query_encoding_special_chars_test_() ->
     case upstream_q_usable() of
         false ->
             [];
         true ->
-            Params = [
+            Agree = [
                 [{"username", "a b"}],
                 [{"name", "a/b"}],
                 [{"vhost", "/"}],
                 [{"routing_key", "#"}],
                 [{"k", "a&b=c"}]
             ],
+            DivergeButSafe = [
+                [{"k", "tilde~x"}],
+                [{"k", "star*x"}]
+            ],
             [
                 {
-                    lists:flatten(io_lib:format("~p", [P])),
+                    "byte parity: " ++ lists:flatten(io_lib:format("~p", [P])),
                     ?_assertEqual(?UPSTREAM:q(P), uri_string:compose_query(P))
                 }
-             || P <- Params
-            ]
+             || P <- Agree
+            ] ++
+                [
+                    {
+                        "decode parity: " ++ lists:flatten(io_lib:format("~p", [P])),
+                        ?_assertEqual(
+                            uri_string:dissect_query(?UPSTREAM:q(P)),
+                            uri_string:dissect_query(uri_string:compose_query(P))
+                        )
+                    }
+                 || P <- DivergeButSafe
+                ]
     end.
 
 %%--------------------------------------------------------------------
