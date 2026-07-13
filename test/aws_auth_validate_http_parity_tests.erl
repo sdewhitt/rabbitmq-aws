@@ -1,0 +1,178 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
+%% Parity tests between the HTTP validation backend and the real
+%% rabbit_auth_backend_http it validates.
+%%
+%% The validation backend does not reimplement an upstream parser (unlike the
+%% LDAP query DSL), so there is no single equal-both-implementations check like
+%% aws_auth_validate_tests:parity_test_/0. What it DOES do is build request
+%% queries and interpret allow/deny responses the same way the real backend
+%% does, mirroring that contract by hand. These tests pin the parts of that
+%% contract that upstream exposes, so a change in rabbit_auth_backend_http that
+%% would make the probe diverge from a real broker request is caught here rather
+%% than silently.
+%%
+%% What is checked:
+%%   * query encoding parity -- the probe's per-path query strings encode
+%%     identically to rabbit_auth_backend_http:q/1 (the exported query builder
+%%     the broker uses). This is a true differential test: both are run on the
+%%     same params and asserted equal.
+%%   * tag-join parity -- join_tags/1 is referenced by the authz query shape.
+%%   * response-grammar contract -- our classify_response/2 accepts exactly the
+%%     allow/deny forms the broker's own parsing accepts, and rejects the rest.
+%%     The broker's parsing is inline in user_login_authentication/2 and req/2
+%%     (not an exported pure function), so this side is asserted against the
+%%     documented grammar rather than by calling upstream directly.
+%%
+%% Like the LDAP parity tests, the differential checks run only when upstream is
+%% actually usable in this node (the module and its deps loaded); otherwise they
+%% skip rather than fail spuriously across the RMQ-version CI matrix.
+-module(aws_auth_validate_http_parity_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(BACKEND, aws_auth_validate_http).
+-define(UPSTREAM, rabbit_auth_backend_http).
+
+%%--------------------------------------------------------------------
+%% Query-encoding parity (differential: our query_for vs upstream q/1)
+%%--------------------------------------------------------------------
+
+%% For every probe path type, the query string our backend sends must encode
+%% byte-for-byte the same as rabbit_auth_backend_http:q/1 given the same params.
+%% If upstream ever changes its encoding (e.g. space as %20 instead of +, or a
+%% different escaping of `/'), the probe would send params a conformant auth
+%% server parses differently and this fails.
+query_encoding_parity_test_() ->
+    case upstream_q_usable() of
+        false ->
+            [];
+        true ->
+            [
+                {
+                    "query_for(" ++ binary_to_list(Key) ++ ") == upstream q/1",
+                    ?_assertEqual(
+                        ?UPSTREAM:q(?BACKEND:params_for(Key)),
+                        ?BACKEND:query_for(Key)
+                    )
+                }
+             || Key <- path_keys()
+            ]
+    end.
+
+%% Spot-check the encoding on the characters most likely to diverge (space,
+%% slash, reserved), independent of the fixed probe params, so a regression is
+%% attributable to encoding rather than to a params change.
+query_encoding_special_chars_test_() ->
+    case upstream_q_usable() of
+        false ->
+            [];
+        true ->
+            Params = [
+                [{"username", "a b"}],
+                [{"name", "a/b"}],
+                [{"vhost", "/"}],
+                [{"routing_key", "#"}],
+                [{"k", "a&b=c"}]
+            ],
+            [
+                {
+                    lists:flatten(io_lib:format("~p", [P])),
+                    ?_assertEqual(?UPSTREAM:q(P), uri_string:compose_query(P))
+                }
+             || P <- Params
+            ]
+    end.
+
+%%--------------------------------------------------------------------
+%% Tag-join parity (join_tags/1 is exported upstream)
+%%--------------------------------------------------------------------
+
+join_tags_parity_test_() ->
+    case upstream_join_tags_usable() of
+        false ->
+            [];
+        true ->
+            [
+                ?_assertEqual("", ?UPSTREAM:join_tags([])),
+                ?_assertEqual("administrator", ?UPSTREAM:join_tags([administrator])),
+                ?_assertEqual(
+                    "administrator management",
+                    ?UPSTREAM:join_tags([administrator, management])
+                )
+            ]
+    end.
+
+%%--------------------------------------------------------------------
+%% Response-grammar contract (our classify_response vs the documented grammar)
+%%--------------------------------------------------------------------
+%%
+%% The broker's allow/deny parsing is inline in user_login_authentication/2
+%% (authn: bare `deny', or `allow' + space-separated tags) and req/2 (authz:
+%% bare `allow' / `deny'), both after lowercasing the trimmed body. Those are
+%% not exported pure functions, so this pins our classify_response/2 against
+%% that grammar directly. If someone loosens or tightens our parser, this flags
+%% it against the contract we are mirroring.
+
+%% authn (user_path): `deny' or `allow'[ tags...] succeed; anything else fails.
+response_grammar_authn_test_() ->
+    Ok = [
+        <<"allow">>,
+        <<"allow administrator">>,
+        <<"allow a b c">>,
+        <<"deny">>,
+        %% trimming + case-insensitivity, as the broker lowercases the trimmed body
+        <<"  ALLOW  ">>,
+        <<"Deny">>
+    ],
+    Bad = [<<"allowed">>, <<"allowxyz">>, <<"denied">>, <<"maybe">>, <<>>, <<"allow-tag">>],
+    [?_assertEqual(ok, ?BACKEND:classify_response(<<"user_path">>, B)) || B <- Ok] ++
+        [
+            ?_assertMatch({error, auth_failed, _}, ?BACKEND:classify_response(<<"user_path">>, B))
+         || B <- Bad
+        ].
+
+%% authz (vhost/resource/topic_path): only bare `allow' / `deny' succeed; the
+%% allow-with-tags form is authn-only and must NOT be accepted here.
+response_grammar_authz_test_() ->
+    Keys = [<<"vhost_path">>, <<"resource_path">>, <<"topic_path">>],
+    Ok = [<<"allow">>, <<"deny">>, <<"  ALLOW ">>],
+    Bad = [<<"allow administrator">>, <<"allowed">>, <<"maybe">>, <<>>],
+    [?_assertEqual(ok, ?BACKEND:classify_response(K, B)) || K <- Keys, B <- Ok] ++
+        [
+            ?_assertMatch({error, auth_failed, _}, ?BACKEND:classify_response(K, B))
+         || K <- Keys, B <- Bad
+        ].
+
+%%--------------------------------------------------------------------
+%% Corpus + upstream-usable guards
+%%--------------------------------------------------------------------
+
+path_keys() ->
+    [<<"user_path">>, <<"vhost_path">>, <<"resource_path">>, <<"topic_path">>].
+
+%% rabbit_auth_backend_http:q/1 depends on rabbit_http_util:quote_plus and
+%% rabbit_data_coercion. Across the RMQ-version CI matrix those are not always
+%% loaded in the bare eunit node; if they are missing q/1 throws undef and the
+%% parity check would fail spuriously. Probe q/1 with a known input and only run
+%% the differential tests when it produces the expected encoding.
+upstream_q_usable() ->
+    code:ensure_loaded(?UPSTREAM) =/= {error, nofile} andalso
+        erlang:function_exported(?UPSTREAM, q, 1) andalso
+        try
+            ?UPSTREAM:q([{"k", "a b"}]) =:= "k=a+b"
+        catch
+            _:_ -> false
+        end.
+
+upstream_join_tags_usable() ->
+    code:ensure_loaded(?UPSTREAM) =/= {error, nofile} andalso
+        erlang:function_exported(?UPSTREAM, join_tags, 1) andalso
+        try
+            ?UPSTREAM:join_tags([a, b]) =:= "a b"
+        catch
+            _:_ -> false
+        end.

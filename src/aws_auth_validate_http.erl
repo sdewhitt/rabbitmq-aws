@@ -78,7 +78,9 @@
     build_client_ssl_opts/1,
     classify_http_error/1,
     is_tls_error/1,
-    classify_response/2
+    classify_response/2,
+    query_for/1,
+    params_for/1
 ]).
 -endif.
 
@@ -603,10 +605,11 @@ is_tls_error(Term) ->
 %% endpoint speaks the auth protocol. We only fail when the body matches
 %% NEITHER allow nor deny, which means the configured path points at something
 %% that is not an auth backend (the false-pass this guard closes). We never
-%% echo the body (R4): a mismatch returns the fixed ?REASON_ENDPOINT.
+%% echo the body: a mismatch returns the fixed ?REASON_ENDPOINT.
 %%
-%% Grammar (mirrors rabbit_auth_backend_http:parse_resp/1, which does
-%% string:to_lower(string:strip(Body)) then matches):
+%% Grammar (mirrors rabbit_auth_backend_http's own parsing in
+%% user_login_authentication/2 (authn) and req/2 (authz), which lowercase the
+%% trimmed body then match):
 %%   * user_path (authn): exactly `deny', or anything beginning with `allow'
 %%     (an `allow' optionally followed by space-separated tags).
 %%   * vhost/resource/topic_path (authz): exactly `allow' or `deny'.
