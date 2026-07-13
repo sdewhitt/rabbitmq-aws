@@ -162,22 +162,29 @@ path_keys() ->
 %% rabbit_auth_backend_http:q/1 depends on rabbit_http_util:quote_plus and
 %% rabbit_data_coercion. Across the RMQ-version CI matrix those are not always
 %% loaded in the bare eunit node; if they are missing q/1 throws undef and the
-%% parity check would fail spuriously. Probe q/1 with a known input and only run
-%% the differential tests when it produces the expected encoding.
+%% parity check would fail spuriously. Probe q/1 only for CALLABILITY (it runs
+%% and returns a string), not for a specific encoding: pinning the expected
+%% output here would make an upstream encoding change flip this guard to false
+%% and skip the parity test, silently disabling the one check that exists to
+%% catch encoding drift. With only a callability guard, such drift fails the
+%% differential assertion instead.
 upstream_q_usable() ->
     code:ensure_loaded(?UPSTREAM) =/= {error, nofile} andalso
         erlang:function_exported(?UPSTREAM, q, 1) andalso
         try
-            ?UPSTREAM:q([{"k", "a b"}]) =:= "k=a+b"
+            is_list(?UPSTREAM:q([{"k", "a b"}]))
         catch
             _:_ -> false
         end.
 
+%% Callability guard only, for the same reason as upstream_q_usable/0: pinning
+%% the expected output would skip the parity test on the very drift it exists to
+%% catch.
 upstream_join_tags_usable() ->
     code:ensure_loaded(?UPSTREAM) =/= {error, nofile} andalso
         erlang:function_exported(?UPSTREAM, join_tags, 1) andalso
         try
-            ?UPSTREAM:join_tags([a, b]) =:= "a b"
+            is_list(?UPSTREAM:join_tags([a, b]))
         catch
             _:_ -> false
         end.
