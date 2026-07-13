@@ -170,6 +170,11 @@
 >>).
 -define(REASON_TOKEN_SIGNATURE_INVALID, <<"access_token signature verification failed">>).
 -define(REASON_TOKEN_EXPIRED, <<"access_token is expired or not yet valid">>).
+-define(REASON_TOKEN_BAD_TIME_CLAIM, <<"access_token has a non-numeric exp or nbf claim">>).
+-define(REASON_TOKEN_MISSING_EXP, <<
+    "access_token has no exp claim but the server requires one "
+    "(auth_oauth2.require_exp)"
+>>).
 -define(REASON_TOKEN_AUDIENCE, <<"access_token audience does not include resource_server_id">>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_NO_ASSUME_ROLE, <<
@@ -669,8 +674,16 @@ jwt_claims(_) ->
 
 %% exp/nbf validation, matching rabbit_auth_backend_oauth2:validate_token_expiry/1
 %% semantics: an exp at or before now is expired; a numeric nbf in the future is
-%% not-yet-valid. Absent claims are permitted (nothing to assert). A present but
-%% non-numeric exp/nbf is treated as expired (the token is malformed w.r.t. time).
+%% not-yet-valid (both -> token_expired, a transient condition). A present but
+%% non-numeric exp/nbf is NOT "expired" -- the claim is malformed, so the token
+%% is invalid -> token_invalid.
+%%
+%% Absent exp: permitted by default, BUT the server-side option
+%% `auth_oauth2.require_exp' (recent) makes the broker REJECT a token with no
+%% exp. When that option is set we mirror it here -- otherwise the endpoint would
+%% report a no-exp token as OK while the live broker would refuse it (a false
+%% pass, the exact thing this endpoint exists to prevent). A missing-required-exp
+%% is a config mismatch the broker would also reject -> token_invalid.
 check_token_expiry(Claims) ->
     Now = os:system_time(seconds),
     case check_exp(maps:get(<<"exp">>, Claims, undefined), Now) of
@@ -679,14 +692,25 @@ check_token_expiry(Claims) ->
     end.
 
 check_exp(undefined, _Now) ->
-    ok;
+    case require_exp() of
+        true -> {error, token_invalid, ?REASON_TOKEN_MISSING_EXP};
+        false -> ok
+    end;
 check_exp(Exp, Now) when is_number(Exp) ->
     case trunc(Exp) =< Now of
         true -> {error, token_expired, ?REASON_TOKEN_EXPIRED};
         false -> ok
     end;
 check_exp(_Exp, _Now) ->
-    {error, token_expired, ?REASON_TOKEN_EXPIRED}.
+    %% present but non-numeric -> malformed claim, not "expired"
+    {error, token_invalid, ?REASON_TOKEN_BAD_TIME_CLAIM}.
+
+%% Read the server's rabbit_auth_backend_oauth2 `require_exp' setting (recent
+%% option). Absent/false -> a token without exp is accepted; true -> it is
+%% rejected, matching what the live broker would do. Read from the oauth2
+%% backend's app env, the same source the backend itself uses.
+require_exp() ->
+    application:get_env(rabbitmq_auth_backend_oauth2, require_exp, false) =:= true.
 
 check_nbf(undefined, _Now) ->
     ok;
@@ -696,7 +720,8 @@ check_nbf(Nbf, Now) when is_number(Nbf) ->
         false -> ok
     end;
 check_nbf(_Nbf, _Now) ->
-    {error, token_expired, ?REASON_TOKEN_EXPIRED}.
+    %% present but non-numeric -> malformed claim, not "not yet valid"
+    {error, token_invalid, ?REASON_TOKEN_BAD_TIME_CLAIM}.
 
 %% When a resource_server_id was supplied, require it in the token `aud' (a
 %% string or a list of strings, per RFC 7519). When none was supplied, the aud

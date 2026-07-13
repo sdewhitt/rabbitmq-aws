@@ -611,6 +611,71 @@ verify_token_not_yet_valid_test() ->
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
 
+%% A present but non-numeric exp is a malformed claim -> token_invalid, NOT
+%% token_expired (the token is invalid, not merely expired).
+verify_token_non_numeric_exp_is_invalid_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => <<"not-a-number">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, token_invalid, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A present but non-numeric nbf is likewise a malformed claim -> token_invalid.
+verify_token_non_numeric_nbf_is_invalid_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future(), <<"nbf">> => <<"soon">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, token_invalid, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A token with NO exp is accepted by default (require_exp unset).
+verify_token_no_exp_ok_by_default_test() ->
+    application:unset_env(rabbitmq_auth_backend_oauth2, require_exp),
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% When the server sets auth_oauth2.require_exp, a token with NO exp is refused
+%% -> token_invalid (the live broker would also reject it -- a config mismatch,
+%% not a transient expiry). Mirrors rabbit_auth_backend_oauth2's require_exp.
+verify_token_no_exp_rejected_when_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, true),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertMatch(
+            {error, token_invalid, _},
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
+
+%% require_exp only affects the ABSENT-exp case: a token WITH a valid exp still
+%% passes when the option is on.
+verify_token_present_exp_ok_when_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, true),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future()}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
+
 %% aud check: resource_server_id present in a list aud -> ok.
 verify_token_audience_ok_test() ->
     #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
