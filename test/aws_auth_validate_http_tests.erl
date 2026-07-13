@@ -760,12 +760,18 @@ http_response_contract_test_() ->
         {<<"user_path">>, <<"allow">>, ok},
         {<<"user_path">>, <<"deny">>, ok},
         {<<"user_path">>, <<"allow administrator management">>, ok},
+        %% deny-with-reason passes, mirroring the backend's `"deny " ++ Reason'
+        %% clause; a conformant server may explain the refusal.
+        {<<"user_path">>, <<"deny insufficient permissions">>, ok},
+        {<<"resource_path">>, <<"deny not allowed here">>, ok},
         %% Normalization: leading/trailing whitespace + case are tolerated,
         %% mirroring rabbit_auth_backend_http's lower(strip(Body)).
         {<<"user_path">>, <<"  ALLOW  ">>, ok},
         {<<"user_path">>, <<"Deny\n">>, ok},
         {<<"user_path">>, <<"allow\tmanagement">>, ok},
-        %% authz paths only ever return a bare allow/deny.
+        {<<"user_path">>, <<"DENY too bad">>, ok},
+        %% authz paths only ever return a bare allow or a deny (with or without
+        %% a reason).
         {<<"vhost_path">>, <<"allow">>, ok},
         {<<"resource_path">>, <<"deny">>, ok},
         {<<"topic_path">>, <<"ALLOW">>, ok},
@@ -773,6 +779,7 @@ http_response_contract_test_() ->
         {<<"user_path">>, <<"<html>hi</html>">>, {error, auth_failed, Endpoint}},
         {<<"user_path">>, <<"">>, {error, auth_failed, Endpoint}},
         {<<"user_path">>, <<"allowed">>, {error, auth_failed, Endpoint}},
+        {<<"user_path">>, <<"denied">>, {error, auth_failed, Endpoint}},
         {<<"user_path">>, <<"{\"result\":\"allow\"}">>, {error, auth_failed, Endpoint}},
         %% allow-with-tags is NOT valid on an authz path (exact match only).
         {<<"vhost_path">>, <<"allow administrator">>, {error, auth_failed, Endpoint}},
