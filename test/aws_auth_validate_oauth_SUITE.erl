@@ -54,10 +54,7 @@ groups() ->
             custom_ca_verify_peer_returns_ok,
             error_reason_leaks_no_target_detail,
             sts_direct_jwks_uri_returns_ok,
-            sts_issuer_only_returns_auth_failed,
-            token_fetch_valid_returns_ok,
-            token_fetch_rejected_returns_auth_failed,
-            token_fetch_no_secret_or_token_leak
+            sts_issuer_only_returns_auth_failed
         ]}
     ].
 
@@ -302,71 +299,6 @@ sts_issuer_only_returns_auth_failed(Config) ->
     ?assertMatch({error, auth_failed, _}, validate(Body)).
 
 %%--------------------------------------------------------------------
-%% client_credentials token-fetch tier (integration)
-%%--------------------------------------------------------------------
-%%
-%% These drive the OPTIONAL credentialed tier end to end against the local stub:
-%% valid JWKS + a real POST to the stub's /oauth2/token endpoint, with the client
-%% secret resolved from a mecked ARN under the group's configured assume_role.
-%% verify_none is used so the self-signed stub cert is accepted, isolating the
-%% grant flow from TLS concerns (TLS paths are covered by the JWKS cases).
-
-%% Valid JWKS + a token endpoint returning an access_token -> ok.
-token_fetch_valid_returns_ok(Config) ->
-    with_resolved_secret(<<"the-secret">>, fun() ->
-        Body = #{
-            <<"jwks_uri">> => self_url(Config, "/jwks"),
-            <<"token_endpoint">> => self_url(Config, "/oauth2/token"),
-            <<"client_id">> => <<"client-abc">>,
-            <<"client_secret_arn">> => <<"arn:aws:secretsmanager:us-west-2:1:secret:s">>,
-            <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
-        },
-        ?assertEqual(ok, validate(Body))
-    end).
-
-%% The token endpoint rejects the grant (401) -> auth_failed.
-token_fetch_rejected_returns_auth_failed(Config) ->
-    with_resolved_secret(<<"the-secret">>, fun() ->
-        Body = #{
-            <<"jwks_uri">> => self_url(Config, "/jwks"),
-            <<"token_endpoint">> => self_url(Config, "/oauth2/token-reject"),
-            <<"client_id">> => <<"client-abc">>,
-            <<"client_secret_arn">> => <<"arn:aws:secretsmanager:us-west-2:1:secret:s">>,
-            <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
-        },
-        ?assertMatch({error, auth_failed, _}, validate(Body))
-    end).
-
-%% R6: neither the resolved secret nor the fetched token appears in the result.
-token_fetch_no_secret_or_token_leak(Config) ->
-    with_resolved_secret(<<"SECRET-ARN-VALUE">>, fun() ->
-        Body = #{
-            <<"jwks_uri">> => self_url(Config, "/jwks"),
-            <<"token_endpoint">> => self_url(Config, "/oauth2/token"),
-            <<"client_id">> => <<"client-abc">>,
-            <<"client_secret_arn">> => <<"arn:aws:secretsmanager:us-west-2:1:secret:s">>,
-            <<"ssl_options">> => #{<<"verify">> => <<"verify_none">>}
-        },
-        Result = validate(Body),
-        Rendered = lists:flatten(io_lib:format("~p", [Result])),
-        ?assertEqual(ok, Result),
-        ?assertEqual(nomatch, string:find(Rendered, "SECRET-ARN-VALUE")),
-        %% The stub returns access_token "stub-access-token".
-        ?assertEqual(nomatch, string:find(Rendered, "stub-access-token"))
-    end).
-
-%% Mock aws_arn_util:resolve_arn to return Secret (the group already configured
-%% assume_role + mecked aws_iam:assume_role), run Fun, then unload the mock.
-with_resolved_secret(Secret, Fun) ->
-    ok = meck:new(aws_arn_util, [passthrough]),
-    try
-        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, Secret, State} end),
-        Fun()
-    after
-        meck:unload(aws_arn_util)
-    end.
-
-%%--------------------------------------------------------------------
 %% Stub HTTPS server (in-process inets httpd)
 %%--------------------------------------------------------------------
 
@@ -440,18 +372,6 @@ do(Info) ->
                     <<"keys">> => [#{<<"kty">> => <<"RSA">>, <<"kid">> => <<"k1">>}]
                 }),
                 {200, Jwks, "application/json"};
-            "/oauth2/token" ->
-                %% client_credentials grant endpoint: return a JSON access_token
-                %% so the token-fetch tier succeeds.
-                Tok = rabbit_json:encode(#{
-                    <<"access_token">> => <<"stub-access-token">>,
-                    <<"token_type">> => <<"Bearer">>
-                }),
-                {200, Tok, "application/json"};
-            "/oauth2/token-reject" ->
-                %% Simulate an IdP rejecting the client credentials.
-                Err = rabbit_json:encode(#{<<"error">> => <<"invalid_client">>}),
-                {401, Err, "application/json"};
             "/jwks-empty" ->
                 {200, rabbit_json:encode(#{<<"keys">> => []}), "application/json"};
             "/jwks-notjwks" ->

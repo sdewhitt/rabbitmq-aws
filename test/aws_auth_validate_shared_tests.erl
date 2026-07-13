@@ -61,6 +61,51 @@ connection_timeout_bounds_test() ->
     application:unset_env(aws, auth_validation_connection_timeout_ms).
 
 %%--------------------------------------------------------------------
+%% aws_auth_validate_ssl: hostname-check on verify_peer paths
+%%--------------------------------------------------------------------
+%%
+%% Regression guard: every verify_peer path must carry the https match_fun so a
+%% multi-label host under a single-label wildcard cert (e.g. Cognito's
+%% foo.auth.<region>.amazoncognito.com vs *.auth.<region>.amazoncognito.com)
+%% verifies the way curl/openssl/browsers do. Without it the probe reported a
+%% spurious tls_failed for valid IdP endpoints. Applies to http + oauth (both
+%% call apply_verify_default with a cacerts anchor present).
+
+%% A cacerts anchor is present, so a bare verify_peer must gain the https
+%% customize_hostname_check match_fun.
+apply_verify_default_adds_hostname_check_test() ->
+    Opts = [{verify, verify_peer}, {cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, true),
+    ?assert(has_https_match_fun(Out)).
+
+%% When verify is ABSENT and an anchor exists, we default to verify_peer AND add
+%% the match_fun (the http/oauth default probe path).
+apply_verify_default_absent_verify_adds_hostname_check_test() ->
+    Opts = [{cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, false),
+    ?assertEqual({verify, verify_peer}, lists:keyfind(verify, 1, Out)),
+    ?assert(has_https_match_fun(Out)).
+
+%% An explicit verify_none is left untouched -- no hostname check injected.
+apply_verify_default_verify_none_untouched_test() ->
+    Opts = [{verify, verify_none}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, true),
+    ?assertNot(lists:keymember(customize_hostname_check, 1, Out)).
+
+%% A caller-supplied customize_hostname_check is not overridden.
+apply_verify_default_respects_caller_hostname_check_test() ->
+    Custom = [{match_fun, fun(_, _) -> true end}],
+    Opts = [{verify, verify_peer}, {cacerts, [<<"der">>]}, {customize_hostname_check, Custom}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, true),
+    ?assertEqual(Custom, proplists:get_value(customize_hostname_check, Out)).
+
+has_https_match_fun(Opts) ->
+    case lists:keyfind(customize_hostname_check, 1, Opts) of
+        {customize_hostname_check, Cfg} -> is_function(proplists:get_value(match_fun, Cfg));
+        false -> false
+    end.
+
+%%--------------------------------------------------------------------
 %% aws_auth_validate_net: the SSRF classifier is identical for the http and
 %% oauth policies (same infra denylist). Assert both backends' TEST wrappers
 %% agree with each other and with the shared module for the full v4/v6 matrix.
