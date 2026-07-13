@@ -47,6 +47,9 @@ make_request(Body, Headers, State) ->
     case aws_lib:api_post_request("sts", "/", Body, Headers, State) of
         {ok, ResponseBody, State1} ->
             parse_assume_role_response(ResponseBody, State1);
-        Error ->
-            Error
+        {error, Reason, _State1} ->
+            %% assume_role/2 runs before connection reuse is enabled (one-shot
+            %% mode), so there is no connection to hand back; collapse the error
+            %% to a 2-tuple and keep this module's public contract unchanged.
+            {error, Reason}
     end.

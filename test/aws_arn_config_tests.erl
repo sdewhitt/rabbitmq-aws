@@ -192,9 +192,9 @@ resolved_state_propagates_across_arns() ->
 %% A resolve_arn/2 error stops the handler chain at that ARN: the remaining
 %% ARN is never resolved and the error is wrapped for the failing key.
 resolve_arn_error_short_circuits() ->
-    ok = meck:expect(aws_arn_util, resolve_arn, fun(Arn, _State) ->
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
         case Arn of
-            "arn:aws:s3:::b/first" -> {error, not_found};
+            "arn:aws:s3:::b/first" -> {error, not_found, State};
             _ -> erlang:error(second_arn_should_not_resolve)
         end
     end),
@@ -267,7 +267,7 @@ self_resolving_handler_state_propagates() ->
 %% produces) rather than leaking a bare, context-free error. Exercises the real
 %% aws_arn_config_oauth2:run/4, mocking only the ARN resolution it calls.
 self_resolving_handler_error_has_context() ->
-    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, not_found} end),
+    ok = meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {error, not_found, State} end),
     Result = aws_arn_config_oauth2:run(
         the_key, providers_https_cacertfile, #{<<"0">> => <<"arn:x">>}, aws_lib:new()
     ),

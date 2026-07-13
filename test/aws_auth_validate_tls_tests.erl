@@ -249,7 +249,7 @@ tls_malformed_pem_maps_to_input_invalid_test_() ->
 %% An ARN resolution failure maps to input_invalid.
 tls_arn_resolve_failure_test_() ->
     {setup, fun setup_role/0, fun cleanup_role/1, fun(_) ->
-        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, _State) -> {error, not_found} end),
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {error, not_found, State} end),
         R = validate_ok_body(),
         [
             ?_assertEqual({error, input_invalid, <<"failed to resolve ARN">>}, R)
