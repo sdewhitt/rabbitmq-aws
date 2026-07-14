@@ -12,41 +12,78 @@
 %% category so the response leaks no target URL, response body, or raw httpc
 %% error.
 %%
-%% Scope: REACHABILITY + JWKS well-formedness (deliberate first cut). WITHOUT a
-%% real token we cannot assert end-to-end token verification. We CAN confirm
-%% the signing-key source the broker would use is reachable, TLS-valid, and
-%% serves a well-formed JWKS. Concretely, an `ok' (204) means:
+%% Scope: REACHABILITY + JWKS well-formedness (the base check). At minimum an
+%% `ok' (204) means:
 %%
 %%   - every configured HTTPS endpoint resolved + connected over TLS, and
 %%   - the JWKS endpoint returned HTTP 200 with a JSON object containing a
 %%     non-empty "keys" array (a syntactically valid JWKS).
 %%
-%% It does NOT mean any particular token will validate (no aud/scope/signature
-%% assertion against a live JWT). This limitation MUST be reflected in customer
-%% docs so the result is not over-trusted -- same caveat the LDAP dn_lookup_base
-%% and HTTP reachability checks carry.
+%% Base reachability alone does NOT prove any particular token will validate.
+%% To close that gap WITHOUT accepting a client secret (and without the
+%% confused-deputy / secret-exfil surface a broker-side grant would add), the
+%% caller may OPTIONALLY supply their OWN access token via `access_token'. The
+%% customer mints it out of band (a single curl to their IdP's token endpoint --
+%% see the tutorial), so no secret ever transits this endpoint. When present,
+%% the token is verified against the just-fetched JWKS:
 %%
-%% A future credentialed mode (accept a real access token + assert full
-%% decode/verify against the fetched keys, with verify_aud/resource_server_id)
-%% is explicitly out of scope; noted as an open follow-up.
+%%   - the JWS `alg' must be in a fixed asymmetric allowlist (RS*/ES*/PS*);
+%%     `none' and any HMAC (HS*) alg are refused, closing the alg-confusion /
+%%     "sign with the public key as an HMAC secret" attack;
+%%   - the signature is verified with jose_jwt:verify_strict/3 (algorithm
+%%     PINNED to the header alg) against the JWKS key whose `kid' matches (a
+%%     token with no `kid' is rejected -- the broker resolves those via a
+%%     configured default_key this endpoint does not model);
+%%   - `exp' is checked (same semantics as rabbit_auth_backend_oauth2, which
+%%     validates `exp' only -- it does not check `nbf');
+%%   - when `resource_server_id' is supplied and the broker's `verify_aud' is
+%%     not disabled, the token `aud' must include it.
 %%
-%% Category mapping (reuses the existing aws_auth_validate_backend categories;
-%% no new category is introduced, per R4 "keep the set small"):
+%% This reuses the broker's own crypto library (jose) so the signature decision
+%% matches what rabbit_auth_backend_oauth2 would compute -- a decision-parity
+%% claim analogous to the LDAP backend's, scoped to signature + exp/nbf/aud. It
+%% does NOT assert scope authorization; that stays an over-trust caveat for the
+%% customer docs, same as the LDAP dn_lookup_base and HTTP reachability checks.
+%%
+%% A broker-side `client_credentials' grant (the broker fetching a token itself
+%% from a supplied token_endpoint + client_secret_arn) was considered and
+%% deliberately NOT implemented: it validates a client capability rather than
+%% the broker's resource-server config, duplicates what the customer already did
+%% to obtain the token they supply here, and would introduce a secret-exfil
+%% surface (caller supplies both the secret ARN and an arbitrary destination
+%% URL). The customer-supplied `access_token' path gives the same end-to-end
+%% signature confidence with no secret transiting the endpoint.
+%%
+%% Category mapping:
 %%   * input_invalid    (400) -- bad URL / bad ssl_options / ARN resolve fail /
-%%                               SSRF-denied target.
+%%                               SSRF-denied target / malformed access_token /
+%%                               unsupported token alg.
 %%   * connection_failed (400) -- host unreachable / DNS / connection refused /
 %%                                timeout.
 %%   * tls_failed        (400) -- TLS handshake / cert verification failure.
 %%   * auth_failed       (422) -- endpoint reached but not a JWKS / discovery
-%%                                doc.
+%%                                doc; also a token audience mismatch.
 %%     NOTE: auth_failed is borrowed for "endpoint did not return a usable
-%%     JWKS/OIDC document". If this proves too coarse, introduce a dedicated
-%%     `endpoint_unverified' category (requires extending
-%%     aws_auth_validate_backend:error_category/0 and the handler's
-%%     status_for_category/1).
+%%     JWKS/OIDC document".
+%%   * token_invalid    (422) -- a supplied access_token failed signature
+%%                               verification, or no fetched JWKS key matched its
+%%                               kid. A REAL config mismatch: the JWKS the broker
+%%                               fetches would also reject live tokens.
+%%   * token_expired    (422) -- a supplied access_token is expired (exp) or not
+%%                               yet valid (nbf). TRANSIENT, not a config bug --
+%%                               re-mint the token and retry.
+%%   token_invalid / token_expired are safe to distinguish (unlike the coarse
+%%   reachability categories) because they describe the caller's own token, not
+%%   the broker's infra or an SSRF target, so they leak nothing R4 guards.
 -module(aws_auth_validate_oauth).
 
 -behaviour(aws_auth_validate_backend).
+
+%% jose record definitions: jose_jwt:verify_strict/3 returns a #jose_jwt{}
+%% carrying its claims under a `fields' map. Using the record accessor (rather
+%% than positional element/2) keeps jwt_claims/1 robust if jose's record layout
+%% changes.
+-include_lib("jose/include/jose_jwt.hrl").
 
 -export([method_name/0, validate/1, allowed_fields/0]).
 
@@ -59,9 +96,31 @@
     classify_ip/1,
     in_cidr/2,
     url_allowed/1,
-    is_valid_jwks/1
+    is_valid_jwks/1,
+    parse_access_token/1,
+    token_header/1,
+    verify_token/3,
+    select_jwk/2
 ]).
 -endif.
+
+%% Asymmetric JWS algorithms accepted for customer-supplied token verification.
+%% Deliberately excludes `none' and every HMAC (HS*) algorithm: a JWKS carries
+%% only public keys, so an HS* token would be "verified" by HMAC-ing with the
+%% public key as the shared secret -- the classic alg-confusion forgery. The
+%% allowlist is passed to jose_jwt:verify_strict/3, which refuses any token
+%% whose header `alg' is not a member.
+-define(ALLOWED_TOKEN_ALGS, [
+    <<"RS256">>,
+    <<"RS384">>,
+    <<"RS512">>,
+    <<"ES256">>,
+    <<"ES384">>,
+    <<"ES512">>,
+    <<"PS256">>,
+    <<"PS384">>,
+    <<"PS512">>
+]).
 
 %% Default per-request timeout (ms) when auth_validation_connection_timeout_ms
 %% is unset. Matches the LDAP/HTTP backends' default.
@@ -103,6 +162,34 @@
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_ENDPOINT, <<"endpoint did not return a valid JWKS document">>).
 -define(REASON_DISCOVERY, <<"issuer discovery did not return a valid OpenID configuration">>).
+%% Customer-supplied access-token verification (optional, activates when
+%% access_token is present). Fixed R4 reasons: no token content, claim value,
+%% or key material echoed. Pure-phase shape problems are input_invalid (400);
+%% verification outcomes use the token_invalid / token_expired categories (422)
+%% so an operator can tell a real config mismatch (token_invalid: bad signature
+%% or no matching JWKS key -- the broker will reject live tokens) from a
+%% transient, non-config problem (token_expired: just re-mint and retry).
+-define(REASON_BAD_ACCESS_TOKEN, <<"access_token must be a non-empty string">>).
+-define(REASON_TOKEN_MALFORMED, <<"access_token is not a well-formed JWT">>).
+-define(REASON_TOKEN_ALG_NOT_ALLOWED, <<
+    "access_token is signed with an unsupported algorithm; "
+    "an asymmetric algorithm (RS*/ES*/PS*) is required"
+>>).
+-define(REASON_TOKEN_NO_MATCHING_KEY, <<
+    "no JWKS key matches the access_token's key id"
+>>).
+-define(REASON_TOKEN_NO_KID, <<
+    "access_token has no kid; the broker resolves such tokens via a configured "
+    "default_key which this endpoint does not model"
+>>).
+-define(REASON_TOKEN_SIGNATURE_INVALID, <<"access_token signature verification failed">>).
+-define(REASON_TOKEN_EXPIRED, <<"access_token is expired">>).
+-define(REASON_TOKEN_BAD_TIME_CLAIM, <<"access_token has a non-numeric exp claim">>).
+-define(REASON_TOKEN_MISSING_EXP, <<
+    "access_token has no exp claim but the server requires one "
+    "(auth_oauth2.require_exp)"
+>>).
+-define(REASON_TOKEN_AUDIENCE, <<"access_token audience does not include resource_server_id">>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_NO_ASSUME_ROLE, <<
     "auth validation requires an assume_role to be configured; "
@@ -189,7 +276,11 @@ allowed_fields() ->
         <<"jwks_uri">>,
         <<"issuer">>,
         <<"resource_server_id">>,
-        <<"ssl_options">>
+        <<"ssl_options">>,
+        %% Optional customer-supplied access token. Present access_token
+        %% activates signature + exp/nbf/aud verification against the fetched
+        %% JWKS. Carries no secret (the customer minted it out of band).
+        <<"access_token">>
     ].
 
 -spec validate(map()) -> aws_auth_validate_backend:result().
@@ -242,6 +333,10 @@ parse_input(Body) ->
         fun parse_urls/2,
         fun parse_resource_server_id/2,
         fun parse_ssl_options/2,
+        %% parse_access_token is pure: it shape-checks the optional customer-
+        %% supplied token and pre-decodes its header so the alg allowlist can be
+        %% enforced without network I/O. No verification happens here.
+        fun parse_access_token/2,
         %% SSRF guard runs in the pure phase so a disallowed target is rejected
         %% before any ARN resolution or outbound request.
         fun guard_urls/2
@@ -321,9 +416,11 @@ parse_url(Bin) when is_binary(Bin) ->
 parse_resource_server_id(Body, Acc) ->
     case maps:get(<<"resource_server_id">>, Body, undefined) of
         undefined ->
-            {ok, Acc};
+            %% Keep the slot present-but-undefined so the token aud check knows
+            %% no resource_server_id was supplied (aud is then not asserted).
+            {ok, Acc#{resource_server_id => undefined}};
         V when is_binary(V), byte_size(V) > 0 ->
-            {ok, Acc};
+            {ok, Acc#{resource_server_id => V}};
         _ ->
             {error, input_invalid, ?REASON_BAD_RESOURCE_SERVER_ID}
     end.
@@ -334,6 +431,93 @@ parse_ssl_options(Body, Acc) ->
     aws_auth_validate_ssl:parse_ssl_options(
         maps:get(<<"ssl_options">>, Body, undefined), Acc, ssl_opts()
     ).
+
+%% Parse the optional customer-supplied access_token (pure phase; no network,
+%% no crypto beyond a header base64url-decode). When absent, the accumulator
+%% carries token => none and behaviour is unchanged. When present it must be a
+%% non-empty string, a well-formed three-segment JWT, and carry a header `alg'
+%% in the asymmetric allowlist -- so an unsupported-alg (or `none') token is
+%% rejected in the pure phase, before any JWKS is fetched. The parsed header
+%% (kid/alg) and the raw token are stashed for the verification step.
+parse_access_token(Body, Acc) ->
+    case maps:get(<<"access_token">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{token => none}};
+        Raw when is_binary(Raw), byte_size(Raw) > 0 ->
+            case parse_access_token(Raw) of
+                {ok, Header} ->
+                    {ok, Acc#{token => #{raw => Raw, header => Header}}};
+                {error, Category, Reason} ->
+                    {error, Category, Reason}
+            end;
+        _ ->
+            {error, input_invalid, ?REASON_BAD_ACCESS_TOKEN}
+    end.
+
+%% Pure shape check of a raw JWT string: exactly three non-empty segments, a
+%% base64url-decodable JSON-object header, a header `alg' in the asymmetric
+%% allowlist, and (when present) a binary `kid'. Returns the decoded header map
+%% on success.
+-spec parse_access_token(binary()) ->
+    {ok, map()} | {error, aws_auth_validate_backend:error_category(), binary()}.
+parse_access_token(Raw) when is_binary(Raw) ->
+    case token_header(Raw) of
+        {ok, Header} ->
+            case maps:get(<<"alg">>, Header, undefined) of
+                Alg when is_binary(Alg) ->
+                    case lists:member(Alg, ?ALLOWED_TOKEN_ALGS) of
+                        true -> check_header_kid(Header);
+                        false -> {error, input_invalid, ?REASON_TOKEN_ALG_NOT_ALLOWED}
+                    end;
+                _ ->
+                    {error, input_invalid, ?REASON_TOKEN_ALG_NOT_ALLOWED}
+            end;
+        {error, _} ->
+            {error, input_invalid, ?REASON_TOKEN_MALFORMED}
+    end.
+
+%% A `kid' is optional, but per RFC 7515 4.1.4 it is a case-sensitive string. A
+%% present-but-non-binary `kid' is a malformed header; reject it here rather than
+%% letting it reach select_jwk/2, whose clauses only match undefined or a binary
+%% `kid' (a non-binary one would otherwise crash and be misreported as a
+%% connection failure by the outer network catch).
+check_header_kid(Header) ->
+    case maps:get(<<"kid">>, Header, undefined) of
+        undefined -> {ok, Header};
+        Kid when is_binary(Kid) -> {ok, Header};
+        _ -> {error, input_invalid, ?REASON_TOKEN_MALFORMED}
+    end.
+
+%% Decode the protected header into a JSON object map via jose (the same
+%% facility rabbitmq_auth_backend_oauth2's uaa_jwt_jwt uses to peek a token
+%% header), rather than a hand-rolled base64url + JSON parser. We still enforce
+%% the compact-serialization shape ourselves -- exactly three non-empty
+%% dot-separated segments -- because jose_jwt:peek_protected/1 tolerates inputs
+%% we want to reject as malformed. Any jose raise on garbage input is caught and
+%% mapped to a malformed token (so it flows to input_invalid, never a crash).
+%%
+%% jose_jwt:peek_protected/1 parses `alg' OUT into the #jose_jws{} record's own
+%% field, so #jose_jws.fields holds only the OTHER header keys (kid/typ). We use
+%% jose_jws:to_map/1 to reconstruct the FULL protected header map -- including
+%% `alg' -- which the caller's alg-allowlist and kid-shape checks require.
+-spec token_header(binary()) -> {ok, map()} | {error, malformed}.
+token_header(Raw) ->
+    case binary:split(Raw, <<".">>, [global]) of
+        [HeaderSeg, PayloadSeg, SigSeg] when
+            byte_size(HeaderSeg) > 0, byte_size(PayloadSeg) > 0, byte_size(SigSeg) > 0
+        ->
+            try
+                {_Modules, Map} = jose_jws:to_map(jose_jwt:peek_protected(Raw)),
+                case is_map(Map) of
+                    true -> {ok, Map};
+                    false -> {error, malformed}
+                end
+            catch
+                _:_ -> {error, malformed}
+            end;
+        _ ->
+            {error, malformed}
+    end.
 
 %%--------------------------------------------------------------------
 %% SSRF guard
@@ -353,14 +537,14 @@ guard_urls(_Body, Acc) ->
         {error, _, _} = Err -> Err
     end.
 
-collect_guard_urls(#{jwks_uri := undefined, issuer := undefined}) ->
-    [];
-collect_guard_urls(#{jwks_uri := undefined, issuer := IssuerUrl}) ->
-    [IssuerUrl];
-collect_guard_urls(#{jwks_uri := JwksUrl, issuer := undefined}) ->
-    [JwksUrl];
-collect_guard_urls(#{jwks_uri := JwksUrl, issuer := IssuerUrl}) ->
-    [JwksUrl, IssuerUrl].
+%% Collect every URL that must pass the pure SSRF guard: the JWKS/issuer
+%% endpoint(s). undefined slots are dropped.
+collect_guard_urls(Acc) ->
+    [
+        U
+     || U <- [maps:get(jwks_uri, Acc, undefined), maps:get(issuer, Acc, undefined)],
+        U =/= undefined
+    ].
 
 check_urls([]) ->
     ok;
@@ -401,7 +585,17 @@ do_oauth_validate(Params) ->
                     {error, _, _} = Err ->
                         Err;
                     {ok, SslOpts} ->
-                        do_fetch_jwks(Params, SslOpts, Profile)
+                        %% Validate the JWKS source first (reachability +
+                        %% well-formedness), capturing its keys. If a
+                        %% customer-supplied access_token is present, verify it
+                        %% against those keys (no extra network). Either step's
+                        %% failure short-circuits.
+                        case do_fetch_jwks(Params, SslOpts, Profile) of
+                            {ok, Keys} ->
+                                maybe_verify_token(Params, Keys);
+                            {error, _, _} = Err ->
+                                Err
+                        end
                 end
             catch
                 _Class:_Reason:_Stack ->
@@ -411,6 +605,190 @@ do_oauth_validate(Params) ->
                 aws_auth_validate_httpc:stop_probe_profile(Profile)
             end
     end.
+
+%%--------------------------------------------------------------------
+%% Customer-supplied access-token verification (no network)
+%%--------------------------------------------------------------------
+%%
+%% Runs after the JWKS is fetched. The customer minted the token out of band, so
+%% no secret transits this endpoint. Verification reuses the broker's own crypto
+%% library (jose) so the signature decision matches what
+%% rabbit_auth_backend_oauth2 computes.
+
+%% When no access_token was supplied (token => none), this layer is a no-op.
+maybe_verify_token(#{token := none}, _Keys) ->
+    ok;
+maybe_verify_token(#{token := #{raw := Raw, header := Header}} = Params, Keys) ->
+    ResourceServerId = maps:get(resource_server_id, Params, undefined),
+    verify_token(Raw, Header, {Keys, ResourceServerId}).
+
+%% Verify a customer-supplied JWT against the fetched JWKS. Steps, in order:
+%%   1. select the JWKS key whose `kid' matches the token header (a token with
+%%      no `kid' is rejected -- see select_jwk/2);
+%%   2. verify the signature with jose_jwt:verify_strict/3, algorithm PINNED to
+%%      the header alg (already allowlisted in the pure phase) so no alg
+%%      substitution is possible;
+%%   3. check exp (same semantics as rabbit_auth_backend_oauth2, which validates
+%%      exp only);
+%%   4. if a resource_server_id was supplied, require it in the token `aud'
+%%      (unless the broker's verify_aud is disabled).
+%% Failures map to fixed categories (no claim value, key material, or token
+%% content echoed -- R6): a bad signature or no matching JWKS key -> token_invalid
+%% (a real config mismatch the broker would also reject); an expired token ->
+%% token_expired (transient, just re-mint); an audience mismatch stays
+%% auth_failed. verify_token/3 takes the pre-decoded header so the -ifdef(TEST)
+%% export can exercise it directly.
+-spec verify_token(binary(), map(), {list(), binary() | undefined}) ->
+    ok | {error, aws_auth_validate_backend:error_category(), binary()}.
+verify_token(Raw, Header, {Keys, ResourceServerId}) ->
+    Alg = maps:get(<<"alg">>, Header),
+    Kid = maps:get(<<"kid">>, Header, undefined),
+    case select_jwk(Kid, Keys) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, JwkMap} ->
+            case verify_signature(Alg, JwkMap, Raw) of
+                {error, _, _} = Err ->
+                    Err;
+                {ok, Claims} ->
+                    case check_token_expiry(Claims) of
+                        {error, _, _} = Err -> Err;
+                        ok -> check_token_audience(Claims, ResourceServerId)
+                    end
+            end
+    end.
+
+%% Select the JWKS entry matching the token's `kid'. A token with NO `kid' is
+%% rejected as a config mismatch: the broker resolves a no-kid token via the
+%% configured `default_key' (uaa_jwt:decode_and_verify -> default_key), NOT "the
+%% only key present in the JWKS". Accepting a lone JWKS key here would pass a
+%% token the broker (with no default_key configured) rejects -- a false pass, the
+%% exact outcome this endpoint exists to prevent. A malformed (non-object) key
+%% entry is skipped.
+select_jwk(undefined, _Keys) ->
+    {error, token_invalid, ?REASON_TOKEN_NO_KID};
+select_jwk(Kid, Keys) when is_binary(Kid) ->
+    case [K || K <- Keys, is_map(K), maps:get(<<"kid">>, K, undefined) =:= Kid] of
+        [Match | _] -> {ok, Match};
+        [] -> {error, token_invalid, ?REASON_TOKEN_NO_MATCHING_KEY}
+    end.
+
+%% Verify the JWS signature with the algorithm pinned to the header alg.
+%% jose_jwt:verify_strict/3 refuses any token whose alg is not the allowed one,
+%% and jose_jwk:from_map/1 builds the public key from the JWKS entry. Any raise
+%% (malformed key material, unsupported curve) is caught and treated as a
+%% signature failure -- never a crash report (R6). Returns the decoded claims.
+verify_signature(Alg, JwkMap, Raw) ->
+    try
+        JWK = jose_jwk:from_map(JwkMap),
+        case jose_jwt:verify_strict(JWK, [Alg], Raw) of
+            {true, {jose_jwt, Claims}, _JWS} when is_map(Claims) ->
+                {ok, Claims};
+            {true, JWT, _JWS} ->
+                {ok, jwt_claims(JWT)};
+            {false, _JWT, _JWS} ->
+                {error, token_invalid, ?REASON_TOKEN_SIGNATURE_INVALID}
+        end
+    catch
+        _:_ -> {error, token_invalid, ?REASON_TOKEN_SIGNATURE_INVALID}
+    end.
+
+%% Extract the claims map from a #jose_jwt{} via the record accessor (the jose
+%% record header is in scope, so no fragile positional element/2). Falls back to
+%% an empty map on any unexpected shape.
+jwt_claims(#jose_jwt{fields = Fields}) when is_map(Fields) ->
+    Fields;
+jwt_claims(_) ->
+    #{}.
+
+%% exp validation, matching rabbit_auth_backend_oauth2:validate_token_expiry/1
+%% semantics: an exp at or before now is expired (-> token_expired, a transient
+%% condition). A present but non-numeric exp is NOT "expired" -- the claim is
+%% malformed, so the token is invalid -> token_invalid (the broker likewise
+%% rejects a non-numeric exp).
+%%
+%% We deliberately check ONLY exp, not nbf: rabbit_auth_backend_oauth2's
+%% validate_token_expiry/1 inspects exp alone and has no nbf/not_before handling.
+%% Checking nbf here would false-fail a post-dated or slightly clock-skewed token
+%% the live broker accepts, so we omit it for strict parity.
+%%
+%% Absent exp: the broker REJECTS a token with no exp UNLESS the operator sets
+%% `auth_oauth2.require_exp' to false; the broker's default is true. We mirror
+%% that default here -- otherwise the endpoint would report a no-exp token as OK
+%% while the live broker (whose default rejects it) would refuse it (a false
+%% pass, the exact thing this endpoint exists to prevent). A missing-required-exp
+%% is a config mismatch the broker would also reject -> token_invalid.
+check_token_expiry(Claims) ->
+    Now = os:system_time(seconds),
+    check_exp(maps:get(<<"exp">>, Claims, undefined), Now).
+
+check_exp(undefined, _Now) ->
+    case require_exp() of
+        true -> {error, token_invalid, ?REASON_TOKEN_MISSING_EXP};
+        false -> ok
+    end;
+check_exp(Exp, Now) when is_number(Exp) ->
+    case trunc(Exp) =< Now of
+        true -> {error, token_expired, ?REASON_TOKEN_EXPIRED};
+        false -> ok
+    end;
+check_exp(_Exp, _Now) ->
+    %% present but non-numeric -> malformed claim, not "expired"
+    {error, token_invalid, ?REASON_TOKEN_BAD_TIME_CLAIM}.
+
+%% Read the server's rabbit_auth_backend_oauth2 `require_exp' setting. The broker
+%% defaults this to true (rabbit_oauth2_resource_server:get_boolean_env/2), so a
+%% token without exp is rejected unless the operator explicitly sets it to false.
+%% Mirror both the default and the coercion (only a literal false disables it;
+%% any other value is treated as true) so this endpoint matches the live broker.
+%% Read from the oauth2 backend's app env, the same source the backend itself uses.
+require_exp() ->
+    application:get_env(rabbitmq_auth_backend_oauth2, require_exp, true) =/= false.
+
+%% When a resource_server_id was supplied, require it in the token `aud' (a
+%% string or a list of strings, per RFC 7519). When none was supplied, the aud
+%% is not asserted (signature + expiry only).
+%%
+%% Honor the broker's `verify_aud' setting: rabbit_oauth2_resource_server
+%% defaults verify_aud to true, but an operator can set `auth_oauth2.verify_aud'
+%% to false, in which case the broker does NOT match the audience (it falls back
+%% to find_unique_resource_server_without_verify_aud/0). Mirror that here -- when
+%% verify_aud is disabled we skip the aud match even if a resource_server_id was
+%% supplied, otherwise the endpoint would false-fail a token the live broker
+%% accepts.
+%%
+%% A string `aud' is split on spaces before matching, mirroring the broker's
+%% rabbit_oauth2_resource_server:find_audience/2 (which does
+%% binary:split(Audience, <<" ">>, [global, trim_all])). Some IdPs emit a
+%% space-delimited multi-value `aud' as a single string; matching it whole would
+%% reject a token the live broker accepts.
+check_token_audience(_Claims, undefined) ->
+    ok;
+check_token_audience(Claims, ResourceServerId) ->
+    case verify_aud() of
+        false ->
+            ok;
+        true ->
+            case maps:get(<<"aud">>, Claims, undefined) of
+                Aud when is_binary(Aud) ->
+                    AudList = binary:split(Aud, <<" ">>, [global, trim_all]),
+                    audience_result(lists:member(ResourceServerId, AudList));
+                Auds when is_list(Auds) ->
+                    audience_result(lists:member(ResourceServerId, Auds));
+                _ ->
+                    {error, auth_failed, ?REASON_TOKEN_AUDIENCE}
+            end
+    end.
+
+audience_result(true) -> ok;
+audience_result(false) -> {error, auth_failed, ?REASON_TOKEN_AUDIENCE}.
+
+%% Read the server's rabbit_auth_backend_oauth2 `verify_aud' setting. The broker
+%% defaults this to true; an operator sets it to false to disable audience
+%% matching. Mirror the coercion used for require_exp (only a literal false
+%% disables it) so this endpoint matches the live broker's decision.
+verify_aud() ->
+    application:get_env(rabbitmq_auth_backend_oauth2, verify_aud, true) =/= false.
 
 %% Determine the JWKS URI (given directly or derived via issuer discovery)
 %% and fetch + validate it.
@@ -482,6 +860,8 @@ parse_discovery_doc(Body) ->
     end.
 
 %% Fetch the JWKS endpoint and validate the response is a well-formed JWKS.
+%% On success returns {ok, Keys} -- the non-empty "keys" array -- so a supplied
+%% access token can be verified against those keys without re-fetching.
 fetch_and_validate_jwks(JwksUrl, SslOpts, Timeout, Profile) ->
     case aws_auth_validate_net:resolve_and_pin(JwksUrl, net_policy()) of
         {error, _, _} = Err ->
@@ -497,9 +877,9 @@ fetch_and_validate_jwks(JwksUrl, SslOpts, Timeout, Profile) ->
             Request = {UrlStr, [{"host", Host}]},
             case httpc:request(get, Request, HttpOpts, [{body_format, binary}], Profile) of
                 {ok, {{_Vsn, 200, _Phrase}, _Headers, Body}} ->
-                    case is_valid_jwks(Body) of
-                        true -> ok;
-                        false -> {error, auth_failed, ?REASON_ENDPOINT}
+                    case parse_jwks(Body) of
+                        {ok, Keys} -> {ok, Keys};
+                        error -> {error, auth_failed, ?REASON_ENDPOINT}
                     end;
                 {ok, {{_Vsn, _Code, _Phrase}, _Headers, _Body}} ->
                     {error, auth_failed, ?REASON_ENDPOINT};
@@ -508,18 +888,29 @@ fetch_and_validate_jwks(JwksUrl, SslOpts, Timeout, Profile) ->
             end
     end.
 
-%% Validate that a response body is a well-formed JWKS: a JSON object whose
-%% "keys" field is a non-empty array.
-is_valid_jwks(Body) when is_binary(Body) ->
+%% Parse a well-formed JWKS: a JSON object whose "keys" field is a non-empty
+%% array. Returns {ok, Keys} or error.
+parse_jwks(Body) when is_binary(Body) ->
     case rabbit_json:try_decode(Body) of
         {ok, Map} when is_map(Map) ->
             case maps:get(<<"keys">>, Map, undefined) of
-                Keys when is_list(Keys), Keys =/= [] -> true;
-                _ -> false
+                Keys when is_list(Keys), Keys =/= [] -> {ok, Keys};
+                _ -> error
             end;
         _ ->
-            false
+            error
     end.
+
+-ifdef(TEST).
+%% Boolean well-formedness predicate retained for the -ifdef(TEST) export
+%% contract and existing unit tests. Production code calls parse_jwks/1
+%% directly (it needs the keys), so this wrapper is test-only.
+is_valid_jwks(Body) when is_binary(Body) ->
+    case parse_jwks(Body) of
+        {ok, _Keys} -> true;
+        error -> false
+    end.
+-endif.
 
 %% Strip a single trailing slash from a URL string to avoid producing
 %% double-slash paths when appending "/.well-known/..." to an issuer URL

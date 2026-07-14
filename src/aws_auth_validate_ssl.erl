@@ -152,7 +152,8 @@ resolve_request_state(Params, Opts) ->
     end.
 
 %% True when the request references any ARN-backed TLS material under
-%% ssl_options, i.e. resolving the request will make at least one AWS call.
+%% ssl_options, i.e. resolving the request will make at least one AWS call and
+%% therefore requires a configured assume_role.
 request_references_arn(#{ssl_options := Map}, #{arn_keys := Keys}) ->
     lists:any(fun(K) -> maps:is_key(K, Map) end, Keys);
 request_references_arn(_Params, _Opts) ->
@@ -375,27 +376,49 @@ translate_ssl_opts(Map, SniKey) ->
 %% downgraded -- the false-positive this endpoint exists to prevent); a DEFAULTED
 %% verify falls back to verify_none; an explicit verify_none is untouched; and
 %% when verify is absent we default to verify_peer only if an anchor exists.
+%%
+%% Every verify_peer path also gets the https hostname-match fun (see
+%% ensure_hostname_check/1): without it ssl's default hostname check rejects a
+%% multi-label host under a single-label wildcard cert (e.g. Cognito's
+%% `foo.auth.<region>.amazoncognito.com' against `*.auth.<region>.amazoncognito.com'),
+%% which every mainstream HTTPS client accepts under RFC 6125. Omitting it made
+%% the probe report tls_failed for perfectly valid IdP endpoints -- the exact
+%% false-negative this endpoint exists to avoid.
 -spec apply_verify_default(list(), boolean()) ->
     {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary()}.
 apply_verify_default(Opts, VerifyExplicit) ->
     case lists:keyfind(verify, 1, Opts) of
         {verify, verify_peer} when VerifyExplicit ->
             case ensure_trust_anchor(Opts) of
-                {ok, _} = Ok -> Ok;
+                {ok, Opts1} -> {ok, ensure_hostname_check(Opts1)};
                 none -> {error, tls_failed, no_trust_anchor()}
             end;
         {verify, verify_peer} ->
             case ensure_trust_anchor(Opts) of
-                {ok, Opts1} -> {ok, Opts1};
+                {ok, Opts1} -> {ok, ensure_hostname_check(Opts1)};
                 none -> {ok, lists:keyreplace(verify, 1, Opts, {verify, verify_none})}
             end;
         {verify, _Other} ->
             {ok, Opts};
         false ->
             case ensure_trust_anchor(Opts) of
-                {ok, Opts1} -> {ok, [{verify, verify_peer} | Opts1]};
+                {ok, Opts1} -> {ok, [{verify, verify_peer} | ensure_hostname_check(Opts1)]};
                 none -> {ok, Opts}
             end
+    end.
+
+%% Add the https-scheme hostname-match fun so wildcard certs verify the way a
+%% browser/curl/openssl would (RFC 6125). Applied only on verify_peer paths, and
+%% only if the caller has not already supplied a customize_hostname_check.
+%% ssl ignores customize_hostname_check under verify_none, so it is harmless
+%% there, but we scope it to the verify_peer branches to keep the intent local.
+ensure_hostname_check(Opts) ->
+    case lists:keymember(customize_hostname_check, 1, Opts) of
+        true ->
+            Opts;
+        false ->
+            MatchFun = public_key:pkix_verify_hostname_match_fun(https),
+            [{customize_hostname_check, [{match_fun, MatchFun}]} | Opts]
     end.
 
 %% Return {ok, OptsWithAnchor} when a trust anchor is present or can be sourced

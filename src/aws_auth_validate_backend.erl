@@ -16,7 +16,16 @@
     | auth_failed
     | config_conflict
     | query_invalid
-    | authz_unverified.
+    | authz_unverified
+    %% Customer-supplied access-token verification outcomes (oauth backend).
+    %% Split out of auth_failed so an operator can distinguish a transient,
+    %% non-config problem (token_expired -- just re-mint and retry) from a real
+    %% config mismatch (token_invalid -- the JWKS the broker fetches will reject
+    %% live tokens). Safe to be granular here: unlike the reachability
+    %% categories, these describe the caller's own token, not the broker's infra
+    %% or an SSRF target, so they leak nothing R4 is guarding.
+    | token_expired
+    | token_invalid.
 
 -type result() :: ok | {error, error_category(), Reason :: binary()}.
 

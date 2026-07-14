@@ -500,12 +500,375 @@ no_arn_needs_no_assume_role_test_() ->
     end}.
 
 %%--------------------------------------------------------------------
+%% Customer-supplied access_token verification: pure phase
+%%--------------------------------------------------------------------
+
+%% A non-binary / empty access_token is rejected as input_invalid.
+access_token_empty_rejected_test() ->
+    Body = (jwks_body())#{<<"access_token">> => <<>>},
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A token that is not three non-empty dot-separated segments is malformed.
+parse_access_token_not_three_segments_test() ->
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(<<"only.two">>)
+    ).
+
+%% A token whose header is not base64url JSON is malformed.
+parse_access_token_bad_header_test() ->
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(<<"!!!.payload.sig">>)
+    ).
+
+%% alg:none is refused in the pure phase (alg-confusion defense).
+parse_access_token_alg_none_rejected_test() ->
+    Token = compact_token(#{<<"alg">> => <<"none">>, <<"typ">> => <<"JWT">>}, #{}, <<>>),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(Token)
+    ).
+
+%% An HMAC alg (HS256) is refused in the pure phase: a JWKS holds only public
+%% keys, so accepting HS* would enable the public-key-as-HMAC-secret forgery.
+parse_access_token_hs256_rejected_test() ->
+    Token = compact_token(#{<<"alg">> => <<"HS256">>}, #{<<"sub">> => <<"s">>}, <<"sig">>),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(Token)
+    ).
+
+%% A well-formed RS256 header is accepted in the pure phase; the header
+%% (including kid) is returned for the verification step.
+parse_access_token_rs256_ok_test() ->
+    Token = compact_token(
+        #{<<"alg">> => <<"RS256">>, <<"kid">> => <<"k1">>}, #{<<"sub">> => <<"s">>}, <<"sig">>
+    ),
+    ?assertMatch(
+        {ok, #{<<"alg">> := <<"RS256">>, <<"kid">> := <<"k1">>}},
+        aws_auth_validate_oauth:parse_access_token(Token)
+    ).
+
+%% A present-but-non-binary kid (e.g. a JSON number) is a malformed header,
+%% rejected in the pure phase rather than crashing select_jwk/2 later.
+parse_access_token_non_binary_kid_rejected_test() ->
+    Token = compact_token(
+        #{<<"alg">> => <<"RS256">>, <<"kid">> => 123}, #{<<"sub">> => <<"s">>}, <<"sig">>
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(Token)
+    ).
+
+%% select_jwk: a token with NO kid is rejected even against a single-key JWKS.
+%% The broker resolves no-kid tokens via a configured default_key (not "the only
+%% key present"), so accepting a lone JWKS key here would be a false pass.
+select_jwk_single_no_kid_rejected_test() ->
+    Key = #{<<"kty">> => <<"RSA">>},
+    ?assertMatch(
+        {error, token_invalid, _}, aws_auth_validate_oauth:select_jwk(undefined, [Key])
+    ).
+
+%% select_jwk: no kid against a multi-key JWKS is likewise rejected -> token_invalid.
+select_jwk_no_kid_multi_test() ->
+    Keys = [#{<<"kid">> => <<"a">>}, #{<<"kid">> => <<"b">>}],
+    ?assertMatch({error, token_invalid, _}, aws_auth_validate_oauth:select_jwk(undefined, Keys)).
+
+%% select_jwk: a kid with no match -> token_invalid.
+select_jwk_no_match_test() ->
+    Keys = [#{<<"kid">> => <<"a">>}],
+    ?assertMatch({error, token_invalid, _}, aws_auth_validate_oauth:select_jwk(<<"zzz">>, Keys)).
+
+%%--------------------------------------------------------------------
+%% Customer-supplied access_token verification: signature + claims
+%%--------------------------------------------------------------------
+
+%% A validly RS256-signed token verifies against the matching JWKS key.
+verify_token_valid_signature_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future()}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A token signed by a DIFFERENT key fails signature verification -> token_invalid.
+verify_token_wrong_key_test() ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    #{jwk_pub := OtherPub} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future()}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, token_invalid, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[OtherPub], undefined})
+    ).
+
+%% An expired token (exp in the past) is refused even with a valid signature
+%% -> token_expired (transient, distinct from a config mismatch).
+verify_token_expired_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => past()}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, token_expired, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A token with a future nbf is ACCEPTED (given a valid signature + exp): the
+%% broker's validate_token_expiry/1 checks exp only and has no nbf handling, so
+%% we deliberately do not check nbf either (checking it would false-fail a
+%% post-dated / clock-skewed token the live broker accepts).
+verify_token_future_nbf_ignored_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"nbf">> => future(), <<"exp">> => future()}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A present but non-numeric exp is a malformed claim -> token_invalid, NOT
+%% token_expired (the token is invalid, not merely expired).
+verify_token_non_numeric_exp_is_invalid_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => <<"not-a-number">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, token_invalid, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A non-numeric nbf is ignored (nbf is not checked at all -- see
+%% verify_token_future_nbf_ignored_test): a valid signature + exp still passes.
+verify_token_non_numeric_nbf_ignored_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future(), <<"nbf">> => <<"soon">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A token with NO exp is REJECTED by default (require_exp unset), matching the
+%% broker whose require_exp default is true -> token_invalid (a config mismatch
+%% the live broker would also reject, not a transient expiry).
+verify_token_no_exp_rejected_by_default_test() ->
+    application:unset_env(rabbitmq_auth_backend_oauth2, require_exp),
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, token_invalid, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A token with NO exp is accepted only when the operator explicitly sets
+%% auth_oauth2.require_exp to false, mirroring the broker's opt-out.
+verify_token_no_exp_ok_when_not_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, false),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
+
+%% When the server sets auth_oauth2.require_exp, a token with NO exp is refused
+%% -> token_invalid (the live broker would also reject it -- a config mismatch,
+%% not a transient expiry). Mirrors rabbit_auth_backend_oauth2's require_exp.
+verify_token_no_exp_rejected_when_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, true),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertMatch(
+            {error, token_invalid, _},
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
+
+%% require_exp only affects the ABSENT-exp case: a token WITH a valid exp still
+%% passes when the option is on.
+verify_token_present_exp_ok_when_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, true),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future()}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
+
+%% aud check: resource_server_id present in a list aud -> ok.
+verify_token_audience_ok_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => [<<"rabbitmq">>, <<"other">>]}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
+%% aud check: resource_server_id absent from aud -> auth_failed.
+verify_token_audience_mismatch_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"someone-else">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, auth_failed, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
+%% aud check: a space-delimited string aud is split before matching, mirroring
+%% the broker's find_audience/2 -> resource_server_id present in the split -> ok.
+verify_token_audience_space_delimited_string_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"rabbitmq api://default">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
+%% aud check: when the operator disables the broker's verify_aud, a token whose
+%% aud OMITS the resource_server_id is accepted -- the live broker skips audience
+%% matching (falls back to find_unique_resource_server_without_verify_aud), so
+%% enforcing it here would false-fail a token the broker accepts.
+verify_token_audience_skipped_when_verify_aud_false_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, verify_aud, false),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"someone-else">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, verify_aud)
+    end.
+
+%% aud check: with verify_aud at its default (unset -> true), an aud mismatch is
+%% still a failure (guards against the verify_aud=false path leaking into the
+%% default case).
+verify_token_audience_enforced_by_default_test() ->
+    application:unset_env(rabbitmq_auth_backend_oauth2, verify_aud),
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"someone-else">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, auth_failed, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
+%%--------------------------------------------------------------------
+%% Customer-supplied access_token: end-to-end (mocked JWKS fetch)
+%%--------------------------------------------------------------------
+
+%% Valid JWKS reachable AND a supplied token that verifies against it -> ok.
+%% No secret / assume_role is involved (the customer minted the token).
+access_token_end_to_end_ok_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future()}),
+        JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+        mock_httpc_response(200, JwksBody),
+        Body = (jwks_body())#{<<"access_token">> => Token},
+        [?_assertEqual(ok, aws_auth_validate_oauth:validate(Body))]
+    end}.
+
+%% Valid JWKS but the supplied token is signed by a different key -> token_invalid.
+access_token_end_to_end_bad_signature_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        #{sign := Sign} = rsa_signer(<<"k1">>),
+        #{jwk_pub := OtherPub} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future()}),
+        JwksBody = rabbit_json:encode(#{<<"keys">> => [OtherPub]}),
+        mock_httpc_response(200, JwksBody),
+        Body = (jwks_body())#{<<"access_token">> => Token},
+        [?_assertMatch({error, token_invalid, _}, aws_auth_validate_oauth:validate(Body))]
+    end}.
+
+%% Valid JWKS, valid signature, but the token is expired -> token_expired
+%% (end-to-end, so the category-not-message distinction is exercised through
+%% the full validate/1 path an operator would hit).
+access_token_end_to_end_expired_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => past()}),
+        JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+        mock_httpc_response(200, JwksBody),
+        Body = (jwks_body())#{<<"access_token">> => Token},
+        [?_assertMatch({error, token_expired, _}, aws_auth_validate_oauth:validate(Body))]
+    end}.
+
+%% R6: a valid supplied token's claims must not leak into the rendered result.
+access_token_no_leak_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"SECRET-SUBJECT-CLAIM">>, <<"exp">> => future()}),
+        JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+        mock_httpc_response(200, JwksBody),
+        Body = (jwks_body())#{<<"access_token">> => Token},
+        Result = aws_auth_validate_oauth:validate(Body),
+        Rendered = lists:flatten(io_lib:format("~p", [Result])),
+        [
+            ?_assertEqual(ok, Result),
+            ?_assertEqual(nomatch, string:find(Rendered, "SECRET-SUBJECT-CLAIM"))
+        ]
+    end}.
+
+%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
 %% A minimal body with a direct jwks_uri (bypasses OIDC discovery).
 jwks_body() ->
     #{<<"jwks_uri">> => <<"https://idp.example.com/.well-known/jwks.json">>}.
+
+%% Seconds since epoch, comfortably in the future / past for exp/nbf tests.
+future() -> os:system_time(seconds) + 3600.
+past() -> os:system_time(seconds) - 3600.
+
+%% Build a compact JWS string from an already-chosen header, claims map, and a
+%% raw (already-bytes) signature. Used for the pure-phase shape tests that must
+%% NOT require a real signature (alg:none, HS256, malformed).
+compact_token(Header, Claims, SigBytes) ->
+    H = b64url(rabbit_json:encode(Header)),
+    P = b64url(rabbit_json:encode(Claims)),
+    S = b64url(SigBytes),
+    <<H/binary, ".", P/binary, ".", S/binary>>.
+
+b64url(Bin) -> base64:encode(Bin, #{mode => urlsafe, padding => false}).
+
+%% Generate a fresh RSA keypair via jose and return:
+%%   * jwk_pub -- the PUBLIC key as a JWKS-style map, tagged with Kid, and
+%%   * sign    -- a fun(ClaimsMap) -> compact RS256 JWT signed by the private key.
+%% Each call produces a DISTINCT key, so "wrong key" tests just call it twice.
+rsa_signer(Kid) ->
+    Priv = jose_jwk:generate_key({rsa, 2048}),
+    {_, PubMap0} = jose_jwk:to_public_map(Priv),
+    PubMap = PubMap0#{<<"kid">> => Kid},
+    Sign = fun(Claims) ->
+        JWS = #{<<"alg">> => <<"RS256">>, <<"kid">> => Kid},
+        {_, Token} = jose_jws:compact(jose_jwt:sign(Priv, JWS, Claims)),
+        Token
+    end,
+    #{jwk_pub => PubMap, sign => Sign}.
 
 %% A minimal body with only issuer (triggers OIDC discovery).
 issuer_body() ->
@@ -523,6 +886,12 @@ setup_httpc_mock() ->
     ok = meck:new(httpc, [unstick, non_strict]),
     ok = meck:new(inets, [unstick, non_strict]),
     ok = meck:new(inet, [unstick, passthrough]),
+    %% Create the aws_arn_util mock up front (passthrough) so a test's
+    %% meck:expect(aws_arn_util, ...) always lands on a mecked module rather
+    %% than silently no-opping against the real one. Tests that resolve no ARN
+    %% simply never trigger it. (Previously tests relied on leaked mock state
+    %% from an earlier case, which was order-dependent and fragile.)
+    ok = meck:new(aws_arn_util, [passthrough]),
     %% Default: inets profile start/stop always succeed.
     meck:expect(inets, start, fun(httpc, _Opts) -> {ok, self()} end),
     meck:expect(inets, stop, fun(httpc, _Profile) -> ok end),
@@ -555,8 +924,8 @@ mock_httpc_response(StatusCode, Body) when is_binary(Body) ->
 %% supply ssl_options with ARNs, so this only fires if the backend
 %% optionally resolves something).
 mock_arn_resolve_noop() ->
-    catch meck:unload(aws_arn_util),
-    ok = meck:new(aws_arn_util, [passthrough]),
+    %% aws_arn_util is already mecked (passthrough) by setup_httpc_mock; just
+    %% override resolve_arn. Kept as a helper so the pure-phase tests read clearly.
     meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, <<"noop">>, State} end),
     ok.
 
