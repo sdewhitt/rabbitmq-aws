@@ -53,16 +53,23 @@ effective_allowed_fields(Module, Method) ->
 
 %%--------------------------------------------------------------------
 
-%% Per-method enable check. Most methods default to enabled when no
-%% per-method setting is provided (operator opts out, not in) -- but a method
-%% in ?OPT_IN_METHODS defaults to DISABLED and must be turned on explicitly.
-%% http and oauth connect to a customer-supplied URL (an SSRF surface). Their
-%% address policy is implemented and enforced (see aws_auth_validate_net); they
-%% are opt-in so enabling ldap or the feature toggle does not bring them live.
-%% tls makes no outbound connection, but resolving a cacertfile ARN under the
-%% assume_role is still a capability worth enabling explicitly, so it is opt-in
-%% too: turning on ldap or the feature toggle does not bring it live.
--define(OPT_IN_METHODS, [<<"http">>, <<"oauth">>, <<"tls">>]).
+%% Per-method enable check. EVERY method is opt-in: a method in ?OPT_IN_METHODS
+%% defaults to DISABLED and must be turned on explicitly with
+%% aws.auth_validation.enabled_methods.<method> = true. The master feature
+%% toggle (aws.auth_validation.enabled) only starts the subsystem; it never
+%% brings any individual method online on its own.
+%%
+%% All four methods make an operator-supplied outbound connection or resolve a
+%% secret ARN, so none should activate implicitly:
+%%   * ldap connects to a customer-supplied LDAP server (an SSRF surface, guarded
+%%     by aws_auth_validate_ldap's stricter address policy).
+%%   * http and oauth connect to a customer-supplied URL (SSRF surface; address
+%%     policy enforced in aws_auth_validate_net).
+%%   * tls makes no outbound connection, but resolving a cacertfile ARN under the
+%%     assume_role is still a capability worth enabling explicitly.
+%% Because every method is listed, is_method_enabled/1's Default is always false;
+%% the list is retained so the opt-in set stays explicit and greppable.
+-define(OPT_IN_METHODS, [<<"ldap">>, <<"http">>, <<"oauth">>, <<"tls">>]).
 
 -spec is_method_enabled(binary()) -> boolean().
 is_method_enabled(Method) ->
