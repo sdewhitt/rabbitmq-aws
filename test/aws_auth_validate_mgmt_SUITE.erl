@@ -31,7 +31,9 @@
     capacity_exhausted_returns_503/1,
     enabled_without_worker_returns_503/1,
     method_disabled_returns_404/1,
+    backend_raise_returns_500_without_leak/1,
     custom_tag_insufficient_returns_401/1,
+    custom_tag_unauthenticated_put_returns_401/1,
     custom_tag_options_preflight_allowed/1,
     options_returns_allowed_methods/1,
     get_returns_405/1,
@@ -46,7 +48,7 @@
 -export([hold_slot/1]).
 
 %% Invoked on the broker node via rpc to stub/unstub the registry dispatch.
--export([mock_dispatch_ok/0, unmock_dispatch/0]).
+-export([mock_dispatch_ok/0, mock_dispatch_raise/1, unmock_dispatch/0]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -55,6 +57,11 @@
 
 -define(API, "/aws/auth/validate/ldap").
 -define(OAUTH_API, "/aws/auth/validate/oauth").
+
+%% A unique secret-shaped sentinel that a backend raise carries in scope. If the
+%% handler's crash-dump guard ever let it escape, it would surface in the HTTP
+%% response body; backend_raise_returns_500_without_leak asserts it does not.
+-define(LEAK_SENTINEL, <<"S3cr3t-Sentinel-Handler-Leak-DO-NOT-LEAK">>).
 
 all() ->
     [
@@ -78,6 +85,7 @@ groups() ->
             capacity_exhausted_returns_503,
             enabled_without_worker_returns_503,
             method_disabled_returns_404,
+            backend_raise_returns_500_without_leak,
             options_returns_allowed_methods,
             get_returns_405,
             password_not_in_response,
@@ -88,6 +96,7 @@ groups() ->
         %% (unauthenticated, user=undefined) must still be allowed through.
         {feature_enabled_custom_tag, [], [
             custom_tag_insufficient_returns_401,
+            custom_tag_unauthenticated_put_returns_401,
             custom_tag_options_preflight_allowed
         ]},
         %% OAuth method tests: opt-in behaviour (disabled by default -> 404),
@@ -167,6 +176,15 @@ init_per_testcase(success_returns_204 = TC, Config) ->
         Config, 0, ?MODULE, mock_dispatch_ok, []
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
+init_per_testcase(backend_raise_returns_500_without_leak = TC, Config) ->
+    %% Drive the registry dispatch to RAISE with a secret-bearing term, so the
+    %% handler's with_semaphore/6 defence-in-depth catch (the R6 crash-dump guard)
+    %% is exercised through the real Cowboy pipeline. The mock runs ON THE BROKER
+    %% NODE so the handler sees it.
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, mock_dispatch_raise, [?LEAK_SENTINEL]
+    ),
+    rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(oauth_success_returns_204 = TC, Config) ->
     %% Enable the oauth method and mock dispatch to return ok.
     rabbit_ct_broker_helpers:rpc(
@@ -202,6 +220,11 @@ end_per_testcase(method_disabled_returns_404 = TC, Config) ->
     ),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(success_returns_204 = TC, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, unmock_dispatch, []
+    ),
+    rabbit_ct_helpers:testcase_finished(Config, TC);
+end_per_testcase(backend_raise_returns_500_without_leak = TC, Config) ->
     ok = rabbit_ct_broker_helpers:rpc(
         Config, 0, ?MODULE, unmock_dispatch, []
     ),
@@ -293,6 +316,36 @@ method_disabled_returns_404(Config) ->
     {ok, {{_, Code, _}, _, _}} = put_request(Config, ?API, Body),
     ?assertEqual(404, Code).
 
+%% R5/R6 (crash-dump leakage): the handler's with_semaphore/6 wraps the backend
+%% dispatch in a try/catch whose sole purpose is to keep an escaping exception --
+%% which would carry the request BodyMap (and any resolved secret) into a Cowboy
+%% crash report -- from ever surfacing. Nothing exercised that catch before: the
+%% success/error paths all RETURN a value, so the class:reason:stack discard was
+%% asserted nowhere.
+%%
+%% Here we force dispatch to RAISE with a secret-bearing term (the worst case for
+%% a crash-report leak) and drive a real PUT through the handler. We assert:
+%%   1. the caller gets the fixed 500 internal_error response (the catch fired --
+%%      the request did not 500 with a stacktrace or hang), and
+%%   2. neither the sentinel secret nor the raised reason leaks into the response
+%%      body -- it is a fixed category + message only.
+%% The submitted-password no-leak on the response is covered by
+%% password_not_in_response; this is specifically the RAISE path through the
+%% handler boundary that the design doc flagged as unproven.
+backend_raise_returns_500_without_leak(Config) ->
+    Body = (base_body())#{<<"password">> => ?LEAK_SENTINEL},
+    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?API, Body),
+    ?assertEqual(500, Code),
+    Decoded = decode(ResBody),
+    ?assertMatch(#{<<"error">> := <<"internal_error">>}, Decoded),
+    %% The fixed message is the only detail; no raised reason / stacktrace.
+    ?assertMatch(
+        #{<<"message">> := <<"Internal error during validation">>}, Decoded
+    ),
+    %% The secret the raise carried in scope must not appear anywhere in the body.
+    RawResBody = iolist_to_binary(ResBody),
+    ?assertEqual(nomatch, binary:match(RawResBody, ?LEAK_SENTINEL)).
+
 %% Feature reads enabled but the semaphore worker is not running (the
 %% runtime-enable-without-restart / supervisor-gave-up case). The handler
 %% must return a graceful 503, not an opaque 500 from a noproc gen_server
@@ -324,6 +377,29 @@ custom_tag_insufficient_returns_401(Config) ->
     {ok, {{_, Code, _}, _, ResBody}} = put_request(Config, ?API, Body),
     ?assertEqual(401, Code),
     ?assertMatch(#{<<"error">> := <<"insufficient_user_tag">>}, decode(ResBody)).
+
+%% R2 confirmatory test: the authorize_tag/3 `user = undefined' clause
+%% (aws_auth_validate_mgmt.erl) lets a request through WITHOUT a user, on the
+%% documented assumption that only an unauthenticated OPTIONS preflight can reach
+%% it (rabbit_mgmt_util short-circuits OPTIONS to {true, _, undefined} before
+%% authenticating). The safety of the whole custom-tag branch rests on that
+%% clause being UNREACHABLE by a state-changing PUT. This asserts the invariant:
+%% an UNAUTHENTICATED PUT (no auth header) is stopped with 401 by is_authorized/2
+%% BEFORE authorize_tag/3 is reached -- it must never dispatch. If a future
+%% refactor let an anonymous PUT reach the user=undefined pass-through, this
+%% would see a 2xx/4xx-from-dispatch instead of the 401 and fail (CWE-862/863).
+custom_tag_unauthenticated_put_returns_401(Config) ->
+    Body = binary_to_list(rabbit_json:encode(base_body())),
+    %% No auth_header/2 credential -- an anonymous request.
+    {ok, {{_, Code, _}, _Headers, _ResBody}} = rabbit_mgmt_test_util:req(
+        Config,
+        0,
+        put,
+        ?API,
+        [{"content-type", "application/json"}],
+        Body
+    ),
+    ?assertEqual(401, Code).
 
 %% An OPTIONS preflight is unauthenticated (user=undefined) but must still be
 %% allowed through on the custom-tag branch -- regression test for the bug
@@ -423,6 +499,17 @@ oauth_response_no_secret(Config) ->
 mock_dispatch_ok() ->
     ok = meck:new(aws_auth_validate_registry, [passthrough, no_link]),
     ok = meck:expect(aws_auth_validate_registry, dispatch, fun(_Method, _Body) -> ok end),
+    ok.
+
+%% Run ON THE BROKER NODE (invoked via rpc). Stub the registry dispatch so it
+%% RAISES with the given secret-bearing term, exercising the handler's
+%% with_semaphore/6 crash-dump guard. The secret is embedded in the raised reason
+%% -- the worst case for a crash-report leak.
+mock_dispatch_raise(Secret) ->
+    ok = meck:new(aws_auth_validate_registry, [passthrough, no_link]),
+    ok = meck:expect(aws_auth_validate_registry, dispatch, fun(_Method, _Body) ->
+        erlang:error({boom, Secret})
+    end),
     ok.
 
 unmock_dispatch() ->
