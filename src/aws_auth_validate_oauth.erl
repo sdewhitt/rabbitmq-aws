@@ -441,8 +441,9 @@ parse_access_token(Body, Acc) ->
     end.
 
 %% Pure shape check of a raw JWT string: exactly three non-empty segments, a
-%% base64url-decodable JSON-object header, and a header `alg' in the asymmetric
-%% allowlist. Returns the decoded header map on success.
+%% base64url-decodable JSON-object header, a header `alg' in the asymmetric
+%% allowlist, and (when present) a binary `kid'. Returns the decoded header map
+%% on success.
 -spec parse_access_token(binary()) ->
     {ok, map()} | {error, aws_auth_validate_backend:error_category(), binary()}.
 parse_access_token(Raw) when is_binary(Raw) ->
@@ -451,7 +452,7 @@ parse_access_token(Raw) when is_binary(Raw) ->
             case maps:get(<<"alg">>, Header, undefined) of
                 Alg when is_binary(Alg) ->
                     case lists:member(Alg, ?ALLOWED_TOKEN_ALGS) of
-                        true -> {ok, Header};
+                        true -> check_header_kid(Header);
                         false -> {error, input_invalid, ?REASON_TOKEN_ALG_NOT_ALLOWED}
                     end;
                 _ ->
@@ -459,6 +460,18 @@ parse_access_token(Raw) when is_binary(Raw) ->
             end;
         {error, _} ->
             {error, input_invalid, ?REASON_TOKEN_MALFORMED}
+    end.
+
+%% A `kid' is optional, but per RFC 7515 4.1.4 it is a case-sensitive string. A
+%% present-but-non-binary `kid' is a malformed header; reject it here rather than
+%% letting it reach select_jwk/2, whose clauses only match undefined or a binary
+%% `kid' (a non-binary one would otherwise crash and be misreported as a
+%% connection failure by the outer network catch).
+check_header_kid(Header) ->
+    case maps:get(<<"kid">>, Header, undefined) of
+        undefined -> {ok, Header};
+        Kid when is_binary(Kid) -> {ok, Header};
+        _ -> {error, input_invalid, ?REASON_TOKEN_MALFORMED}
     end.
 
 %% Decode the first JWT segment (the protected header) into a JSON object map.

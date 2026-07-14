@@ -550,6 +550,17 @@ parse_access_token_rs256_ok_test() ->
         aws_auth_validate_oauth:parse_access_token(Token)
     ).
 
+%% A present-but-non-binary kid (e.g. a JSON number) is a malformed header,
+%% rejected in the pure phase rather than crashing select_jwk/2 later.
+parse_access_token_non_binary_kid_rejected_test() ->
+    Token = compact_token(
+        #{<<"alg">> => <<"RS256">>, <<"kid">> => 123}, #{<<"sub">> => <<"s">>}, <<"sig">>
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(Token)
+    ).
+
 %% select_jwk: a token with no kid against a single-key JWKS picks that key.
 select_jwk_single_no_kid_test() ->
     Key = #{<<"kty">> => <<"RSA">>},
