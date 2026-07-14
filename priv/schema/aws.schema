@@ -109,10 +109,11 @@
 {mapping, "aws.auth_validation.enabled", "aws.auth_validation_enabled",
     [{datatype, {enum, [true, false]}}]}.
 
-%% @doc Per-method enable flag. Methods are enabled by default; set
-%% explicit false to disable a specific method even when the master
-%% toggle is on. Example:
-%%   aws.auth_validation.enabled_methods.ldap = false
+%% @doc Per-method enable flag. Every method is opt-in and defaults to
+%% DISABLED: the master toggle (aws.auth_validation.enabled) starts the
+%% subsystem but brings no individual method online. Set an explicit true to
+%% enable a specific method. Example:
+%%   aws.auth_validation.enabled_methods.ldap = true
 %%   aws.auth_validation.enabled_methods.oauth = true
 {mapping, "aws.auth_validation.enabled_methods.$name", "aws.auth_validation_enabled_methods",
     [{datatype, {enum, [true, false]}}]}.

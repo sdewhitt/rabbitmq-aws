@@ -122,6 +122,10 @@ init_per_group(feature_disabled, Config) ->
 init_per_group(feature_enabled, Config) ->
     setup_broker(Config, [
         {auth_validation_enabled, true},
+        %% ldap is opt-in like every other method: the master toggle alone does
+        %% not bring it online, so this group must enable it explicitly or every
+        %% ldap case below would get a 404 (method_disabled).
+        {auth_validation_enabled_methods, [{<<"ldap">>, true}]},
         {auth_validation_max_concurrent, 1},
         {auth_validation_max_body_size, 1024},
         %% base_body/0 uses a loopback server (127.0.0.1); without this the
@@ -135,6 +139,8 @@ init_per_group(feature_enabled, Config) ->
 init_per_group(feature_enabled_custom_tag, Config) ->
     setup_broker(Config, [
         {auth_validation_enabled, true},
+        %% ldap is opt-in; enable it explicitly (see the feature_enabled note).
+        {auth_validation_enabled_methods, [{<<"ldap">>, true}]},
         {auth_validation_max_concurrent, 1},
         {auth_validation_max_body_size, 1024},
         {auth_validation_allow_private_networks, true},
@@ -215,8 +221,15 @@ init_per_testcase(TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC).
 
 end_per_testcase(method_disabled_returns_404 = TC, Config) ->
+    %% Restore the group's ldap-enabled setting rather than unset it: ldap is now
+    %% opt-in, so unsetting would leave it DISABLED and spuriously 404 the later
+    %% ldap cases in this group (password_not_in_response, success_returns_204).
     rabbit_ct_broker_helpers:rpc(
-        Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
+        Config,
+        0,
+        application,
+        set_env,
+        [aws, auth_validation_enabled_methods, [{<<"ldap">>, true}]]
     ),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(success_returns_204 = TC, Config) ->
