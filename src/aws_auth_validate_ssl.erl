@@ -78,11 +78,6 @@
 %%   sni_key    :: binary()   -- the customer-facing SNI key (<<"sni">> for
 %%                 http/oauth, <<"server_name_indication">> for ldap).
 %%   client_cert :: boolean() -- whether the mTLS cert/key pair is accepted.
-%%   param_arn_keys :: [binary()] -- OPTIONAL. Top-level (non-ssl_options) param
-%%                 keys that carry an ARN-backed secret (e.g. the OAuth
-%%                 client_secret_arn). Presence of any (as a non-empty binary)
-%%                 forces the assume_role guardrail, exactly like arn_keys.
-%%                 Omit for backends with no such param.
 %%   reasons    :: map()      -- backend-specific fixed reason binaries, keyed by
 %%                 the atoms below (so each backend keeps its own fixed-response
 %%                 wording). See reason/2.
@@ -91,7 +86,6 @@
     ssl_option_keys := [binary()],
     sni_key := binary(),
     client_cert := boolean(),
-    param_arn_keys => [binary()],
     reasons := map()
 }.
 
@@ -157,28 +151,12 @@ resolve_request_state(Params, Opts) ->
             end
     end.
 
-%% True when the request references any ARN, i.e. resolving the request will
-%% make at least one AWS call and therefore requires a configured assume_role.
-%% Two ARN sources are considered:
-%%   * ssl_options.<arn_keys> -- ARN-backed TLS material (all backends), and
-%%   * top-level Params.<param_arn_keys> -- non-TLS ARN-backed secrets a backend
-%%     may accept directly (e.g. the OAuth client_secret_arn). `param_arn_keys'
-%%     is OPTIONAL in opts(); absent for backends that reference no such secret,
-%%     so their behaviour is unchanged.
-request_references_arn(Params, Opts) ->
-    ssl_options_reference_arn(Params, Opts) orelse params_reference_arn(Params, Opts).
-
-ssl_options_reference_arn(#{ssl_options := Map}, #{arn_keys := Keys}) ->
+%% True when the request references any ARN-backed TLS material under
+%% ssl_options, i.e. resolving the request will make at least one AWS call and
+%% therefore requires a configured assume_role.
+request_references_arn(#{ssl_options := Map}, #{arn_keys := Keys}) ->
     lists:any(fun(K) -> maps:is_key(K, Map) end, Keys);
-ssl_options_reference_arn(_Params, _Opts) ->
-    false.
-
-%% A top-level param ARN counts as a reference only when the value is actually
-%% present (a non-empty binary): merely listing the key in param_arn_keys does
-%% not force an assume_role if the caller omitted the secret.
-params_reference_arn(Params, #{param_arn_keys := Keys}) when is_map(Params) ->
-    lists:any(fun(K) -> is_nonempty_binary(maps:get(K, Params, undefined)) end, Keys);
-params_reference_arn(_Params, _Opts) ->
+request_references_arn(_Params, _Opts) ->
     false.
 
 %% Resolve an ARN using the request's threaded aws_state(). The 3-tuple
