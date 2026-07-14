@@ -714,6 +714,17 @@ verify_token_audience_mismatch_test() ->
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
     ).
 
+%% aud check: a space-delimited string aud is split before matching, mirroring
+%% the broker's find_audience/2 -> resource_server_id present in the split -> ok.
+verify_token_audience_space_delimited_string_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"rabbitmq api://default">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
 %%--------------------------------------------------------------------
 %% Customer-supplied access_token: end-to-end (mocked JWKS fetch)
 %%--------------------------------------------------------------------

@@ -728,12 +728,19 @@ check_nbf(_Nbf, _Now) ->
 %% When a resource_server_id was supplied, require it in the token `aud' (a
 %% string or a list of strings, per RFC 7519). When none was supplied, the aud
 %% is not asserted (signature + expiry only).
+%%
+%% A string `aud' is split on spaces before matching, mirroring the broker's
+%% rabbit_oauth2_resource_server:find_audience/2 (which does
+%% binary:split(Audience, <<" ">>, [global, trim_all])). Some IdPs emit a
+%% space-delimited multi-value `aud' as a single string; matching it whole would
+%% reject a token the live broker accepts.
 check_token_audience(_Claims, undefined) ->
     ok;
 check_token_audience(Claims, ResourceServerId) ->
     case maps:get(<<"aud">>, Claims, undefined) of
         Aud when is_binary(Aud) ->
-            audience_result(Aud =:= ResourceServerId);
+            AudList = binary:split(Aud, <<" ">>, [global, trim_all]),
+            audience_result(lists:member(ResourceServerId, AudList));
         Auds when is_list(Auds) ->
             audience_result(lists:member(ResourceServerId, Auds));
         _ ->
