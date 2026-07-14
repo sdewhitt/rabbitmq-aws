@@ -272,12 +272,17 @@ apply_verify_default_absent_verify_without_anchor_stays_unset_test_() ->
         [?_assertNot(lists:keymember(verify, 1, Opts))]
     end).
 
-%% Explicit verify_peer WITH a supplied trust anchor (cacerts) is accepted
-%% unchanged -- the presence of cacerts short-circuits before the OS store, so no
-%% mock is needed.
+%% Explicit verify_peer WITH a supplied trust anchor (cacerts) is accepted --
+%% the presence of cacerts short-circuits before the OS store, so no mock is
+%% needed. The verify and cacerts opts are preserved and the https match_fun is
+%% added (every verify_peer path carries it -- see has_https_match_fun and the
+%% wildcard-cert regression guards above).
 apply_verify_default_explicit_verify_peer_with_cacerts_is_ok_test() ->
     Opts0 = [{verify, verify_peer}, {cacerts, [<<"der">>]}],
-    ?assertEqual({ok, Opts0}, aws_auth_validate_ssl:apply_verify_default(Opts0, true)).
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts0, true),
+    ?assertEqual({verify, verify_peer}, lists:keyfind(verify, 1, Out)),
+    ?assertEqual({cacerts, [<<"der">>]}, lists:keyfind(cacerts, 1, Out)),
+    ?assert(has_https_match_fun(Out)).
 
 %% An explicit verify_none is honoured as-is (the operator opted out of
 %% verification); apply_verify_default never touches it.
