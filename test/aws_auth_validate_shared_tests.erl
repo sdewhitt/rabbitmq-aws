@@ -214,3 +214,86 @@ scheme_policy_divergence_test() ->
     HttpsUrl = #{scheme => "https", host => "example.com"},
     ?assertEqual(ok, aws_auth_validate_http:url_allowed(HttpsUrl)),
     ?assertEqual(ok, aws_auth_validate_oauth:url_allowed(HttpsUrl)).
+
+%%--------------------------------------------------------------------
+%% aws_auth_validate_ssl:apply_verify_default/2 (R7): verify_peer is never
+%% SILENTLY downgraded. This is the false-positive the whole endpoint exists to
+%% prevent -- an operator who wrote verify_peer must not be told "reachable" by a
+%% probe that quietly fell back to verify_none. These pin every branch of the
+%% policy directly, deterministically, without needing a live TLS server (the
+%% http/oauth/tls SUITEs cover it end to end but skip when no server is present).
+%%
+%% Branch matrix (VerifyExplicit x anchor-present):
+%%   explicit verify_peer + no anchor   -> {error, tls_failed, _}   (FAIL, never downgrade)
+%%   explicit verify_peer + anchor      -> {ok, _} unchanged
+%%   defaulted verify_peer + no anchor  -> {ok, _} downgraded to verify_none
+%%   explicit verify_none               -> {ok, _} untouched
+%%   absent verify + anchor             -> {ok, _} verify_peer added
+%%   absent verify + no anchor          -> {ok, _} verify left unset
+%%--------------------------------------------------------------------
+
+%% Run Fun/0 (an eunit instantiator returning a test list) with the OS trust
+%% store forced empty, so the "no anchor" branches are deterministic regardless
+%% of the host's CA store. os_cacerts/0 wraps public_key:cacerts_get/0 in a
+%% try/catch, so returning [] here means "no trust anchor available".
+with_empty_os_store(Fun) ->
+    {setup,
+        fun() ->
+            ok = meck:new(public_key, [unstick, passthrough]),
+            meck:expect(public_key, cacerts_get, fun() -> [] end),
+            ok
+        end,
+        fun(_) -> meck:unload(public_key) end, Fun}.
+
+%% LOAD-BEARING R7 assertion: an EXPLICIT verify_peer with no trust anchor MUST
+%% fail closed with tls_failed -- it must never be silently downgraded to
+%% verify_none.
+apply_verify_default_explicit_verify_peer_without_anchor_fails_test_() ->
+    with_empty_os_store(fun() ->
+        Result = aws_auth_validate_ssl:apply_verify_default([{verify, verify_peer}], true),
+        [?_assertMatch({error, tls_failed, _}, Result)]
+    end).
+
+%% A DEFAULTED verify_peer (not explicitly requested) with no anchor is the ONLY
+%% case allowed to downgrade -- to verify_none -- so a plain reachability probe
+%% still works without a CA store. Explicitness (previous test) is what forbids
+%% the downgrade.
+apply_verify_default_defaulted_verify_peer_without_anchor_downgrades_test_() ->
+    with_empty_os_store(fun() ->
+        {ok, Opts} = aws_auth_validate_ssl:apply_verify_default([{verify, verify_peer}], false),
+        [?_assertEqual({verify, verify_none}, lists:keyfind(verify, 1, Opts))]
+    end).
+
+%% Absent verify + no anchor: leave verify unset (do not fabricate verify_peer
+%% with nothing to verify against).
+apply_verify_default_absent_verify_without_anchor_stays_unset_test_() ->
+    with_empty_os_store(fun() ->
+        {ok, Opts} = aws_auth_validate_ssl:apply_verify_default([], false),
+        [?_assertNot(lists:keymember(verify, 1, Opts))]
+    end).
+
+%% Explicit verify_peer WITH a supplied trust anchor (cacerts) is accepted --
+%% the presence of cacerts short-circuits before the OS store, so no mock is
+%% needed. The verify and cacerts opts are preserved and the https match_fun is
+%% added (every verify_peer path carries it -- see has_https_match_fun and the
+%% wildcard-cert regression guards above).
+apply_verify_default_explicit_verify_peer_with_cacerts_is_ok_test() ->
+    Opts0 = [{verify, verify_peer}, {cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts0, true),
+    ?assertEqual({verify, verify_peer}, lists:keyfind(verify, 1, Out)),
+    ?assertEqual({cacerts, [<<"der">>]}, lists:keyfind(cacerts, 1, Out)),
+    ?assert(has_https_match_fun(Out)).
+
+%% An explicit verify_none is honoured as-is (the operator opted out of
+%% verification); apply_verify_default never touches it.
+apply_verify_default_explicit_verify_none_untouched_test() ->
+    Opts0 = [{verify, verify_none}],
+    ?assertEqual({ok, Opts0}, aws_auth_validate_ssl:apply_verify_default(Opts0, false)).
+
+%% Absent verify WITH a trust anchor present: default up to verify_peer (secure
+%% by default when we have something to verify against).
+apply_verify_default_absent_verify_with_cacerts_adds_verify_peer_test() ->
+    Opts0 = [{cacerts, [<<"der">>]}],
+    {ok, Opts1} = aws_auth_validate_ssl:apply_verify_default(Opts0, false),
+    ?assertEqual({verify, verify_peer}, lists:keyfind(verify, 1, Opts1)),
+    ?assert(lists:keymember(cacerts, 1, Opts1)).

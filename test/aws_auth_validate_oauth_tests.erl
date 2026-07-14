@@ -550,12 +550,27 @@ parse_access_token_rs256_ok_test() ->
         aws_auth_validate_oauth:parse_access_token(Token)
     ).
 
-%% select_jwk: a token with no kid against a single-key JWKS picks that key.
-select_jwk_single_no_kid_test() ->
-    Key = #{<<"kty">> => <<"RSA">>},
-    ?assertEqual({ok, Key}, aws_auth_validate_oauth:select_jwk(undefined, [Key])).
+%% A present-but-non-binary kid (e.g. a JSON number) is a malformed header,
+%% rejected in the pure phase rather than crashing select_jwk/2 later.
+parse_access_token_non_binary_kid_rejected_test() ->
+    Token = compact_token(
+        #{<<"alg">> => <<"RS256">>, <<"kid">> => 123}, #{<<"sub">> => <<"s">>}, <<"sig">>
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_oauth:parse_access_token(Token)
+    ).
 
-%% select_jwk: no kid against a multi-key JWKS is unresolvable -> token_invalid.
+%% select_jwk: a token with NO kid is rejected even against a single-key JWKS.
+%% The broker resolves no-kid tokens via a configured default_key (not "the only
+%% key present"), so accepting a lone JWKS key here would be a false pass.
+select_jwk_single_no_kid_rejected_test() ->
+    Key = #{<<"kty">> => <<"RSA">>},
+    ?assertMatch(
+        {error, token_invalid, _}, aws_auth_validate_oauth:select_jwk(undefined, [Key])
+    ).
+
+%% select_jwk: no kid against a multi-key JWKS is likewise rejected -> token_invalid.
 select_jwk_no_kid_multi_test() ->
     Keys = [#{<<"kid">> => <<"a">>}, #{<<"kid">> => <<"b">>}],
     ?assertMatch({error, token_invalid, _}, aws_auth_validate_oauth:select_jwk(undefined, Keys)).
@@ -601,13 +616,16 @@ verify_token_expired_test() ->
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
 
-%% A not-yet-valid token (nbf in the future) is refused -> token_expired.
-verify_token_not_yet_valid_test() ->
+%% A token with a future nbf is ACCEPTED (given a valid signature + exp): the
+%% broker's validate_token_expiry/1 checks exp only and has no nbf handling, so
+%% we deliberately do not check nbf either (checking it would false-fail a
+%% post-dated / clock-skewed token the live broker accepts).
+verify_token_future_nbf_ignored_test() ->
     #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
     Token = Sign(#{<<"sub">> => <<"alice">>, <<"nbf">> => future(), <<"exp">> => future()}),
     {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
-    ?assertMatch(
-        {error, token_expired, _},
+    ?assertEqual(
+        ok,
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
 
@@ -622,26 +640,45 @@ verify_token_non_numeric_exp_is_invalid_test() ->
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
 
-%% A present but non-numeric nbf is likewise a malformed claim -> token_invalid.
-verify_token_non_numeric_nbf_is_invalid_test() ->
+%% A non-numeric nbf is ignored (nbf is not checked at all -- see
+%% verify_token_future_nbf_ignored_test): a valid signature + exp still passes.
+verify_token_non_numeric_nbf_ignored_test() ->
     #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
     Token = Sign(#{<<"sub">> => <<"alice">>, <<"exp">> => future(), <<"nbf">> => <<"soon">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+    ).
+
+%% A token with NO exp is REJECTED by default (require_exp unset), matching the
+%% broker whose require_exp default is true -> token_invalid (a config mismatch
+%% the live broker would also reject, not a transient expiry).
+verify_token_no_exp_rejected_by_default_test() ->
+    application:unset_env(rabbitmq_auth_backend_oauth2, require_exp),
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"sub">> => <<"alice">>}),
     {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
     ?assertMatch(
         {error, token_invalid, _},
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
 
-%% A token with NO exp is accepted by default (require_exp unset).
-verify_token_no_exp_ok_by_default_test() ->
-    application:unset_env(rabbitmq_auth_backend_oauth2, require_exp),
-    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
-    Token = Sign(#{<<"sub">> => <<"alice">>}),
-    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
-    ?assertEqual(
-        ok,
-        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
-    ).
+%% A token with NO exp is accepted only when the operator explicitly sets
+%% auth_oauth2.require_exp to false, mirroring the broker's opt-out.
+verify_token_no_exp_ok_when_not_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, false),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
 
 %% When the server sets auth_oauth2.require_exp, a token with NO exp is refused
 %% -> token_invalid (the live broker would also reject it -- a config mismatch,
@@ -688,6 +725,48 @@ verify_token_audience_ok_test() ->
 
 %% aud check: resource_server_id absent from aud -> auth_failed.
 verify_token_audience_mismatch_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"someone-else">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertMatch(
+        {error, auth_failed, _},
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
+%% aud check: a space-delimited string aud is split before matching, mirroring
+%% the broker's find_audience/2 -> resource_server_id present in the split -> ok.
+verify_token_audience_space_delimited_string_test() ->
+    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"rabbitmq api://default">>}),
+    {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+    ).
+
+%% aud check: when the operator disables the broker's verify_aud, a token whose
+%% aud OMITS the resource_server_id is accepted -- the live broker skips audience
+%% matching (falls back to find_unique_resource_server_without_verify_aud), so
+%% enforcing it here would false-fail a token the broker accepts.
+verify_token_audience_skipped_when_verify_aud_false_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, verify_aud, false),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"someone-else">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], <<"rabbitmq">>})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, verify_aud)
+    end.
+
+%% aud check: with verify_aud at its default (unset -> true), an aud mismatch is
+%% still a failure (guards against the verify_aud=false path leaking into the
+%% default case).
+verify_token_audience_enforced_by_default_test() ->
+    application:unset_env(rabbitmq_auth_backend_oauth2, verify_aud),
     #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
     Token = Sign(#{<<"exp">> => future(), <<"aud">> => <<"someone-else">>}),
     {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
