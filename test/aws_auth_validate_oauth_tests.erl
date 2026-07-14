@@ -632,16 +632,34 @@ verify_token_non_numeric_nbf_is_invalid_test() ->
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
 
-%% A token with NO exp is accepted by default (require_exp unset).
-verify_token_no_exp_ok_by_default_test() ->
+%% A token with NO exp is REJECTED by default (require_exp unset), matching the
+%% broker whose require_exp default is true -> token_invalid (a config mismatch
+%% the live broker would also reject, not a transient expiry).
+verify_token_no_exp_rejected_by_default_test() ->
     application:unset_env(rabbitmq_auth_backend_oauth2, require_exp),
     #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
     Token = Sign(#{<<"sub">> => <<"alice">>}),
     {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {error, token_invalid, _},
         aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
     ).
+
+%% A token with NO exp is accepted only when the operator explicitly sets
+%% auth_oauth2.require_exp to false, mirroring the broker's opt-out.
+verify_token_no_exp_ok_when_not_required_test() ->
+    application:set_env(rabbitmq_auth_backend_oauth2, require_exp, false),
+    try
+        #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+        Token = Sign(#{<<"sub">> => <<"alice">>}),
+        {ok, Header} = aws_auth_validate_oauth:parse_access_token(Token),
+        ?assertEqual(
+            ok,
+            aws_auth_validate_oauth:verify_token(Token, Header, {[PubJwk], undefined})
+        )
+    after
+        application:unset_env(rabbitmq_auth_backend_oauth2, require_exp)
+    end.
 
 %% When the server sets auth_oauth2.require_exp, a token with NO exp is refused
 %% -> token_invalid (the live broker would also reject it -- a config mismatch,

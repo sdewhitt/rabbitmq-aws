@@ -678,10 +678,10 @@ jwt_claims(_) ->
 %% non-numeric exp/nbf is NOT "expired" -- the claim is malformed, so the token
 %% is invalid -> token_invalid.
 %%
-%% Absent exp: permitted by default, BUT the server-side option
-%% `auth_oauth2.require_exp' (recent) makes the broker REJECT a token with no
-%% exp. When that option is set we mirror it here -- otherwise the endpoint would
-%% report a no-exp token as OK while the live broker would refuse it (a false
+%% Absent exp: the broker REJECTS a token with no exp UNLESS the operator sets
+%% `auth_oauth2.require_exp' to false; the broker's default is true. We mirror
+%% that default here -- otherwise the endpoint would report a no-exp token as OK
+%% while the live broker (whose default rejects it) would refuse it (a false
 %% pass, the exact thing this endpoint exists to prevent). A missing-required-exp
 %% is a config mismatch the broker would also reject -> token_invalid.
 check_token_expiry(Claims) ->
@@ -705,12 +705,14 @@ check_exp(_Exp, _Now) ->
     %% present but non-numeric -> malformed claim, not "expired"
     {error, token_invalid, ?REASON_TOKEN_BAD_TIME_CLAIM}.
 
-%% Read the server's rabbit_auth_backend_oauth2 `require_exp' setting (recent
-%% option). Absent/false -> a token without exp is accepted; true -> it is
-%% rejected, matching what the live broker would do. Read from the oauth2
-%% backend's app env, the same source the backend itself uses.
+%% Read the server's rabbit_auth_backend_oauth2 `require_exp' setting. The broker
+%% defaults this to true (rabbit_oauth2_resource_server:get_boolean_env/2), so a
+%% token without exp is rejected unless the operator explicitly sets it to false.
+%% Mirror both the default and the coercion (only a literal false disables it;
+%% any other value is treated as true) so this endpoint matches the live broker.
+%% Read from the oauth2 backend's app env, the same source the backend itself uses.
 require_exp() ->
-    application:get_env(rabbitmq_auth_backend_oauth2, require_exp, false) =:= true.
+    application:get_env(rabbitmq_auth_backend_oauth2, require_exp, true) =/= false.
 
 check_nbf(undefined, _Now) ->
     ok;
