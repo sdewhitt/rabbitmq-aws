@@ -192,8 +192,8 @@
 -define(REASON_TOKEN_AUDIENCE, <<"access_token audience does not include resource_server_id">>).
 %% Optional authz-evaluation config shape errors (pure phase).
 -define(REASON_BAD_AUTHZ_CHECK, <<
-    "authz_check must be an object with a permission (configure|write|read) and "
-    "a resource string"
+    "authz_check must be an object with a permission (configure|write|read), "
+    "a resource string, and an optional vhost string"
 >>).
 -define(REASON_BAD_AUTHZ_CONFIG, <<
     "scope_aliases must be an object, additional_scopes_key/scope_prefix a "
@@ -559,9 +559,17 @@ parse_authz_config(Body, Acc) ->
 parse_authz_check(Body, Check, Acc) ->
     Permission = maps:get(<<"permission">>, Check, undefined),
     Resource = maps:get(<<"resource">>, Check, undefined),
+    %% vhost defaults to <<"/">> when absent. When supplied it must be a binary:
+    %% a non-binary vhost would flow into #resource{virtual_host = VHost} and
+    %% crash the broker's scope matcher (rabbit_data_coercion:to_binary/1 has no
+    %% clause for a float or map), a crash the outer network catch would then
+    %% misreport as a connection failure. Validate it here in the pure phase,
+    %% alongside resource and permission.
     VHost = maps:get(<<"vhost">>, Check, <<"/">>),
     ValidPerm = lists:member(Permission, [<<"configure">>, <<"write">>, <<"read">>]),
-    case ValidPerm andalso is_binary(Resource) andalso byte_size(Resource) > 0 of
+    ValidResource = is_binary(Resource) andalso byte_size(Resource) > 0,
+    ValidVHost = is_binary(VHost),
+    case ValidPerm andalso ValidResource andalso ValidVHost of
         false ->
             {error, input_invalid, ?REASON_BAD_AUTHZ_CHECK};
         true ->

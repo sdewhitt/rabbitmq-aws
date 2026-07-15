@@ -1040,6 +1040,26 @@ authz_check_bad_permission_rejected_test() ->
     },
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
 
+%% A non-binary authz_check.vhost is rejected in the pure phase. Without this
+%% guard the value would reach the broker's scope matcher as
+%% #resource{virtual_host = VHost} and crash it, a crash the network catch would
+%% misreport as a connection failure. resource_server_id is supplied so the
+%% check reaches the vhost validation rather than the earlier
+%% resource_server_id guard.
+authz_check_non_binary_vhost_rejected_test() ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    Body = (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"resource_server_id">> => <<"rabbitmq">>,
+        <<"authz_check">> => #{
+            <<"vhost">> => 1.5,
+            <<"resource">> => <<"q">>,
+            <<"permission">> => <<"read">>
+        }
+    },
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
 %% Run Fun only if the oauth2 backend is loaded; otherwise return an empty test
 %% list (graceful skip), mirroring how the LDAP integration suite skips without
 %% slapd.
