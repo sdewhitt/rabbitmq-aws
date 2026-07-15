@@ -41,7 +41,11 @@
 
 dispatcher() -> [{"/aws/auth/validate/:method", ?MODULE, []}].
 
-web_ui() -> [].
+%% Register the management-console UI extension. The management plugin serves
+%% this plugin's priv/www/ automatically (see rabbit_mgmt_dispatcher), so the
+%% referenced file is loaded from priv/www/js/aws_auth_validate.js. The JS adds
+%% an admin-gated "Auth Validation" tab that drives PUT /aws/auth/validate/:method.
+web_ui() -> [{javascript, <<"aws_auth_validate.js">>}].
 
 %%--------------------------------------------------------------------
 %% cowboy_rest callbacks

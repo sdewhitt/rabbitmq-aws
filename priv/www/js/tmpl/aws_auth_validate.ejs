@@ -1,0 +1,131 @@
+<!--
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+<h1>Auth Validation</h1>
+<p class="description">
+  Validate an authentication-backend configuration (LDAP, HTTP, OAuth2, or TLS)
+  without a broker restart. The result is a fixed category; no target host,
+  certificate, or backend error detail is returned.
+</p>
+
+<div class="section">
+  <h2>Request</h2>
+  <table class="form">
+    <tr>
+      <th><label for="aws-auth-validate-method">Method:</label></th>
+      <td>
+        <select id="aws-auth-validate-method" name="method">
+          <option value="ldap">ldap</option>
+          <option value="http">http</option>
+          <option value="oauth">oauth</option>
+          <option value="tls">tls</option>
+        </select>
+        <p class="argument">
+          Each method must be enabled server-side
+          (<code>aws.auth_validation.enabled = true</code> plus
+          <code>aws.auth_validation.enabled_methods.&lt;method&gt; = true</code>);
+          a disabled method returns <code>method_disabled</code> below.
+        </p>
+      </td>
+    </tr>
+  </table>
+
+  <form id="aws-auth-validate-form">
+
+    <!-- ldap -->
+    <div id="aws-av-fields-ldap" class="aws-av-method-fields">
+      <table class="form">
+        <tr><th><label>Servers:</label></th>
+          <td><input type="text" data-av-field="servers" placeholder="ldap1.example.com ldap2.example.com" />
+            <span class="argument">space-separated hostnames</span></td></tr>
+        <tr><th><label>Port:</label></th>
+          <td><input type="number" data-av-field="port" min="1" max="65535" placeholder="389" /></td></tr>
+        <tr><th><label>User DN:</label></th>
+          <td><input type="text" data-av-field="user_dn" placeholder="cn=admin,dc=example,dc=com" /></td></tr>
+        <tr><th><label>Password ARN:</label></th>
+          <td><input type="text" data-av-field="password_arn" placeholder="arn:aws:secretsmanager:..." /></td></tr>
+        <tr><th><label>Use SSL (LDAPS):</label></th>
+          <td><input type="checkbox" data-av-field="use_ssl" /></td></tr>
+        <tr><th><label>Use StartTLS:</label></th>
+          <td><input type="checkbox" data-av-field="use_starttls" /></td></tr>
+      </table>
+    </div>
+
+    <!-- http -->
+    <div id="aws-av-fields-http" class="aws-av-method-fields" style="display:none;">
+      <table class="form">
+        <tr><th><label>User path:</label></th>
+          <td><input type="text" data-av-field="user_path" placeholder="https://auth.example.com/user" />
+            <span class="argument">required</span></td></tr>
+        <tr><th><label>Vhost path:</label></th>
+          <td><input type="text" data-av-field="vhost_path" placeholder="https://auth.example.com/vhost" /></td></tr>
+        <tr><th><label>Resource path:</label></th>
+          <td><input type="text" data-av-field="resource_path" placeholder="https://auth.example.com/resource" /></td></tr>
+        <tr><th><label>Topic path:</label></th>
+          <td><input type="text" data-av-field="topic_path" placeholder="https://auth.example.com/topic" /></td></tr>
+        <tr><th><label>HTTP method:</label></th>
+          <td><select data-av-field="http_method"><option value="">(default)</option>
+            <option value="get">get</option><option value="post">post</option></select></td></tr>
+      </table>
+    </div>
+
+    <!-- oauth -->
+    <div id="aws-av-fields-oauth" class="aws-av-method-fields" style="display:none;">
+      <table class="form">
+        <tr><th><label>JWKS URI:</label></th>
+          <td><input type="text" data-av-field="jwks_uri" placeholder="https://idp.example.com/.well-known/jwks.json" /></td></tr>
+        <tr><th><label>Issuer:</label></th>
+          <td><input type="text" data-av-field="issuer" placeholder="https://idp.example.com/" /></td></tr>
+        <tr><th><label>Resource server id:</label></th>
+          <td><input type="text" data-av-field="resource_server_id" placeholder="rabbitmq" /></td></tr>
+        <tr><th><label>Access token:</label></th>
+          <td><input type="text" data-av-field="access_token" placeholder="(optional) enables signature/exp/aud checks" /></td></tr>
+      </table>
+    </div>
+
+    <!-- tls -->
+    <div id="aws-av-fields-tls" class="aws-av-method-fields" style="display:none;">
+      <table class="form">
+        <tr><th><label>Target:</label></th>
+          <td><input type="text" data-av-field="target" placeholder="listener" /></td></tr>
+      </table>
+    </div>
+
+    <!-- shared ssl_options (applies to ldap/http/oauth/tls that support TLS) -->
+    <div class="section-hidden">
+      <h3>ssl_options</h3>
+      <table class="form">
+        <tr><th><label>CA cert ARN:</label></th>
+          <td><input type="text" data-av-ssl="cacertfile_arn" placeholder="arn:aws:s3:::.../ca.pem" /></td></tr>
+        <tr><th><label>Client cert ARN:</label></th>
+          <td><input type="text" data-av-ssl="certfile_arn" placeholder="(mTLS) arn:aws:s3:::.../cert.pem" /></td></tr>
+        <tr><th><label>Client key ARN:</label></th>
+          <td><input type="text" data-av-ssl="keyfile_arn" placeholder="(mTLS) arn:aws:secretsmanager:.../key" /></td></tr>
+        <tr><th><label>Verify:</label></th>
+          <td><select data-av-ssl="verify"><option value="">(default)</option>
+            <option value="verify_peer">verify_peer</option>
+            <option value="verify_none">verify_none</option></select></td></tr>
+        <tr><th><label>SNI:</label></th>
+          <td><input type="text" data-av-ssl="sni" placeholder="auth.example.com" /></td></tr>
+      </table>
+      <p class="argument">
+        ARN fields are resolved server-side under the configured
+        <code>aws.arns.assume_role_arn</code> and are never echoed back. Do not
+        expect resolved secret material to appear in any result.
+      </p>
+    </div>
+
+    <div style="margin-top:10px;">
+      <input type="submit" id="aws-auth-validate-submit" value="Validate" />
+    </div>
+  </form>
+</div>
+
+<div class="section">
+  <h2>Result</h2>
+  <div id="aws-auth-validate-result">
+    <p class="argument">Submit a request to see the categorized result here.</p>
+  </div>
+</div>
