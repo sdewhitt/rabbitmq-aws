@@ -833,7 +833,7 @@ access_token_no_leak_test_() ->
     end}.
 
 %%--------------------------------------------------------------------
-%% PROTOTYPE: optional authorization-evaluation layer (runtime soft dependency
+%% Optional authorization-evaluation layer (runtime soft dependency
 %% on rabbitmq_auth_backend_oauth2). These tests only run when that backend is
 %% loaded on the node (it is a TEST_DEPS-style presence, not a build DEPS);
 %% each test skips gracefully via availability/0 so the suite passes whether or

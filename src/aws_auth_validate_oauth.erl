@@ -190,7 +190,7 @@
     "(auth_oauth2.require_exp)"
 >>).
 -define(REASON_TOKEN_AUDIENCE, <<"access_token audience does not include resource_server_id">>).
-%% PROTOTYPE: optional authz-evaluation config shape errors (pure phase).
+%% Optional authz-evaluation config shape errors (pure phase).
 -define(REASON_BAD_AUTHZ_CHECK, <<
     "authz_check must be an object with a permission (configure|write|read) and "
     "a resource string"
@@ -293,7 +293,7 @@ allowed_fields() ->
         %% activates signature + exp/nbf/aud verification against the fetched
         %% JWKS. Carries no secret (the customer minted it out of band).
         <<"access_token">>,
-        %% PROTOTYPE (optional authorization-evaluation layer): the customer's
+        %% Optional authorization-evaluation layer: the customer's
         %% OAuth authz config (scope_aliases / additional_scopes_key /
         %% scope_prefix / scope_pattern_syntax) plus an authz_check block
         %% {vhost,resource,permission} to evaluate the supplied access_token
@@ -361,7 +361,7 @@ parse_input(Body) ->
         %% supplied token and pre-decodes its header so the alg allowlist can be
         %% enforced without network I/O. No verification happens here.
         fun parse_access_token/2,
-        %% PROTOTYPE: pure shape-check of the optional authz-evaluation config.
+        %% Pure shape-check of the optional authz-evaluation config.
         fun parse_authz_config/2,
         %% SSRF guard runs in the pure phase so a disallowed target is rejected
         %% before any ARN resolution or outbound request.
@@ -514,7 +514,7 @@ check_header_kid(Header) ->
         _ -> {error, input_invalid, ?REASON_TOKEN_MALFORMED}
     end.
 
-%% PROTOTYPE: pure shape-check of the optional authorization-evaluation config.
+%% Pure shape-check of the optional authorization-evaluation config.
 %% When no authz_check is supplied, this is a no-op (authz_check => none) and the
 %% backend behaves exactly as before. When supplied, we shape-check the config
 %% fields and the check block here (pure phase) so a malformed request never
@@ -732,13 +732,13 @@ maybe_verify_token(#{token := none} = Params, _Keys) ->
 maybe_verify_token(#{token := #{raw := Raw, header := Header}} = Params, Keys) ->
     ResourceServerId = maps:get(resource_server_id, Params, undefined),
     %% Verify signature + exp + aud, capturing the decoded claims so the optional
-    %% PROTOTYPE authorization-evaluation layer can run against them.
+    %% authorization-evaluation layer can run against them.
     case verify_token_claims(Raw, Header, {Keys, ResourceServerId}) of
         {error, _, _} = Err ->
             Err;
         {ok, Claims} ->
-            %% PROTOTYPE: optional authz evaluation via the broker's own scope
-            %% functions (runtime soft dependency). No-op when no authz_check.
+            %% Optional authz evaluation via the broker's own scope functions
+            %% (runtime soft dependency). No-op when no authz_check.
             aws_auth_validate_oauth_authz:maybe_check(Params, Claims)
     end.
 
