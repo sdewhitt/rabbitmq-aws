@@ -1,0 +1,251 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
+%% Optional OAuth authorization-evaluation layer, wired as an opt-in step in
+%% aws_auth_validate_oauth (activates only when a request carries an authz_check
+%% block; a no-op otherwise).
+%%
+%% Purpose: given a *already-verified* customer-supplied access token (signature
+%% + exp + aud already checked by aws_auth_validate_oauth), answer "would the
+%% broker grant this principal <permission> on <vhost>/<resource>?" -- i.e. reach
+%% an authorization decision, not just an authentication one. This is a
+%% troubleshooting/triage aid: it localizes WHICH layer of an OAuth config is
+%% wrong (reachability vs. authentication vs. authorization) and, for authz,
+%% names the failing STAGE (see the reason macros), deflecting the "my token is
+%% broken (it isn't)" support ticket without a broker restart.
+%%
+%% Design: RUNTIME SOFT DEPENDENCY on rabbitmq_auth_backend_oauth2.
+%%   * We do NOT add it to the plugin's DEPS (it is not force-loaded onto
+%%     aws-plugin users who never run OAuth).
+%%   * We CALL its exported, pure decision functions when-and-only-when the
+%%     module is already loaded on the broker, guarded by
+%%     erlang:function_exported/3. When it is not loaded, authz evaluation is
+%%     unavailable and we say so with a fixed category -- we never fall back to a
+%%     home-grown scope matcher (that would reintroduce the drift risk this
+%%     approach exists to avoid).
+%%   * Because we EXECUTE the broker's own code rather than mirror it, there is
+%%     nothing to keep in sync: drift is impossible by construction.
+%%
+%% The broker functions used (all verified pure -- no app-env / ETS / mnesia on
+%% this path; they read all config from the #resource_server{} record we build):
+%%   * rabbit_oauth2_resource_server:new_resource_server/1  -- record constructor
+%%   * rabbit_auth_backend_oauth2:normalize_token_scope/2   -- alias / additional-
+%%       scopes-key / prefix-filter expansion (the IAM `scope_aliases' path)
+%%   * rabbit_auth_backend_oauth2:get_expanded_scopes/3     -- {vhost} placeholder
+%%       expansion
+%%   * rabbit_oauth2_scope:{vhost,resource,topic}_access/*  -- the final match
+%%
+%% R3 (zero side effects): every function above is side-effect-free; the config
+%% comes from the record argument, so this reads nothing from broker state and
+%% mutates nothing. We construct the #resource_server{} from CUSTOMER-SUPPLIED
+%% fields, so we are validating the customer's config, not the broker's live one.
+%% (Verified: no ETS / mnesia / persistent_term / application:get_env on this
+%% call path -- the only side effect reachable is rabbit_oauth2_scope's own
+%% ?LOG_WARNING on a rejected/invalid pattern, which carries no token or claim
+%% content. The impure resource-server *resolution* functions that DO read
+%% app-env are bypassed by constructing the record via new_resource_server/1.)
+%%
+%% scope_pattern_syntax: both `wildcard' (the default, used by IAM and the
+%% documented OAuth recipe) and `regex' are accepted. The regex path carries NO
+%% new ReDoS surface: rabbit_oauth2_scope runs the SAME bounded matcher the live
+%% broker runs on every OAuth-authenticated connection -- a 2048-byte pattern
+%% cap, a rejected-construct denylist (inline modifiers / callouts / comments /
+%% control verbs), and hard PCRE bounds (match_limit=10000,
+%% match_limit_recursion=1000) that cap backtracking regardless of pattern. A
+%% crafted pattern cannot exceed what the broker already permits at auth time,
+%% and the concurrency semaphore bounds how many run at once. Allowing regex
+%% keeps validation parity with a broker configured for regex scopes.
+-module(aws_auth_validate_oauth_authz).
+
+-export([maybe_check/2, available/0]).
+
+%% We build the broker's #resource_server{} record, so we include its header.
+%% This is a COMPILE-TIME header include (a record shape), not a code/DEPS
+%% dependency: if upstream changes the record, this fails loudly at build time
+%% rather than drifting silently at runtime. #resource{} is from rabbit_common,
+%% already a real dependency of this plugin.
+-include_lib("rabbitmq_auth_backend_oauth2/include/oauth2.hrl").
+-include_lib("rabbit_common/include/resource.hrl").
+
+-define(OAUTH2_MOD, rabbit_auth_backend_oauth2).
+-define(SCOPE_MOD, rabbit_oauth2_scope).
+-define(RS_MOD, rabbit_oauth2_resource_server).
+
+%% Fixed reasons. NOTE on granularity vs R4: R4's fixed-category rule guards
+%% against leaking BROKER INFRASTRUCTURE or an SSRF target (hostnames, IPs, raw
+%% network/LDAP errors) that an attacker does not already know. The authz
+%% failure reasons below are categorically different: they describe only the
+%% CALLER'S OWN token and the CALLER'S OWN supplied authorization config (both
+%% arrived in this same request), never broker infra or a network target -- the
+%% same basis on which token_expired/token_invalid were already split out. So we
+%% keep a single error CATEGORY (authz_unverified) for the audit-log/response
+%% contract but differentiate the human-readable message, which is what actually
+%% lets a customer self-diagnose the "my token is broken (it isn't)" case. The
+%% messages carry NO scope values or claim content -- they name the failing
+%% STAGE, not the data -- so no token material is echoed, and (per the design
+%% decision) the message is not audit-logged regardless.
+-define(REASON_AUTHZ_UNAVAILABLE, <<
+    "authorization evaluation requires the rabbitmq_auth_backend_oauth2 plugin "
+    "to be loaded on this broker; it is not"
+>>).
+%% Authentic token, but nothing survived scope_prefix / resource_server_id
+%% filtering -- the #1 cause of a spurious "my token is broken" ticket (a
+%% scope_prefix or scope_aliases typo). Naming this stage points the customer
+%% straight at their prefix/alias config.
+-define(REASON_AUTHZ_NO_EFFECTIVE_SCOPES, <<
+    "the access_token carries no scopes for this resource_server after "
+    "scope_prefix / resource_server_id filtering; check scope_prefix, "
+    "resource_server_id, additional_scopes_key, and scope_aliases"
+>>).
+%% Token has effective scopes, but none grant the requested permission on the
+%% requested resource -- the genuine authorization mismatch.
+-define(REASON_AUTHZ_NO_MATCH, <<
+    "the access_token has scopes for this resource_server, but none grant the "
+    "requested permission on the requested vhost/resource"
+>>).
+%% normalize_token_scope/2's only explicit error: the token exceeded the
+%% broker's maximum scope count. Previously swallowed as a generic denial, which
+%% wrongly told the customer to fix their permission mapping.
+-define(REASON_AUTHZ_TOO_MANY_SCOPES, <<
+    "the access_token carries more scopes than the broker will process "
+    "(auth_oauth2 maximum); the live broker would also reject it"
+>>).
+%% Catch-all for any future normalize_token_scope/2 error we do not yet model,
+%% so an upstream change cannot crash or be misclassified.
+-define(REASON_AUTHZ_UNPROCESSABLE, <<
+    "the access_token's scopes could not be processed under the supplied "
+    "authorization config"
+>>).
+-define(REASON_AUTHZ_BAD_INPUT, <<
+    "authz_check must be an object with permission and resource fields"
+>>).
+
+%% True when the broker has the oauth2 decision functions available on the code
+%% path. Used both to gate the request and (in aws_auth_validate_oauth) to decide
+%% whether to offer authz mode at all.
+%%
+%% We use code:ensure_loaded/1 rather than a bare erlang:function_exported/3:
+%% the latter returns false for a module whose beam is on the path but has not
+%% yet been loaded into the VM, which would make availability depend on load
+%% order (a request could see the oauth2 backend as "absent" simply because
+%% nothing had called it yet this boot). ensure_loaded triggers the load if the
+%% beam is present, so this reflects "is the backend installed" -- the property
+%% we actually want -- and stays false only when the backend genuinely is not
+%% deployed on this broker.
+-spec available() -> boolean().
+available() ->
+    module_ready(?SCOPE_MOD) andalso
+        module_ready(?OAUTH2_MOD) andalso
+        module_ready(?RS_MOD) andalso
+        erlang:function_exported(?SCOPE_MOD, resource_access, 4) andalso
+        erlang:function_exported(?OAUTH2_MOD, get_expanded_scopes, 3) andalso
+        erlang:function_exported(?OAUTH2_MOD, normalize_token_scope, 2) andalso
+        erlang:function_exported(?RS_MOD, new_resource_server, 1).
+
+module_ready(Mod) ->
+    case code:ensure_loaded(Mod) of
+        {module, Mod} -> true;
+        _ -> false
+    end.
+
+%% Optional layer: when the request carried an `authz_check' block, evaluate it
+%% against the verified token's claims. Params is the parsed request accumulator
+%% from aws_auth_validate_oauth; Claims is the decoded, already-signature-and-
+%% expiry-verified JWT claims map.
+%%
+%%   * no authz_check supplied            -> ok (layer is a no-op)
+%%   * authz_check supplied, oauth2 absent -> {error, config_conflict, ...}
+%%   * granted                            -> ok
+%%   * denied / unprocessable             -> {error, authz_unverified, Msg}
+%%       where Msg distinguishes: no effective scopes after prefix/alias
+%%       filtering, scopes present but none match, or too-many-scopes. The
+%%       CATEGORY stays authz_unverified in every failing case; only the message
+%%       differs (see the reason macros above for the R4 rationale).
+-spec maybe_check(map(), map()) -> aws_auth_validate_backend:result().
+maybe_check(#{authz_check := none}, _Claims) ->
+    ok;
+maybe_check(#{authz_check := Check} = Params, Claims) when is_map(Check) ->
+    case available() of
+        false ->
+            {error, config_conflict, ?REASON_AUTHZ_UNAVAILABLE};
+        true ->
+            evaluate(Params, Check, Claims)
+    end;
+maybe_check(_Params, _Claims) ->
+    %% No authz_check slot at all (older parse path) -> no-op.
+    ok.
+
+%%--------------------------------------------------------------------
+%% Evaluation (runs only when oauth2 is loaded)
+%%--------------------------------------------------------------------
+
+evaluate(Params, Check, Claims) ->
+    %% Build the broker's #resource_server{} from CUSTOMER-SUPPLIED config so the
+    %% alias / additional-scopes-key / prefix logic matches what their broker
+    %% would do. new_resource_server/1 seeds the defaults; we overlay the
+    %% supplied fields.
+    ResourceServerId = maps:get(resource_server_id, Params, <<"rabbitmq">>),
+    RS0 = ?RS_MOD:new_resource_server(ResourceServerId),
+    RS = RS0#resource_server{
+        scope_aliases = maps:get(scope_aliases, Params, undefined),
+        additional_scopes_key = maps:get(additional_scopes_key, Params, undefined),
+        scope_prefix = maps:get(scope_prefix, Params, RS0#resource_server.scope_prefix),
+        scope_pattern_syntax = maps:get(scope_pattern_syntax, Params, wildcard)
+    },
+    Syntax = RS#resource_server.scope_pattern_syntax,
+    VHost = maps:get(vhost, Check, <<"/">>),
+    Name = maps:get(resource, Check, undefined),
+    Permission = maps:get(permission, Check, undefined),
+    case {Name, Permission} of
+        {N, P} when is_binary(N), is_binary(P) ->
+            %% 1. normalize_token_scope applies aliases + additional_scopes_key +
+            %%    prefix filter (the IAM `scope_aliases' expansion), storing the
+            %%    result in the token's `scope' field. Its errors are no longer
+            %%    swallowed as a generic denial (which wrongly implied a
+            %%    permission-mapping problem): they are mapped to their own
+            %%    message so the customer sees the real cause.
+            case ?OAUTH2_MOD:normalize_token_scope(RS, Claims) of
+                {ok, Normalized} ->
+                    Resource = #resource{
+                        virtual_host = VHost,
+                        kind = queue,
+                        name = Name
+                    },
+                    %% 2. expand {vhost} etc. placeholders, then 3. match.
+                    Scopes = ?OAUTH2_MOD:get_expanded_scopes(Normalized, Resource, Syntax),
+                    decide(Scopes, Resource, to_permission_atom(P), Syntax);
+                {error, too_many_scopes} ->
+                    {error, authz_unverified, ?REASON_AUTHZ_TOO_MANY_SCOPES};
+                {error, _Other} ->
+                    %% Any future normalize error we do not yet model: fixed,
+                    %% generic message (never the raw reason) so an upstream
+                    %% change cannot crash or misclassify.
+                    {error, authz_unverified, ?REASON_AUTHZ_UNPROCESSABLE}
+            end;
+        _ ->
+            {error, input_invalid, ?REASON_AUTHZ_BAD_INPUT}
+    end.
+
+%% Distinguish "authentic token, but no scopes survived prefix/alias filtering"
+%% (the prefix/alias-typo footgun) from "has scopes, but none grant this
+%% permission" (a genuine mapping mismatch). Both stay in the authz_unverified
+%% category; only the message differs. No scope value is echoed -- the messages
+%% name the failing stage, not the data.
+decide([], _Resource, _PermAtom, _Syntax) ->
+    {error, authz_unverified, ?REASON_AUTHZ_NO_EFFECTIVE_SCOPES};
+decide(Scopes, Resource, PermAtom, Syntax) ->
+    case ?SCOPE_MOD:resource_access(Resource, PermAtom, Scopes, Syntax) of
+        true -> ok;
+        false -> {error, authz_unverified, ?REASON_AUTHZ_NO_MATCH}
+    end.
+
+%% Map the supplied permission string to the broker's permission atom. Only the
+%% three RabbitMQ permission verbs are accepted; anything else is bad input
+%% (caught by the caller's is_binary guard returning a non-matching atom is not
+%% possible, so we constrain here).
+to_permission_atom(<<"configure">>) -> configure;
+to_permission_atom(<<"write">>) -> write;
+to_permission_atom(<<"read">>) -> read;
+to_permission_atom(_) -> undefined.

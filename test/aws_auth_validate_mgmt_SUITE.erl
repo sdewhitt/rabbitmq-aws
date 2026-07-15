@@ -41,7 +41,9 @@
     success_returns_204/1,
     oauth_disabled_by_default_returns_404/1,
     oauth_success_returns_204/1,
-    oauth_response_no_secret/1
+    oauth_response_no_secret/1,
+    oauth_authz_grants_returns_204/1,
+    oauth_authz_denies_returns_422/1
 ]).
 
 %% Invoked on the broker node via rpc to hold a semaphore slot.
@@ -49,6 +51,17 @@
 
 %% Invoked on the broker node via rpc to stub/unstub the registry dispatch.
 -export([mock_dispatch_ok/0, mock_dispatch_raise/1, unmock_dispatch/0]).
+
+%% Invoked on the broker node via rpc for the authz-through-the-pipeline cases:
+%% probe for the oauth2 backend, mint a token + matching JWKS with jose, and
+%% stub ONLY the network seam (DNS resolve-and-pin + the JWKS httpc GET) so the
+%% REAL backend + registry run end-to-end through the Cowboy handler.
+-export([
+    oauth2_backend_available/0,
+    oauth_authz_mint/0,
+    mock_oauth_network/1,
+    unmock_oauth_network/0
+]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -100,11 +113,15 @@ groups() ->
             custom_tag_options_preflight_allowed
         ]},
         %% OAuth method tests: opt-in behaviour (disabled by default -> 404),
-        %% and success/no-secret when enabled with mocked dispatch.
+        %% success/no-secret when enabled with mocked dispatch, and the optional
+        %% authorization-evaluation layer driven end-to-end through the real
+        %% backend + registry (dispatch NOT mocked; only the JWKS network seam is).
         {oauth_method, [], [
             oauth_disabled_by_default_returns_404,
             oauth_success_returns_204,
-            oauth_response_no_secret
+            oauth_response_no_secret,
+            oauth_authz_grants_returns_204,
+            oauth_authz_denies_returns_422
         ]}
     ].
 
@@ -217,6 +234,40 @@ init_per_testcase(oauth_response_no_secret = TC, Config) ->
         Config, 0, ?MODULE, mock_dispatch_ok, []
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
+init_per_testcase(TC, Config) when
+    TC =:= oauth_authz_grants_returns_204; TC =:= oauth_authz_denies_returns_422
+->
+    %% These drive the REAL oauth backend + registry end-to-end through the
+    %% Cowboy handler (dispatch is NOT mocked), so we only stub the network seam
+    %% (DNS resolve-and-pin + the JWKS httpc GET). The optional authz layer runs
+    %% the broker's own scope-decision functions, so it needs
+    %% rabbitmq_auth_backend_oauth2 loadable on the broker; skip gracefully if it
+    %% is not (mirrors the eunit maybe_skip_authz and the LDAP suite's slapd skip).
+    case rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_available, []) of
+        true ->
+            rabbit_ct_broker_helpers:rpc(
+                Config,
+                0,
+                application,
+                set_env,
+                [aws, auth_validation_enabled_methods, [{<<"oauth">>, true}]]
+            ),
+            %% A signed RS256 token plus the authz config exceeds the group's
+            %% 1024-byte cap; give the body headroom for these two cases only.
+            rabbit_ct_broker_helpers:rpc(
+                Config, 0, application, set_env, [aws, auth_validation_max_body_size, 8192]
+            ),
+            {Token, JwksJson} = rabbit_ct_broker_helpers:rpc(
+                Config, 0, ?MODULE, oauth_authz_mint, []
+            ),
+            ok = rabbit_ct_broker_helpers:rpc(
+                Config, 0, ?MODULE, mock_oauth_network, [JwksJson]
+            ),
+            Config1 = rabbit_ct_helpers:set_config(Config, [{oauth_token, Token}]),
+            rabbit_ct_helpers:testcase_started(Config1, TC);
+        false ->
+            {skip, "rabbitmq_auth_backend_oauth2 is not loaded on the broker node"}
+    end;
 init_per_testcase(TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC).
 
@@ -256,6 +307,20 @@ end_per_testcase(oauth_response_no_secret = TC, Config) ->
     ),
     rabbit_ct_broker_helpers:rpc(
         Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
+    ),
+    rabbit_ct_helpers:testcase_finished(Config, TC);
+end_per_testcase(TC, Config) when
+    TC =:= oauth_authz_grants_returns_204; TC =:= oauth_authz_denies_returns_422
+->
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, unmock_oauth_network, []
+    ),
+    rabbit_ct_broker_helpers:rpc(
+        Config, 0, application, unset_env, [aws, auth_validation_enabled_methods]
+    ),
+    %% Restore the group's body-size cap so later cases are unaffected.
+    rabbit_ct_broker_helpers:rpc(
+        Config, 0, application, set_env, [aws, auth_validation_max_body_size, 1024]
     ),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(TC, Config) ->
@@ -502,6 +567,38 @@ oauth_response_no_secret(Config) ->
     {ok, {{_, _Code, _}, _, ResBody}} = put_request(Config, ?OAUTH_API, Body),
     ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Secret)).
 
+%% Optional authorization-evaluation layer, driven END-TO-END through the full
+%% Cowboy pipeline: auth gate -> body-size cap -> JSON decode -> semaphore ->
+%% registry field-filter -> REAL oauth backend -> token verification -> authz
+%% evaluation via the broker's own scope-decision functions. Unlike
+%% oauth_success_returns_204, dispatch is NOT mocked here; only the JWKS network
+%% seam (DNS resolve-and-pin + httpc GET) is stubbed, so the authz decision is
+%% genuinely computed. The minted token grants `read' on any vhost/resource.
+%%
+%% GRANT: request `read' -> the broker's resource_access says yes -> 204. This
+%% proves the authz_check field survives the registry allowlist filter and the
+%% grant path returns success through the handler (not just via dispatch/2).
+oauth_authz_grants_returns_204(Config) ->
+    Token = ?config(oauth_token, Config),
+    Body = oauth_authz_body(Token, <<"read">>),
+    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?OAUTH_API, Body),
+    ?assertEqual(204, Code),
+    ?assertEqual(<<>>, iolist_to_binary(ResBody)).
+
+%% DENY: the SAME verified token (grants `read' only), but request `configure'.
+%% The broker's scope match fails -> authz_unverified -> 422. Same token, only
+%% the requested permission differs, so a 422 here (vs 204 above) proves the
+%% authz config is genuinely consumed and not a no-op. The response carries the
+%% fixed category only; it must not leak the token.
+oauth_authz_denies_returns_422(Config) ->
+    Token = ?config(oauth_token, Config),
+    Body = oauth_authz_body(Token, <<"configure">>),
+    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?OAUTH_API, Body),
+    ?assertEqual(422, Code),
+    ?assertMatch(#{<<"error">> := <<"authz_unverified">>}, decode(ResBody)),
+    %% R6/R4: the caller's token must never appear in the response body.
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Token)).
+
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
@@ -528,6 +625,68 @@ mock_dispatch_raise(Secret) ->
 unmock_dispatch() ->
     catch meck:unload(aws_auth_validate_registry),
     ok.
+
+%% Runs ON THE BROKER NODE. True when the optional authz layer can run there --
+%% i.e. rabbitmq_auth_backend_oauth2's scope-decision functions are loadable.
+%% Delegates to the layer's own availability probe (code:ensure_loaded-backed),
+%% so this matches exactly what the request path checks at runtime.
+oauth2_backend_available() ->
+    aws_auth_validate_oauth_authz:available().
+
+%% Runs ON THE BROKER NODE. Mint a fresh RSA keypair with jose, sign an RS256
+%% token whose scope grants `read' on any vhost/resource (aud=rabbitmq so the
+%% backend's audience check passes), and return {Token, JwksJson} where JwksJson
+%% is the PUBLIC key as a one-key JWKS document the network stub will serve.
+%% Minting on the broker node guarantees the key that signs the token is the same
+%% one the backend fetches (no cross-node key/JWKS mismatch).
+oauth_authz_mint() ->
+    Priv = jose_jwk:generate_key({rsa, 2048}),
+    {_, PubMap0} = jose_jwk:to_public_map(Priv),
+    PubMap = PubMap0#{<<"kid">> => <<"k1">>},
+    Claims = #{
+        <<"sub">> => <<"alice">>,
+        <<"aud">> => <<"rabbitmq">>,
+        <<"exp">> => os:system_time(seconds) + 3600,
+        <<"scope">> => <<"rabbitmq.read:*/*">>
+    },
+    JWS = #{<<"alg">> => <<"RS256">>, <<"kid">> => <<"k1">>},
+    {_, Token} = jose_jws:compact(jose_jwt:sign(Priv, JWS, Claims)),
+    JwksJson = rabbit_json:encode(#{<<"keys">> => [PubMap]}),
+    {Token, JwksJson}.
+
+%% Runs ON THE BROKER NODE. Stub ONLY the network seam so the REAL backend +
+%% registry + authz layer run: (1) aws_auth_validate_net:resolve_and_pin/2 skips
+%% DNS and pins the JWKS host to itself, and (2) httpc:request/5 returns the
+%% supplied JWKS for the test IdP host, passing through anything else so the
+%% broker's own outbound calls are unaffected. Both mecks are passthrough.
+mock_oauth_network(JwksJson) ->
+    catch meck:unload(aws_auth_validate_net),
+    catch meck:unload(httpc),
+    ok = meck:new(aws_auth_validate_net, [passthrough, no_link]),
+    meck:expect(aws_auth_validate_net, resolve_and_pin, fun(#{host := Host} = Url, _Policy) ->
+        {ok, Url, Host}
+    end),
+    ok = meck:new(httpc, [passthrough, unstick, no_link]),
+    meck:expect(httpc, request, fun(Method, Req, HttpOpts, Opts, Profile) ->
+        Url = oauth_request_url(Req),
+        case string:find(Url, "idp.example.com") of
+            nomatch ->
+                meck:passthrough([Method, Req, HttpOpts, Opts, Profile]);
+            _ ->
+                {ok, {{"HTTP/1.1", 200, "OK"}, [], JwksJson}}
+        end
+    end),
+    ok.
+
+unmock_oauth_network() ->
+    catch meck:unload(httpc),
+    catch meck:unload(aws_auth_validate_net),
+    ok.
+
+%% Extract the URL string from an httpc Request tuple (GET or POST form). Runs on
+%% the broker node inside the httpc mock.
+oauth_request_url({Url, _Headers}) -> Url;
+oauth_request_url({Url, _Headers, _ContentType, _Body}) -> Url.
 
 setup_broker(Config0, ExtraEnv) ->
     Config1 = rabbit_ct_helpers:set_config(Config0, [
@@ -599,6 +758,23 @@ put_request(Config, Path, BodyMap) ->
 oauth_body() ->
     #{
         <<"jwks_uri">> => <<"https://idp.example.com/.well-known/jwks.json">>
+    }.
+
+%% An oauth validation body carrying a customer-supplied access_token plus an
+%% authz_check block. The scope config (resource_server_id + scope_prefix) mirrors
+%% the documented OAuth recipe; the minted token's scope is `rabbitmq.read:*/*'.
+%% Permission is parameterised so one helper drives both the grant (read) and the
+%% deny (configure) case against the same token.
+oauth_authz_body(Token, Permission) ->
+    (oauth_body())#{
+        <<"access_token">> => Token,
+        <<"resource_server_id">> => <<"rabbitmq">>,
+        <<"scope_prefix">> => <<"rabbitmq.">>,
+        <<"authz_check">> => #{
+            <<"vhost">> => <<"/">>,
+            <<"resource">> => <<"my-queue">>,
+            <<"permission">> => Permission
+        }
     }.
 
 decode(ResBody) ->
