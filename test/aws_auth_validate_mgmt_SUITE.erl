@@ -53,12 +53,12 @@
 -export([mock_dispatch_ok/0, mock_dispatch_raise/1, unmock_dispatch/0]).
 
 %% Invoked on the broker node via rpc for the authz-through-the-pipeline cases:
-%% probe for the oauth2 backend, mint a token + matching JWKS with jose, and
-%% stub ONLY the network seam (DNS resolve-and-pin + the JWKS httpc GET) so the
-%% REAL backend + registry run end-to-end through the Cowboy handler.
+%% probe for the oauth2 backend and stub ONLY the network seam (DNS
+%% resolve-and-pin + the JWKS httpc GET) so the REAL backend + registry run
+%% end-to-end through the Cowboy handler. Token + JWKS minting is done via the
+%% shared aws_auth_validate_oauth_test_helpers module (rpc'd directly).
 -export([
     oauth2_backend_available/0,
-    oauth_authz_mint/0,
     mock_oauth_network/1,
     unmock_oauth_network/0
 ]).
@@ -258,7 +258,7 @@ init_per_testcase(TC, Config) when
                 Config, 0, application, set_env, [aws, auth_validation_max_body_size, 8192]
             ),
             {Token, JwksJson} = rabbit_ct_broker_helpers:rpc(
-                Config, 0, ?MODULE, oauth_authz_mint, []
+                Config, 0, aws_auth_validate_oauth_test_helpers, oauth_authz_mint, []
             ),
             ok = rabbit_ct_broker_helpers:rpc(
                 Config, 0, ?MODULE, mock_oauth_network, [JwksJson]
@@ -633,27 +633,6 @@ unmock_dispatch() ->
 oauth2_backend_available() ->
     aws_auth_validate_oauth_authz:available().
 
-%% Runs ON THE BROKER NODE. Mint a fresh RSA keypair with jose, sign an RS256
-%% token whose scope grants `read' on any vhost/resource (aud=rabbitmq so the
-%% backend's audience check passes), and return {Token, JwksJson} where JwksJson
-%% is the PUBLIC key as a one-key JWKS document the network stub will serve.
-%% Minting on the broker node guarantees the key that signs the token is the same
-%% one the backend fetches (no cross-node key/JWKS mismatch).
-oauth_authz_mint() ->
-    Priv = jose_jwk:generate_key({rsa, 2048}),
-    {_, PubMap0} = jose_jwk:to_public_map(Priv),
-    PubMap = PubMap0#{<<"kid">> => <<"k1">>},
-    Claims = #{
-        <<"sub">> => <<"alice">>,
-        <<"aud">> => <<"rabbitmq">>,
-        <<"exp">> => os:system_time(seconds) + 3600,
-        <<"scope">> => <<"rabbitmq.read:*/*">>
-    },
-    JWS = #{<<"alg">> => <<"RS256">>, <<"kid">> => <<"k1">>},
-    {_, Token} = jose_jws:compact(jose_jwt:sign(Priv, JWS, Claims)),
-    JwksJson = rabbit_json:encode(#{<<"keys">> => [PubMap]}),
-    {Token, JwksJson}.
-
 %% Runs ON THE BROKER NODE. Stub ONLY the network seam so the REAL backend +
 %% registry + authz layer run: (1) aws_auth_validate_net:resolve_and_pin/2 skips
 %% DNS and pins the JWKS host to itself, and (2) httpc:request/5 returns the
@@ -668,7 +647,7 @@ mock_oauth_network(JwksJson) ->
     end),
     ok = meck:new(httpc, [passthrough, unstick, no_link]),
     meck:expect(httpc, request, fun(Method, Req, HttpOpts, Opts, Profile) ->
-        Url = oauth_request_url(Req),
+        Url = aws_auth_validate_oauth_test_helpers:request_url(Req),
         case string:find(Url, "idp.example.com") of
             nomatch ->
                 meck:passthrough([Method, Req, HttpOpts, Opts, Profile]);
@@ -682,11 +661,6 @@ unmock_oauth_network() ->
     catch meck:unload(httpc),
     catch meck:unload(aws_auth_validate_net),
     ok.
-
-%% Extract the URL string from an httpc Request tuple (GET or POST form). Runs on
-%% the broker node inside the httpc mock.
-oauth_request_url({Url, _Headers}) -> Url;
-oauth_request_url({Url, _Headers, _ContentType, _Body}) -> Url.
 
 setup_broker(Config0, ExtraEnv) ->
     Config1 = rabbit_ct_helpers:set_config(Config0, [

@@ -10,6 +10,10 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% Shared JWT-minting and httpc-request helpers (see the helper module). Imported
+%% so the existing rsa_signer/1 and request_url/1 call sites need no changes.
+-import(aws_auth_validate_oauth_test_helpers, [rsa_signer/1, request_url/1]).
+
 %%--------------------------------------------------------------------
 %% Method identity
 %%--------------------------------------------------------------------
@@ -1100,21 +1104,6 @@ compact_token(Header, Claims, SigBytes) ->
 
 b64url(Bin) -> base64:encode(Bin, #{mode => urlsafe, padding => false}).
 
-%% Generate a fresh RSA keypair via jose and return:
-%%   * jwk_pub -- the PUBLIC key as a JWKS-style map, tagged with Kid, and
-%%   * sign    -- a fun(ClaimsMap) -> compact RS256 JWT signed by the private key.
-%% Each call produces a DISTINCT key, so "wrong key" tests just call it twice.
-rsa_signer(Kid) ->
-    Priv = jose_jwk:generate_key({rsa, 2048}),
-    {_, PubMap0} = jose_jwk:to_public_map(Priv),
-    PubMap = PubMap0#{<<"kid">> => Kid},
-    Sign = fun(Claims) ->
-        JWS = #{<<"alg">> => <<"RS256">>, <<"kid">> => Kid},
-        {_, Token} = jose_jws:compact(jose_jwt:sign(Priv, JWS, Claims)),
-        Token
-    end,
-    #{jwk_pub => PubMap, sign => Sign}.
-
 %% A minimal body with only issuer (triggers OIDC discovery).
 issuer_body() ->
     #{<<"issuer">> => <<"https://idp.example.com">>}.
@@ -1173,7 +1162,3 @@ mock_arn_resolve_noop() ->
     %% override resolve_arn. Kept as a helper so the pure-phase tests read clearly.
     meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, <<"noop">>, State} end),
     ok.
-
-%% Extract the URL string from an httpc Request tuple (GET or POST form).
-request_url({Url, _Headers}) -> Url;
-request_url({Url, _Headers, _ContentType, _Body}) -> Url.
