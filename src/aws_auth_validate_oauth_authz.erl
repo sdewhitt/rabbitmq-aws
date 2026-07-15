@@ -298,14 +298,15 @@ decide(Scopes, Resource, PermAtom, Syntax) ->
         false -> {error, authz_unverified, ?REASON_AUTHZ_NO_MATCH}
     end.
 
-%% Map the supplied permission string to the broker's permission atom. Only the
-%% three RabbitMQ permission verbs are accepted; anything else is bad input
-%% (caught by the caller's is_binary guard returning a non-matching atom is not
-%% possible, so we constrain here).
+%% Map the supplied permission string to the broker's permission atom. The
+%% permission is already allowlisted to exactly these three verbs in the pure
+%% phase (aws_auth_validate_oauth:parse_authz_check/3), so this clause set is
+%% total over every value that can reach it. It has no catch-all: an unexpected
+%% value must fail loudly here rather than be silently mapped to a non-matching
+%% atom that resource_access/4 would report as a spurious "none grant".
 to_permission_atom(<<"configure">>) -> configure;
 to_permission_atom(<<"write">>) -> write;
-to_permission_atom(<<"read">>) -> read;
-to_permission_atom(_) -> undefined.
+to_permission_atom(<<"read">>) -> read.
 
 -else.
 
