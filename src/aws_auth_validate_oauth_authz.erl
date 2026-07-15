@@ -61,13 +61,28 @@
 
 -export([maybe_check/2, available/0]).
 
-%% We build the broker's #resource_server{} record, so we include its header.
-%% This is a COMPILE-TIME header include (a record shape), not a code/DEPS
-%% dependency: if upstream changes the record, this fails loudly at build time
-%% rather than drifting silently at runtime. #resource{} is from rabbit_common,
-%% already a real dependency of this plugin.
--include_lib("rabbitmq_auth_backend_oauth2/include/oauth2.hrl").
+%% The evaluation path builds the broker's #resource_server{} record, so it needs
+%% that record's shape (from oauth2.hrl). But rabbitmq_auth_backend_oauth2 is a
+%% RUNTIME soft dependency, not a build DEPS: the plugin is compiled against a
+%% range of broker series, and the oauth2 backend's shape is NOT stable across
+%% them -- older series (e.g. 3.13.x) ship no oauth2.hrl at all, and newer ones
+%% add record fields (scope_pattern_syntax). Hard-including the header would make
+%% the whole plugin fail to COMPILE on any series that lacks it, defeating the
+%% soft-dependency design (the feature is meant to be merely UNAVAILABLE there,
+%% via available/0, not a build break).
+%%
+%% So the header include and the record-using evaluation code are guarded by
+%% -ifdef(HAVE_OAUTH2_RESOURCE_SERVER), a macro the Makefile defines only when
+%% $(DEPS_DIR)/rabbitmq_auth_backend_oauth2/include/oauth2.hrl actually exists at
+%% build time. When it is absent, the module still compiles; available/0 returns
+%% false and maybe_check/2 reports config_conflict (authz unavailable). When it
+%% is present, the record-typed evaluator is compiled in. We do NOT reference
+%% fields that vary across supported series (scope_pattern_syntax): the syntax is
+%% threaded as a plain argument to the scope functions instead (see evaluate/3).
 -include_lib("rabbit_common/include/resource.hrl").
+-ifdef(HAVE_OAUTH2_RESOURCE_SERVER).
+-include_lib("rabbitmq_auth_backend_oauth2/include/oauth2.hrl").
+-endif.
 
 -define(OAUTH2_MOD, rabbit_auth_backend_oauth2).
 -define(SCOPE_MOD, rabbit_oauth2_scope).
@@ -135,6 +150,7 @@
 %% we actually want -- and stays false only when the backend genuinely is not
 %% deployed on this broker.
 -spec available() -> boolean().
+-ifdef(HAVE_OAUTH2_RESOURCE_SERVER).
 available() ->
     module_ready(?SCOPE_MOD) andalso
         module_ready(?OAUTH2_MOD) andalso
@@ -149,6 +165,12 @@ module_ready(Mod) ->
         {module, Mod} -> true;
         _ -> false
     end.
+-else.
+%% Built against a broker series with no oauth2 resource_server record: the
+%% evaluator cannot be compiled in, so authz is unconditionally unavailable.
+available() ->
+    false.
+-endif.
 
 %% Optional layer: when the request carried an `authz_check' block, evaluate it
 %% against the verified token's claims. Params is the parsed request accumulator
@@ -167,19 +189,25 @@ module_ready(Mod) ->
 maybe_check(#{authz_check := none}, _Claims) ->
     ok;
 maybe_check(#{authz_check := Check} = Params, Claims) when is_map(Check) ->
-    case available() of
-        false ->
-            {error, config_conflict, ?REASON_AUTHZ_UNAVAILABLE};
-        true ->
-            evaluate(Params, Check, Claims)
-    end;
+    maybe_check_available(Params, Check, Claims);
 maybe_check(_Params, _Claims) ->
     %% No authz_check slot at all (older parse path) -> no-op.
     ok.
 
 %%--------------------------------------------------------------------
-%% Evaluation (runs only when oauth2 is loaded)
+%% Evaluation (compiled in only when the oauth2 resource_server record is
+%% available at build time; see HAVE_OAUTH2_RESOURCE_SERVER at the top).
 %%--------------------------------------------------------------------
+
+-ifdef(HAVE_OAUTH2_RESOURCE_SERVER).
+
+maybe_check_available(Params, Check, Claims) ->
+    case available() of
+        false ->
+            {error, config_conflict, ?REASON_AUTHZ_UNAVAILABLE};
+        true ->
+            evaluate(Params, Check, Claims)
+    end.
 
 evaluate(Params, Check, Claims) ->
     %% Build the broker's #resource_server{} from CUSTOMER-SUPPLIED config so the
@@ -188,13 +216,23 @@ evaluate(Params, Check, Claims) ->
     %% supplied fields.
     ResourceServerId = maps:get(resource_server_id, Params, <<"rabbitmq">>),
     RS0 = ?RS_MOD:new_resource_server(ResourceServerId),
+    %% Only overlay fields that exist in the #resource_server{} record across all
+    %% supported broker series. `scope_pattern_syntax' is deliberately NOT set on
+    %% the record: it is absent from older oauth2 backends' record definition, so
+    %% a compile-time field reference here would fail to build against those
+    %% series (this module is compiled against whatever oauth2.hrl the broker
+    %% ships). It is not needed on the record anyway -- normalize_token_scope/2
+    %% does not read it (the scope_prefix filter is a literal prefix match, not a
+    %% pattern), and the ONLY consumers of the syntax (get_expanded_scopes/3 and
+    %% rabbit_oauth2_scope:resource_access/4) take it as an explicit argument,
+    %% which we thread through as `Syntax' below. So regex parity is preserved on
+    %% brokers that support it without a record-shape dependency.
     RS = RS0#resource_server{
         scope_aliases = maps:get(scope_aliases, Params, undefined),
         additional_scopes_key = maps:get(additional_scopes_key, Params, undefined),
-        scope_prefix = maps:get(scope_prefix, Params, RS0#resource_server.scope_prefix),
-        scope_pattern_syntax = maps:get(scope_pattern_syntax, Params, wildcard)
+        scope_prefix = maps:get(scope_prefix, Params, RS0#resource_server.scope_prefix)
     },
-    Syntax = RS#resource_server.scope_pattern_syntax,
+    Syntax = maps:get(scope_pattern_syntax, Params, wildcard),
     VHost = maps:get(vhost, Check, <<"/">>),
     Name = maps:get(resource, Check, undefined),
     Permission = maps:get(permission, Check, undefined),
@@ -249,3 +287,13 @@ to_permission_atom(<<"configure">>) -> configure;
 to_permission_atom(<<"write">>) -> write;
 to_permission_atom(<<"read">>) -> read;
 to_permission_atom(_) -> undefined.
+
+-else.
+
+%% No oauth2 resource_server record at build time: authz cannot be evaluated, so
+%% a supplied authz_check is a config conflict (the feature is unavailable on
+%% this broker series). available/0 already returns false in this branch.
+maybe_check_available(_Params, _Check, _Claims) ->
+    {error, config_conflict, ?REASON_AUTHZ_UNAVAILABLE}.
+
+-endif.
