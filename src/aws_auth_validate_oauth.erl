@@ -202,6 +202,14 @@
 -define(REASON_AUTHZ_NEEDS_TOKEN, <<
     "authz_check requires an access_token to evaluate"
 >>).
+%% authz evaluation builds the broker's #resource_server{} from resource_server_id
+%% (it seeds the default scope_prefix and the record id). Without it the record
+%% cannot be constructed, so we require it explicitly here in the pure phase
+%% rather than defaulting silently -- a missing resource_server_id is the
+%% operator's config to supply, and guessing one would break decision parity.
+-define(REASON_AUTHZ_NEEDS_RESOURCE_SERVER_ID, <<
+    "authz_check requires resource_server_id to be set"
+>>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_NO_ASSUME_ROLE, <<
     "auth validation requires an assume_role to be configured; "
@@ -530,7 +538,19 @@ parse_authz_config(Body, Acc) ->
                 none ->
                     {error, input_invalid, ?REASON_AUTHZ_NEEDS_TOKEN};
                 _ ->
-                    parse_authz_check(Body, Check, Acc)
+                    %% authz evaluation needs resource_server_id to construct the
+                    %% broker's #resource_server{} (it seeds the record id and the
+                    %% default scope_prefix). parse_resource_server_id always seats
+                    %% the slot -- present-and-binary or undefined -- so an absent
+                    %% id surfaces here as undefined. Reject it in the pure phase
+                    %% rather than letting new_resource_server(undefined) crash and
+                    %% be misreported as a connection failure by the network catch.
+                    case maps:get(resource_server_id, Acc, undefined) of
+                        undefined ->
+                            {error, input_invalid, ?REASON_AUTHZ_NEEDS_RESOURCE_SERVER_ID};
+                        _ ->
+                            parse_authz_check(Body, Check, Acc)
+                    end
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_AUTHZ_CHECK}

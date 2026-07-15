@@ -25,8 +25,20 @@
 %%     unavailable and we say so with a fixed category -- we never fall back to a
 %%     home-grown scope matcher (that would reintroduce the drift risk this
 %%     approach exists to avoid).
-%%   * Because we EXECUTE the broker's own code rather than mirror it, there is
-%%     nothing to keep in sync: drift is impossible by construction.
+%%   * Because we EXECUTE the broker's own SCOPE-MATCHING code rather than mirror
+%%     it, the matching logic itself cannot drift. The parity guarantee is scoped
+%%     to that: it covers the fields we overlay onto the #resource_server{} record
+%%     below -- scope_prefix, scope_aliases, additional_scopes_key -- plus the
+%%     scope_pattern_syntax we thread through. It does NOT cover
+%%     resource-server config the broker also consumes but that this endpoint does
+%%     not model: resource_server_type (the rich-authorization-request path in
+%%     normalize_token_scope), extra_scopes_source, preferred_username_claims, and
+%%     per-`resource_servers' map entries. Those stay at new_resource_server/1
+%%     defaults here. For an operator relying on them, this endpoint can under-
+%%     report effective scopes and thus FAIL an authz_check the live broker would
+%%     grant (the safe direction -- it never over-grants -- but still a parity gap
+%%     to document, not a "drift is impossible" claim). Extending the overlay to
+%%     those fields is a documented follow-up.
 %%
 %% The broker functions used (all verified pure -- no app-env / ETS / mnesia on
 %% this path; they read all config from the #resource_server{} record we build):
@@ -214,7 +226,14 @@ evaluate(Params, Check, Claims) ->
     %% alias / additional-scopes-key / prefix logic matches what their broker
     %% would do. new_resource_server/1 seeds the defaults; we overlay the
     %% supplied fields.
-    ResourceServerId = maps:get(resource_server_id, Params, <<"rabbitmq">>),
+    %% resource_server_id is guaranteed present and a non-empty binary here:
+    %% aws_auth_validate_oauth:parse_authz_config rejects an authz_check request
+    %% that lacks it (input_invalid) in the pure phase, so this layer never
+    %% builds new_resource_server(undefined) (which would crash on the
+    %% iolist_to_binary([undefined, <<".">>]) scope_prefix seed and be misreported
+    %% as a connection failure). We read it with no default so a future caller that
+    %% breaks that invariant fails loudly rather than silently guessing an id.
+    ResourceServerId = maps:get(resource_server_id, Params),
     RS0 = ?RS_MOD:new_resource_server(ResourceServerId),
     %% Only overlay fields that exist in the #resource_server{} record across all
     %% supported broker series. `scope_pattern_syntax' is deliberately NOT set on

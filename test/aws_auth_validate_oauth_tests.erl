@@ -1011,6 +1011,23 @@ authz_check_without_token_rejected_test() ->
     },
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
 
+%% authz_check without a resource_server_id is rejected in the pure phase.
+%% The evaluator builds the broker's #resource_server{} from resource_server_id
+%% (it seeds the record id and default scope_prefix); without it,
+%% new_resource_server(undefined) would crash on iolist_to_binary([undefined,
+%% <<".">>]) and be misreported by the network catch as connection_failed. The
+%% pure-phase guard turns that into a clean input_invalid before any JWKS fetch.
+authz_check_without_resource_server_id_rejected_test() ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    Body = (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"authz_check">> => #{
+            <<"resource">> => <<"q">>, <<"permission">> => <<"read">>
+        }
+    },
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
 %% A malformed authz_check (bad permission verb) is rejected in the pure phase.
 authz_check_bad_permission_rejected_test() ->
     #{sign := Sign} = rsa_signer(<<"k1">>),
