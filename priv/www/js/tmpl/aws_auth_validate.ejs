@@ -3,6 +3,25 @@ Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
 
+<style type="text/css">
+/* Widen the text inputs in the left-hand field boxes so long placeholder
+   examples and values (DNs, ARNs, URLs) are not truncated. Scoped to this
+   view's field containers so the rest of the console is unaffected. Checkboxes
+   and the number input keep their natural size. */
+#aws-av-fields-ldap input[type=text],
+#aws-av-fields-http input[type=text],
+#aws-av-fields-oauth input[type=text],
+#aws-av-fields-tls input[type=text],
+#aws-auth-validate-form div.section-hidden input[type=text] {
+  width: 320px;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+/* Keep the field-title column on a single line (don't let the wider inputs
+   squeeze the labels into wrapping). */
+#aws-auth-validate-form table.form th { white-space: nowrap; }
+</style>
+
 <h1>Auth Validation</h1>
 <p class="description">
   Validate an authentication-backend configuration (LDAP, HTTP, OAuth2, or TLS)
@@ -34,6 +53,12 @@ SPDX-License-Identifier: Apache-2.0
 
   <form id="aws-auth-validate-form">
 
+  <!-- Two columns: individual field boxes on the left, the equivalent
+       rabbitmq.conf on the right. Wraps to stacked on narrow viewports. -->
+  <div style="display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap;">
+
+  <div style="flex:1 1 360px; min-width:300px;">
+
     <!-- ldap -->
     <div id="aws-av-fields-ldap" class="aws-av-method-fields">
       <table class="form">
@@ -46,6 +71,10 @@ SPDX-License-Identifier: Apache-2.0
           <td><input type="text" data-av-field="user_dn" placeholder="cn=admin,dc=example,dc=com" /></td></tr>
         <tr><th><label>Password ARN:</label></th>
           <td><input type="text" data-av-field="password_arn" placeholder="arn:aws:secretsmanager:..." /></td></tr>
+        <tr><th><label>DN lookup base:</label></th>
+          <td><input type="text" data-av-field="dn_lookup_base" placeholder="dc=example,dc=com" /></td></tr>
+        <tr><th><label>DN lookup attribute:</label></th>
+          <td><input type="text" data-av-field="dn_lookup_attribute" placeholder="sAMAccountName" /></td></tr>
         <tr><th><label>Use SSL (LDAPS):</label></th>
           <td><input type="checkbox" data-av-field="use_ssl" /></td></tr>
         <tr><th><label>Use StartTLS:</label></th>
@@ -117,6 +146,28 @@ SPDX-License-Identifier: Apache-2.0
       </p>
     </div>
 
+  </div><!-- /left column (individual fields) -->
+
+  <!-- Right column: the equivalent rabbitmq.conf. -->
+  <div class="section-hidden" style="flex:1 1 360px; min-width:300px; margin-top:0;">
+    <h3>rabbitmq.conf</h3>
+    <p class="argument">
+      Paste your rabbitmq.conf here:
+    </p>
+    <textarea id="aws-auth-validate-config" rows="18"
+              spellcheck="false" autocomplete="off" autocapitalize="off"
+              style="width:100%; font-family:monospace; box-sizing:border-box;"
+              placeholder="auth_backends.1 = ldap&#10;auth_ldap.servers.1 = ldap.example.com&#10;auth_ldap.port = 636&#10;auth_ldap.use_ssl = true&#10;auth_ldap.dn_lookup_bind.user_dn = cn=admin,dc=example,dc=com&#10;auth_ldap.ssl_options.verify = verify_peer&#10;aws.arns.auth_ldap.dn_lookup_bind.password = arn:aws:secretsmanager:..."></textarea>
+    <div style="margin-top:6px;">
+      <button type="button" id="aws-auth-validate-parse">Parse into fields</button>
+      <button type="button" id="aws-auth-validate-build">Update config from fields</button>
+      <button type="button" id="aws-auth-validate-copy">Copy config</button>
+      <span id="aws-auth-validate-copy-status" class="argument"></span>
+    </div>
+  </div><!-- /right column (rabbitmq.conf) -->
+
+  </div><!-- /two-column row -->
+
     <div style="margin-top:10px;">
       <input type="submit" id="aws-auth-validate-submit" value="Validate" />
     </div>
@@ -129,3 +180,10 @@ SPDX-License-Identifier: Apache-2.0
     <p class="argument">Submit a request to see the categorized result here.</p>
   </div>
 </div>
+
+<script type="text/javascript">
+// Runs after the management console injects this template (jQuery .html()
+// executes inline scripts). Primes the preview with the full field template for
+// the initially-selected method. Defined in aws_auth_validate.js.
+if (typeof aws_auth_validate_on_render === 'function') { aws_auth_validate_on_render(); }
+</script>
