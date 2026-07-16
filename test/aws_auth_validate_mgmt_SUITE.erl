@@ -59,6 +59,7 @@
 %% shared aws_auth_validate_oauth_test_helpers module (rpc'd directly).
 -export([
     oauth2_backend_available/0,
+    oauth2_backend_loaded/0,
     mock_oauth_network/1,
     unmock_oauth_network/0
 ]).
@@ -244,6 +245,23 @@ init_per_testcase(TC, Config) when
     %% rabbitmq_auth_backend_oauth2 loadable on the broker; skip gracefully if it
     %% is not (mirrors the eunit maybe_skip_authz and the LDAP suite's slapd skip).
     case rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_available, []) of
+        false ->
+            %% available/0 is false. Distinguish the two reasons (Luke's blocking
+            %% coverage-gap note): if the oauth2 backend is not loaded at all,
+            %% skip legitimately (mirrors the LDAP suite's slapd skip); but if it
+            %% IS loaded and merely lacks the arity-4 scope API, that is the
+            %% build-guard portability bug and must FAIL rather than skip green.
+            case rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_loaded, []) of
+                false ->
+                    {skip, "rabbitmq_auth_backend_oauth2 is not loaded on the broker node"};
+                true ->
+                    ct:fail(
+                        "rabbitmq_auth_backend_oauth2 is loaded on the broker node but "
+                        "aws_auth_validate_oauth_authz:available/0 is false: the backend "
+                        "does not export the arity-4 scope API this layer requires. The "
+                        "build guard admitted an unsupported broker series."
+                    )
+            end;
         true ->
             rabbit_ct_broker_helpers:rpc(
                 Config,
@@ -264,9 +282,7 @@ init_per_testcase(TC, Config) when
                 Config, 0, ?MODULE, mock_oauth_network, [JwksJson]
             ),
             Config1 = rabbit_ct_helpers:set_config(Config, [{oauth_token, Token}]),
-            rabbit_ct_helpers:testcase_started(Config1, TC);
-        false ->
-            {skip, "rabbitmq_auth_backend_oauth2 is not loaded on the broker node"}
+            rabbit_ct_helpers:testcase_started(Config1, TC)
     end;
 init_per_testcase(TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC).
@@ -632,6 +648,13 @@ unmock_dispatch() ->
 %% so this matches exactly what the request path checks at runtime.
 oauth2_backend_available() ->
     aws_auth_validate_oauth_authz:available().
+
+%% Runs ON THE BROKER NODE. True when rabbitmq_auth_backend_oauth2 is loaded at
+%% all, regardless of whether it exposes the arity-4 scope API. Lets
+%% init_per_testcase tell "backend genuinely absent" (legitimate skip) from
+%% "backend present but too old" (hard failure) -- see Luke's coverage-gap note.
+oauth2_backend_loaded() ->
+    aws_auth_validate_oauth_authz:backend_loaded().
 
 %% Runs ON THE BROKER NODE. Stub ONLY the network seam so the REAL backend +
 %% registry + authz layer run: (1) aws_auth_validate_net:resolve_and_pin/2 skips

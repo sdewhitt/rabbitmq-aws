@@ -20,16 +20,18 @@ DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 include ../../rabbitmq-components.mk
 include ../../erlang.mk
 
-# The optional OAuth authz-evaluation layer (aws_auth_validate_oauth_authz)
-# builds the broker's #resource_server{} record and so needs oauth2.hrl at
-# compile time. rabbitmq_auth_backend_oauth2 is a RUNTIME soft dependency, and
-# its header is absent on older broker series (e.g. 3.13.x). Define
-# HAVE_OAUTH2_RESOURCE_SERVER only when the header actually exists in the
-# resolved deps dir, so the plugin still compiles where it does not (the authz
-# layer is then merely unavailable at runtime via available/0). This must come
-# after erlang.mk so DEPS_DIR and ERLC_OPTS are set.
+# Gate the optional OAuth authz layer on the arity-4 scope API it needs, not
+# just oauth2.hrl existing: the header predates resource_access/4 and the
+# scope_pattern_syntax field (both landed in the v4.2.0-beta series -- the
+# supported-series floor), so a header-only guard would build against a missing
+# function. scope_pattern_syntax in the resolved header is the sentinel for that
+# API. When absent, the module still compiles (-else branch), available/0
+# returns false, and authz_check reports config_conflict. Must follow erlang.mk
+# so DEPS_DIR and ERLC_OPTS are set.
 OAUTH2_HRL = $(DEPS_DIR)/rabbitmq_auth_backend_oauth2/include/oauth2.hrl
 ifneq ($(wildcard $(OAUTH2_HRL)),)
+ifneq ($(shell grep -l scope_pattern_syntax $(OAUTH2_HRL) 2>/dev/null),)
 ERLC_OPTS += -DHAVE_OAUTH2_RESOURCE_SERVER=1
 TEST_ERLC_OPTS += -DHAVE_OAUTH2_RESOURCE_SERVER=1
+endif
 endif

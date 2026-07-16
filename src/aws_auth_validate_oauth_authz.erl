@@ -71,7 +71,10 @@
 %% keeps validation parity with a broker configured for regex scopes.
 -module(aws_auth_validate_oauth_authz).
 
--export([maybe_check/2, available/0]).
+-export([maybe_check/2, available/0, backend_loaded/0]).
+
+%% persistent_term key caching a positive availability result (see available/0).
+-define(AVAIL_CACHE_KEY, {?MODULE, available}).
 
 %% The evaluation path builds the broker's #resource_server{} record, so it needs
 %% that record's shape (from oauth2.hrl). But rabbitmq_auth_backend_oauth2 is a
@@ -153,6 +156,14 @@
 %% path. Used both to gate the request and (in aws_auth_validate_oauth) to decide
 %% whether to offer authz mode at all.
 %%
+%% available/0 is the strong property: the oauth2 backend is loaded AND exposes
+%% the exact arity-4 scope API this layer calls. backend_loaded/0 is the weaker
+%% property: rabbit_auth_backend_oauth2 is loaded at all, regardless of its API
+%% version. The two differ precisely on the portability regression Luke flagged:
+%% a broker series that ships the oauth2 backend but predates resource_access/4.
+%% Tests use the pair to tell a legitimate skip (backend absent entirely) from a
+%% hard failure (backend present but API too old -- must not pass silently).
+%%
 %% We use code:ensure_loaded/1 rather than a bare erlang:function_exported/3:
 %% the latter returns false for a module whose beam is on the path but has not
 %% yet been loaded into the VM, which would make availability depend on load
@@ -161,9 +172,29 @@
 %% beam is present, so this reflects "is the backend installed" -- the property
 %% we actually want -- and stays false only when the backend genuinely is not
 %% deployed on this broker.
+%%
+%% Memoization: a positive result is cached in persistent_term so the per-request
+%% probe (3x code:ensure_loaded + 4x function_exported) runs at most once per
+%% boot. We cache ONLY `true' -- never `false' -- so a backend that loads AFTER
+%% the first call (e.g. plugin enabled at runtime) is still picked up on a later
+%% request rather than being pinned "unavailable" for the node's lifetime.
 -spec available() -> boolean().
 -ifdef(HAVE_OAUTH2_RESOURCE_SERVER).
 available() ->
+    case persistent_term:get(?AVAIL_CACHE_KEY, false) of
+        true ->
+            true;
+        false ->
+            case probe_available() of
+                true ->
+                    persistent_term:put(?AVAIL_CACHE_KEY, true),
+                    true;
+                false ->
+                    false
+            end
+    end.
+
+probe_available() ->
     module_ready(?SCOPE_MOD) andalso
         module_ready(?OAUTH2_MOD) andalso
         module_ready(?RS_MOD) andalso
@@ -177,11 +208,29 @@ module_ready(Mod) ->
         {module, Mod} -> true;
         _ -> false
     end.
+
+%% Weaker probe: is the oauth2 backend module loaded at all, independent of its
+%% API version? Used only by tests to distinguish "backend genuinely absent"
+%% (legitimate skip) from "backend present but too old" (hard failure). Not
+%% memoized -- it is off the request path.
+-spec backend_loaded() -> boolean().
+backend_loaded() ->
+    module_ready(?OAUTH2_MOD).
 -else.
 %% Built against a broker series with no oauth2 resource_server record: the
 %% evaluator cannot be compiled in, so authz is unconditionally unavailable.
 available() ->
     false.
+
+%% Even without the record at build time, the runtime backend module may exist;
+%% report its load state so tests can still make the absent-vs-present-but-old
+%% distinction on this build branch.
+-spec backend_loaded() -> boolean().
+backend_loaded() ->
+    case code:ensure_loaded(?OAUTH2_MOD) of
+        {module, ?OAUTH2_MOD} -> true;
+        _ -> false
+    end.
 -endif.
 
 %% Optional layer: when the request carried an `authz_check' block, evaluate it
@@ -221,6 +270,17 @@ maybe_check_available(Params, Check, Claims) ->
             evaluate(Params, Check, Claims)
     end.
 
+%% COUPLING NOTE (see the parity-scope discussion in the module header): this
+%% function replays the broker's authorization decision as an explicit chain of
+%% its internal stages -- new_resource_server/1 -> normalize_token_scope/2 ->
+%% get_expanded_scopes/3 -> resource_access/4. The matcher itself cannot drift
+%% (it IS the broker's code), but this SEQUENCING can: if a future oauth2 series
+%% inserts a normalization stage between these calls, or moves work into a
+%% higher-level entry point, this endpoint would under-report effective scopes
+%% (the safe direction -- it never over-grants -- but a parity gap). If the
+%% backend ever exposes a single pure "would this token be granted X" entry
+%% point, prefer collapsing this chain onto it. Until then, any new stage the
+%% backend adds must be mirrored here.
 evaluate(Params, Check, Claims) ->
     %% Build the broker's #resource_server{} from CUSTOMER-SUPPLIED config so the
     %% alias / additional-scopes-key / prefix logic matches what their broker

@@ -1064,13 +1064,35 @@ authz_check_non_binary_vhost_rejected_test() ->
     },
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
 
-%% Run Fun only if the oauth2 backend is loaded; otherwise return an empty test
-%% list (graceful skip), mirroring how the LDAP integration suite skips without
-%% slapd.
+%% Run Fun only if the oauth2 backend's arity-4 scope API is available.
+%%
+%% Three distinct states, deliberately handled differently (Luke's blocking
+%% coverage-gap note): a bare `available() -> false' skip would collapse the two
+%% false cases together and let a portability regression pass CI green.
+%%   * available()                       -> run the tests.
+%%   * NOT available, backend not loaded -> legitimate skip (return []), the same
+%%     way the LDAP suite skips without slapd. The feature genuinely cannot run.
+%%   * NOT available, backend IS loaded  -> HARD FAILURE. The oauth2 backend is
+%%     present but too old to expose resource_access/4 etc.; that is exactly the
+%%     build-guard portability bug. It must turn CI red, not silently skip.
 maybe_skip_authz(Fun) ->
     case aws_auth_validate_oauth_authz:available() of
-        true -> Fun();
-        false -> []
+        true ->
+            Fun();
+        false ->
+            case aws_auth_validate_oauth_authz:backend_loaded() of
+                false ->
+                    %% Backend genuinely absent -- legitimate skip.
+                    [];
+                true ->
+                    %% Present-but-unusable: fail loudly rather than skip.
+                    [
+                        ?_assertEqual(
+                            backend_loaded_but_authz_api_absent,
+                            available_with_loaded_backend
+                        )
+                    ]
+            end
     end.
 
 %% True when an {error, _, Reason} result's Reason binary contains Substr. Used
