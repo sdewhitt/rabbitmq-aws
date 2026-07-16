@@ -190,6 +190,27 @@
     "(auth_oauth2.require_exp)"
 >>).
 -define(REASON_TOKEN_AUDIENCE, <<"access_token audience does not include resource_server_id">>).
+%% Optional authz-evaluation config shape errors (pure phase).
+-define(REASON_BAD_AUTHZ_CHECK, <<
+    "authz_check must be an object with a permission (configure|write|read), "
+    "a resource string, and an optional vhost string"
+>>).
+-define(REASON_BAD_AUTHZ_CONFIG, <<
+    "scope_aliases must be an object mapping each alias name (string) to a list "
+    "of scope strings, additional_scopes_key/scope_prefix a string, and "
+    "scope_pattern_syntax one of wildcard|regex"
+>>).
+-define(REASON_AUTHZ_NEEDS_TOKEN, <<
+    "authz_check requires an access_token to evaluate"
+>>).
+%% authz evaluation builds the broker's #resource_server{} from resource_server_id
+%% (it seeds the default scope_prefix and the record id). Without it the record
+%% cannot be constructed, so we require it explicitly here in the pure phase
+%% rather than defaulting silently -- a missing resource_server_id is the
+%% operator's config to supply, and guessing one would break decision parity.
+-define(REASON_AUTHZ_NEEDS_RESOURCE_SERVER_ID, <<
+    "authz_check requires resource_server_id to be set"
+>>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_NO_ASSUME_ROLE, <<
     "auth validation requires an assume_role to be configured; "
@@ -280,7 +301,19 @@ allowed_fields() ->
         %% Optional customer-supplied access token. Present access_token
         %% activates signature + exp/nbf/aud verification against the fetched
         %% JWKS. Carries no secret (the customer minted it out of band).
-        <<"access_token">>
+        <<"access_token">>,
+        %% Optional authorization-evaluation layer: the customer's
+        %% OAuth authz config (scope_aliases / additional_scopes_key /
+        %% scope_prefix / scope_pattern_syntax) plus an authz_check block
+        %% {vhost,resource,permission} to evaluate the supplied access_token
+        %% against, via the broker's own scope-decision functions (runtime soft
+        %% dependency on rabbitmq_auth_backend_oauth2). See
+        %% aws_auth_validate_oauth_authz.
+        <<"scope_aliases">>,
+        <<"additional_scopes_key">>,
+        <<"scope_prefix">>,
+        <<"scope_pattern_syntax">>,
+        <<"authz_check">>
     ].
 
 -spec validate(map()) -> aws_auth_validate_backend:result().
@@ -337,6 +370,8 @@ parse_input(Body) ->
         %% supplied token and pre-decodes its header so the alg allowlist can be
         %% enforced without network I/O. No verification happens here.
         fun parse_access_token/2,
+        %% Pure shape-check of the optional authz-evaluation config.
+        fun parse_authz_config/2,
         %% SSRF guard runs in the pure phase so a disallowed target is rejected
         %% before any ARN resolution or outbound request.
         fun guard_urls/2
@@ -488,6 +523,140 @@ check_header_kid(Header) ->
         _ -> {error, input_invalid, ?REASON_TOKEN_MALFORMED}
     end.
 
+%% Pure shape-check of the optional authorization-evaluation config.
+%% When no authz_check is supplied, this is a no-op (authz_check => none) and the
+%% backend behaves exactly as before. When supplied, we shape-check the config
+%% fields and the check block here (pure phase) so a malformed request never
+%% reaches the network / crypto phase. The actual evaluation happens after token
+%% verification, in aws_auth_validate_oauth_authz. authz_check requires an
+%% access_token (there is nothing to evaluate without one).
+parse_authz_config(Body, Acc) ->
+    case maps:get(<<"authz_check">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{authz_check => none}};
+        Check when is_map(Check) ->
+            case maps:get(token, Acc, none) of
+                none ->
+                    {error, input_invalid, ?REASON_AUTHZ_NEEDS_TOKEN};
+                _ ->
+                    %% authz evaluation needs resource_server_id to construct the
+                    %% broker's #resource_server{} (it seeds the record id and the
+                    %% default scope_prefix). parse_resource_server_id always seats
+                    %% the slot -- present-and-binary or undefined -- so an absent
+                    %% id surfaces here as undefined. Reject it in the pure phase
+                    %% rather than letting new_resource_server(undefined) crash and
+                    %% be misreported as a connection failure by the network catch.
+                    case maps:get(resource_server_id, Acc, undefined) of
+                        undefined ->
+                            {error, input_invalid, ?REASON_AUTHZ_NEEDS_RESOURCE_SERVER_ID};
+                        _ ->
+                            parse_authz_check(Body, Check, Acc)
+                    end
+            end;
+        _ ->
+            {error, input_invalid, ?REASON_BAD_AUTHZ_CHECK}
+    end.
+
+parse_authz_check(Body, Check, Acc) ->
+    Permission = maps:get(<<"permission">>, Check, undefined),
+    Resource = maps:get(<<"resource">>, Check, undefined),
+    %% vhost defaults to <<"/">> when absent. When supplied it must be a binary:
+    %% a non-binary vhost would flow into #resource{virtual_host = VHost} and
+    %% crash the broker's scope matcher (rabbit_data_coercion:to_binary/1 has no
+    %% clause for a float or map), a crash the outer network catch would then
+    %% misreport as a connection failure. Validate it here in the pure phase,
+    %% alongside resource and permission.
+    VHost = maps:get(<<"vhost">>, Check, <<"/">>),
+    ValidPerm = lists:member(Permission, [<<"configure">>, <<"write">>, <<"read">>]),
+    ValidResource = is_binary(Resource) andalso byte_size(Resource) > 0,
+    ValidVHost = is_binary(VHost),
+    case ValidPerm andalso ValidResource andalso ValidVHost of
+        false ->
+            {error, input_invalid, ?REASON_BAD_AUTHZ_CHECK};
+        true ->
+            CheckMap = #{permission => Permission, resource => Resource, vhost => VHost},
+            parse_authz_scope_config(Body, Acc#{authz_check => CheckMap})
+    end.
+
+%% Shape-check the optional scope-config fields (all optional; each drives the
+%% #resource_server{} the evaluator builds). Stored as parsed atoms/values on the
+%% accumulator for aws_auth_validate_oauth_authz to consume.
+parse_authz_scope_config(Body, Acc) ->
+    Aliases = maps:get(<<"scope_aliases">>, Body, undefined),
+    AddKey = maps:get(<<"additional_scopes_key">>, Body, undefined),
+    Prefix = maps:get(<<"scope_prefix">>, Body, undefined),
+    Syntax = maps:get(<<"scope_pattern_syntax">>, Body, <<"wildcard">>),
+    case
+        {
+            valid_opt(Aliases, fun valid_scope_aliases/1),
+            valid_opt(AddKey, fun erlang:is_binary/1),
+            valid_opt(Prefix, fun erlang:is_binary/1),
+            parse_syntax(Syntax)
+        }
+    of
+        {true, true, true, {ok, SyntaxAtom}} ->
+            {ok,
+                maybe_put(
+                    scope_pattern_syntax,
+                    SyntaxAtom,
+                    maybe_put(
+                        scope_prefix,
+                        Prefix,
+                        maybe_put(
+                            additional_scopes_key,
+                            AddKey,
+                            maybe_put(scope_aliases, Aliases, Acc)
+                        )
+                    )
+                )};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_AUTHZ_CONFIG}
+    end.
+
+valid_opt(undefined, _Pred) -> true;
+valid_opt(V, Pred) -> Pred(V).
+
+%% scope_aliases must match the shape the broker's #resource_server{} record
+%% holds: a map of alias-name binary => list of scope binaries. The oauth2
+%% schema (rabbit_oauth2_schema:translate_scope_aliases/1) produces exactly
+%% #{binary() => [binary()]}, so a request that supplies any other shape is
+%% describing a config the broker could never hold.
+%%
+%% Beyond the parity gap, an unvalidated value is a crash footgun (the same
+%% class as the authz_check.vhost fix): when a token scope matches an alias key,
+%% the backend runs rabbit_data_coercion:to_binary/1 over the value, which has
+%% no clause for a float or a map and raises. The outer network catch would then
+%% misreport that crash as a connection failure -- the exact misclassification
+%% the pure-phase guards exist to prevent. Reject the bad shape here with
+%% input_invalid so the caller is told their scope_aliases is malformed.
+%%
+%% We require a list of scope strings (not a bare string) so there is no
+%% ambiguity about space-splitting: the config path space-splits a string into a
+%% list, but the caller supplies the already-split list directly here.
+valid_scope_aliases(Map) when is_map(Map) ->
+    maps:fold(
+        fun
+            (K, V, true) -> is_binary(K) andalso is_list_of_binaries(V);
+            (_K, _V, false) -> false
+        end,
+        true,
+        Map
+    );
+valid_scope_aliases(_) ->
+    false.
+
+is_list_of_binaries(L) when is_list(L) ->
+    lists:all(fun erlang:is_binary/1, L);
+is_list_of_binaries(_) ->
+    false.
+
+maybe_put(_Key, undefined, Acc) -> Acc;
+maybe_put(Key, Value, Acc) -> Acc#{Key => Value}.
+
+parse_syntax(<<"wildcard">>) -> {ok, wildcard};
+parse_syntax(<<"regex">>) -> {ok, regex};
+parse_syntax(_) -> error.
+
 %% Decode the protected header into a JSON object map via jose (the same
 %% facility rabbitmq_auth_backend_oauth2's uaa_jwt_jwt uses to peek a token
 %% header), rather than a hand-rolled base64url + JSON parser. We still enforce
@@ -616,11 +785,25 @@ do_oauth_validate(Params) ->
 %% rabbit_auth_backend_oauth2 computes.
 
 %% When no access_token was supplied (token => none), this layer is a no-op.
-maybe_verify_token(#{token := none}, _Keys) ->
+maybe_verify_token(#{token := none} = Params, _Keys) ->
+    %% Guard: an authz_check without an access_token is rejected in the pure
+    %% phase (parse_authz_config), so token=none implies authz_check=none here.
+    %% Belt-and-braces: if a check somehow reached here with no token, it is a
+    %% no-op rather than a crash.
+    _ = Params,
     ok;
 maybe_verify_token(#{token := #{raw := Raw, header := Header}} = Params, Keys) ->
     ResourceServerId = maps:get(resource_server_id, Params, undefined),
-    verify_token(Raw, Header, {Keys, ResourceServerId}).
+    %% Verify signature + exp + aud, capturing the decoded claims so the optional
+    %% authorization-evaluation layer can run against them.
+    case verify_token_claims(Raw, Header, {Keys, ResourceServerId}) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, Claims} ->
+            %% Optional authz evaluation via the broker's own scope functions
+            %% (runtime soft dependency). No-op when no authz_check.
+            aws_auth_validate_oauth_authz:maybe_check(Params, Claims)
+    end.
 
 %% Verify a customer-supplied JWT against the fetched JWKS. Steps, in order:
 %%   1. select the JWKS key whose `kid' matches the token header (a token with
@@ -638,9 +821,25 @@ maybe_verify_token(#{token := #{raw := Raw, header := Header}} = Params, Keys) -
 %% token_expired (transient, just re-mint); an audience mismatch stays
 %% auth_failed. verify_token/3 takes the pre-decoded header so the -ifdef(TEST)
 %% export can exercise it directly.
+-ifdef(TEST).
+%% Test-only wrapper preserving the historical verify_token/3 contract (returns
+%% `ok' on success). Production code calls verify_token_claims/3 directly (it
+%% needs the decoded claims for the optional authz-evaluation layer).
 -spec verify_token(binary(), map(), {list(), binary() | undefined}) ->
     ok | {error, aws_auth_validate_backend:error_category(), binary()}.
-verify_token(Raw, Header, {Keys, ResourceServerId}) ->
+verify_token(Raw, Header, Ctx) ->
+    case verify_token_claims(Raw, Header, Ctx) of
+        {ok, _Claims} -> ok;
+        {error, _, _} = Err -> Err
+    end.
+-endif.
+
+%% Verify a customer-supplied JWT against the fetched JWKS, returning {ok, Claims}
+%% on success so the caller can feed the verified claims to the optional authz-
+%% evaluation layer without re-decoding.
+-spec verify_token_claims(binary(), map(), {list(), binary() | undefined}) ->
+    {ok, map()} | {error, aws_auth_validate_backend:error_category(), binary()}.
+verify_token_claims(Raw, Header, {Keys, ResourceServerId}) ->
     Alg = maps:get(<<"alg">>, Header),
     Kid = maps:get(<<"kid">>, Header, undefined),
     case select_jwk(Kid, Keys) of
@@ -652,8 +851,13 @@ verify_token(Raw, Header, {Keys, ResourceServerId}) ->
                     Err;
                 {ok, Claims} ->
                     case check_token_expiry(Claims) of
-                        {error, _, _} = Err -> Err;
-                        ok -> check_token_audience(Claims, ResourceServerId)
+                        {error, _, _} = Err ->
+                            Err;
+                        ok ->
+                            case check_token_audience(Claims, ResourceServerId) of
+                                ok -> {ok, Claims};
+                                {error, _, _} = Err -> Err
+                            end
                     end
             end
     end.

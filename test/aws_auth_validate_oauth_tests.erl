@@ -10,6 +10,10 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% Shared JWT-minting and httpc-request helpers (see the helper module). Imported
+%% so the existing rsa_signer/1 and request_url/1 call sites need no changes.
+-import(aws_auth_validate_oauth_test_helpers, [rsa_signer/1, request_url/1]).
+
 %%--------------------------------------------------------------------
 %% Method identity
 %%--------------------------------------------------------------------
@@ -833,6 +837,346 @@ access_token_no_leak_test_() ->
     end}.
 
 %%--------------------------------------------------------------------
+%% Optional authorization-evaluation layer (runtime soft dependency
+%% on rabbitmq_auth_backend_oauth2). These tests only run when that backend is
+%% loaded on the node (it is a TEST_DEPS-style presence, not a build DEPS);
+%% each test skips gracefully via availability/0 so the suite passes whether or
+%% not the oauth2 modules are present.
+%%--------------------------------------------------------------------
+
+%% The soft-dependency probe returns a boolean and never raises, regardless of
+%% whether the oauth2 backend is loaded.
+authz_available_is_boolean_test() ->
+    ?assert(is_boolean(aws_auth_validate_oauth_authz:available())).
+
+%% A verified token whose scopes grant the requested permission -> 204. Uses a
+%% direct `scope' claim (no alias) so it exercises the scope->permission match.
+authz_direct_scope_grants_access_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        maybe_skip_authz(fun() ->
+            #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+            Token = Sign(#{
+                <<"exp">> => future(),
+                <<"aud">> => <<"rabbitmq">>,
+                <<"scope">> => <<"rabbitmq.configure:*/* rabbitmq.write:*/* rabbitmq.read:*/*">>
+            }),
+            JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+            mock_httpc_response(200, JwksBody),
+            Body = (jwks_body())#{
+                <<"access_token">> => Token,
+                <<"resource_server_id">> => <<"rabbitmq">>,
+                <<"scope_prefix">> => <<"rabbitmq.">>,
+                <<"authz_check">> => #{
+                    <<"vhost">> => <<"/">>,
+                    <<"resource">> => <<"my-queue">>,
+                    <<"permission">> => <<"configure">>
+                }
+            },
+            [?_assertEqual(ok, aws_auth_validate_oauth:validate(Body))]
+        end)
+    end}.
+
+%% scope_pattern_syntax => regex is accepted and runs the broker's bounded regex
+%% matcher (A2). A regex scope granting configure on any vhost/resource -> 204.
+%% Proves the regex path is wired through and functional (its ReDoS bounds are
+%% the broker's own -- see the aws_auth_validate_oauth_authz header).
+authz_regex_syntax_grants_access_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        maybe_skip_authz(fun() ->
+            #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+            Token = Sign(#{
+                <<"exp">> => future(),
+                <<"aud">> => <<"rabbitmq">>,
+                <<"scope">> => <<"rabbitmq.configure:.*/.*">>
+            }),
+            JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+            mock_httpc_response(200, JwksBody),
+            Body = (jwks_body())#{
+                <<"access_token">> => Token,
+                <<"resource_server_id">> => <<"rabbitmq">>,
+                <<"scope_prefix">> => <<"rabbitmq.">>,
+                <<"scope_pattern_syntax">> => <<"regex">>,
+                <<"authz_check">> => #{
+                    <<"vhost">> => <<"/">>,
+                    <<"resource">> => <<"my-queue">>,
+                    <<"permission">> => <<"configure">>
+                }
+            },
+            [?_assertEqual(ok, aws_auth_validate_oauth:validate(Body))]
+        end)
+    end}.
+
+%% A verified token that HAS an effective scope but it does NOT grant the
+%% requested permission -> authz_unverified with the "none grant" message (the
+%% genuine mapping mismatch). Token grants read; we ask for configure. The
+%% category stays authz_unverified; the message distinguishes this from the
+%% no-effective-scopes case below.
+authz_present_scope_no_match_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        maybe_skip_authz(fun() ->
+            #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+            Token = Sign(#{
+                <<"exp">> => future(),
+                <<"aud">> => <<"rabbitmq">>,
+                <<"scope">> => <<"rabbitmq.read:*/*">>
+            }),
+            JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+            mock_httpc_response(200, JwksBody),
+            Body = (jwks_body())#{
+                <<"access_token">> => Token,
+                <<"resource_server_id">> => <<"rabbitmq">>,
+                <<"scope_prefix">> => <<"rabbitmq.">>,
+                <<"authz_check">> => #{
+                    <<"resource">> => <<"my-queue">>,
+                    <<"permission">> => <<"configure">>
+                }
+            },
+            Result = aws_auth_validate_oauth:validate(Body),
+            [
+                ?_assertMatch({error, authz_unverified, _}, Result),
+                ?_assert(reason_contains(Result, "none grant"))
+            ]
+        end)
+    end}.
+
+%% A verified token whose scopes ALL have the wrong prefix -> nothing survives
+%% scope_prefix filtering -> authz_unverified with the no-effective-scopes
+%% message (the prefix/alias-typo footgun that generates "my token is broken"
+%% tickets). Token carries `other.read:*/*'; prefix is `rabbitmq.'.
+authz_no_effective_scopes_after_prefix_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        maybe_skip_authz(fun() ->
+            #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+            Token = Sign(#{
+                <<"exp">> => future(),
+                <<"aud">> => <<"rabbitmq">>,
+                <<"scope">> => <<"other.configure:*/*">>
+            }),
+            JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+            mock_httpc_response(200, JwksBody),
+            Body = (jwks_body())#{
+                <<"access_token">> => Token,
+                <<"resource_server_id">> => <<"rabbitmq">>,
+                <<"scope_prefix">> => <<"rabbitmq.">>,
+                <<"authz_check">> => #{
+                    <<"resource">> => <<"my-queue">>,
+                    <<"permission">> => <<"configure">>
+                }
+            },
+            Result = aws_auth_validate_oauth:validate(Body),
+            [
+                ?_assertMatch({error, authz_unverified, _}, Result),
+                ?_assert(reason_contains(Result, "no scopes for this resource_server"))
+            ]
+        end)
+    end}.
+
+%% IAM-style path: the token carries the role ARN in `sub', additional_scopes_key
+%% points at `sub', and scope_aliases maps that ARN to concrete RabbitMQ scopes.
+%% Proves the alias expansion (the actual MQ IAM mechanism) reaches an allow.
+authz_iam_scope_alias_grants_access_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        maybe_skip_authz(fun() ->
+            RoleArn = <<"arn:aws:iam::123456789012:role/RabbitMqAdminRole">>,
+            #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+            Token = Sign(#{
+                <<"exp">> => future(), <<"aud">> => <<"rabbitmq">>, <<"sub">> => RoleArn
+            }),
+            JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+            mock_httpc_response(200, JwksBody),
+            Body = (jwks_body())#{
+                <<"access_token">> => Token,
+                <<"resource_server_id">> => <<"rabbitmq">>,
+                <<"scope_prefix">> => <<"rabbitmq.">>,
+                <<"additional_scopes_key">> => <<"sub">>,
+                <<"scope_aliases">> => #{
+                    RoleArn => [
+                        <<"rabbitmq.tag:administrator">>,
+                        <<"rabbitmq.read:*/*">>,
+                        <<"rabbitmq.write:*/*">>,
+                        <<"rabbitmq.configure:*/*">>
+                    ]
+                },
+                <<"authz_check">> => #{
+                    <<"resource">> => <<"my-queue">>,
+                    <<"permission">> => <<"write">>
+                }
+            },
+            [?_assertEqual(ok, aws_auth_validate_oauth:validate(Body))]
+        end)
+    end}.
+
+%% authz_check without an access_token is rejected in the pure phase.
+authz_check_without_token_rejected_test() ->
+    Body = (jwks_body())#{
+        <<"authz_check">> => #{
+            <<"resource">> => <<"q">>, <<"permission">> => <<"read">>
+        }
+    },
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% authz_check without a resource_server_id is rejected in the pure phase.
+%% The evaluator builds the broker's #resource_server{} from resource_server_id
+%% (it seeds the record id and default scope_prefix); without it,
+%% new_resource_server(undefined) would crash on iolist_to_binary([undefined,
+%% <<".">>]) and be misreported by the network catch as connection_failed. The
+%% pure-phase guard turns that into a clean input_invalid before any JWKS fetch.
+authz_check_without_resource_server_id_rejected_test() ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    Body = (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"authz_check">> => #{
+            <<"resource">> => <<"q">>, <<"permission">> => <<"read">>
+        }
+    },
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A malformed authz_check (bad permission verb) is rejected in the pure phase.
+authz_check_bad_permission_rejected_test() ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    Body = (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"authz_check">> => #{
+            <<"resource">> => <<"q">>, <<"permission">> => <<"admin">>
+        }
+    },
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A non-binary authz_check.vhost is rejected in the pure phase. Without this
+%% guard the value would reach the broker's scope matcher as
+%% #resource{virtual_host = VHost} and crash it, a crash the network catch would
+%% misreport as a connection failure. resource_server_id is supplied so the
+%% check reaches the vhost validation rather than the earlier
+%% resource_server_id guard.
+authz_check_non_binary_vhost_rejected_test() ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    Body = (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"resource_server_id">> => <<"rabbitmq">>,
+        <<"authz_check">> => #{
+            <<"vhost">> => 1.5,
+            <<"resource">> => <<"q">>,
+            <<"permission">> => <<"read">>
+        }
+    },
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% scope_aliases must be a map of alias-name => list-of-scope-strings (the shape
+%% the broker's #resource_server{} record holds). These pure-phase tests assert
+%% the malformed shapes that would otherwise reach the broker matcher and crash
+%% rabbit_data_coercion:to_binary/1 (float / map values), or describe a config
+%% the broker could never hold, are rejected as input_invalid before any network
+%% or crypto. A valid authz_check + resource_server_id + access_token are
+%% supplied so the request reaches parse_authz_scope_config rather than an
+%% earlier guard.
+authz_scope_aliases_helper_body(Aliases) ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"resource_server_id">> => <<"rabbitmq">>,
+        <<"scope_aliases">> => Aliases,
+        <<"authz_check">> => #{
+            <<"resource">> => <<"q">>,
+            <<"permission">> => <<"read">>
+        }
+    }.
+
+%% A float alias value would crash to_binary/1 on a matching scope; reject it.
+authz_scope_aliases_float_value_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => 1.5}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A nested-object alias value would crash to_binary/1; reject it.
+authz_scope_aliases_object_value_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => #{<<"x">> => 1}}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A bare-string alias value is not the record shape (broker holds a list);
+%% require the caller to supply the already-split list, so reject a string.
+authz_scope_aliases_bare_string_value_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => <<"rabbitmq.read:*/*">>}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A list containing a non-binary (mixed list) crashes to_binary/1 element-wise;
+%% reject the whole value.
+authz_scope_aliases_mixed_list_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => [<<"ok">>, 1.5]}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% Note: the valid scope_aliases shape (alias => list of scope strings) is
+%% already exercised end-to-end through the JWKS mock by
+%% authz_iam_scope_alias_grants_access_test_/0, which asserts a grant, so no
+%% separate positive shape test is added here (a bare validate/1 without the
+%% network mock would attempt a real JWKS fetch).
+
+%% Run Fun only if the oauth2 backend's arity-4 scope API is available.
+%%
+%% Distinct states, deliberately handled differently (Luke's blocking
+%% coverage-gap note): a bare `available() -> false' skip would let a
+%% portability regression pass CI green.
+%%   * available()                                 -> run the tests.
+%%   * NOT available, evaluator NOT compiled in    -> legitimate skip ([]). This
+%%     is a pre-floor broker series (oauth2.hrl lacks the arity-4 scope API), so
+%%     the feature is genuinely unavailable by design -- same as the LDAP suite
+%%     skipping without slapd.
+%%   * NOT available, evaluator compiled in, but
+%%     backend loaded                              -> HARD FAILURE. The evaluator
+%%     was built (the Makefile saw the arity-4 API) and the backend is loaded,
+%%     yet available/0 is false at runtime: a genuine portability regression. It
+%%     must turn CI red, not silently skip.
+%%   * NOT available, evaluator compiled in,
+%%     backend NOT loaded                          -> legitimate skip ([]): the
+%%     backend simply is not running on this node.
+%%
+%% NOTE: gate the hard failure on evaluator_compiled_in/0, not backend_loaded/0
+%% alone. rabbitmq_auth_backend_oauth2 is in TEST_DEPS, so the module is loadable
+%% even on a pre-floor series where the evaluator was correctly NOT compiled in;
+%% keying the hard failure on backend_loaded alone would wrongly fail that
+%% legitimate case.
+maybe_skip_authz(Fun) ->
+    case aws_auth_validate_oauth_authz:available() of
+        true ->
+            Fun();
+        false ->
+            maybe_skip_authz_unavailable(),
+            []
+    end.
+
+%% available/0 is false. If the evaluator was compiled in AND the backend is
+%% loaded, that is the portability regression -- fail loudly (a runtime error,
+%% not a two-literal ?assertEqual, which erlc rejects with a "guard evaluates to
+%% false" warning under warnings-as-errors). Otherwise the unavailability is
+%% legitimate and the caller skips.
+maybe_skip_authz_unavailable() ->
+    case
+        aws_auth_validate_oauth_authz:evaluator_compiled_in() andalso
+            aws_auth_validate_oauth_authz:backend_loaded()
+    of
+        true ->
+            erlang:error(
+                {backend_loaded_but_authz_api_absent,
+                    "rabbitmq_auth_backend_oauth2 is loaded and the authz evaluator "
+                    "was compiled in, but available/0 is false: the arity-4 scope API "
+                    "this layer requires is missing. The build guard admitted an "
+                    "unsupported broker series."}
+            );
+        false ->
+            ok
+    end.
+
+%% True when an {error, _, Reason} result's Reason binary contains Substr. Used
+%% to assert the specific authz_unverified message (the category is constant;
+%% the message is what distinguishes the failure stage).
+reason_contains({error, _Cat, Reason}, Substr) when is_binary(Reason) ->
+    string:find(Reason, Substr) =/= nomatch;
+reason_contains(_Other, _Substr) ->
+    false.
+
+%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
@@ -854,21 +1198,6 @@ compact_token(Header, Claims, SigBytes) ->
     <<H/binary, ".", P/binary, ".", S/binary>>.
 
 b64url(Bin) -> base64:encode(Bin, #{mode => urlsafe, padding => false}).
-
-%% Generate a fresh RSA keypair via jose and return:
-%%   * jwk_pub -- the PUBLIC key as a JWKS-style map, tagged with Kid, and
-%%   * sign    -- a fun(ClaimsMap) -> compact RS256 JWT signed by the private key.
-%% Each call produces a DISTINCT key, so "wrong key" tests just call it twice.
-rsa_signer(Kid) ->
-    Priv = jose_jwk:generate_key({rsa, 2048}),
-    {_, PubMap0} = jose_jwk:to_public_map(Priv),
-    PubMap = PubMap0#{<<"kid">> => Kid},
-    Sign = fun(Claims) ->
-        JWS = #{<<"alg">> => <<"RS256">>, <<"kid">> => Kid},
-        {_, Token} = jose_jws:compact(jose_jwt:sign(Priv, JWS, Claims)),
-        Token
-    end,
-    #{jwk_pub => PubMap, sign => Sign}.
 
 %% A minimal body with only issuer (triggers OIDC discovery).
 issuer_body() ->
@@ -928,7 +1257,3 @@ mock_arn_resolve_noop() ->
     %% override resolve_arn. Kept as a helper so the pure-phase tests read clearly.
     meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {ok, <<"noop">>, State} end),
     ok.
-
-%% Extract the URL string from an httpc Request tuple (GET or POST form).
-request_url({Url, _Headers}) -> Url;
-request_url({Url, _Headers, _ContentType, _Body}) -> Url.
