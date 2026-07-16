@@ -42,6 +42,7 @@
     oauth_disabled_by_default_returns_404/1,
     oauth_success_returns_204/1,
     oauth_response_no_secret/1,
+    oauth_authz_portability_tripwire/1,
     oauth_authz_grants_returns_204/1,
     oauth_authz_denies_returns_422/1
 ]).
@@ -122,6 +123,7 @@ groups() ->
             oauth_disabled_by_default_returns_404,
             oauth_success_returns_204,
             oauth_response_no_secret,
+            oauth_authz_portability_tripwire,
             oauth_authz_grants_returns_204,
             oauth_authz_denies_returns_422
         ]}
@@ -245,37 +247,15 @@ init_per_testcase(TC, Config) when
     %% the broker's own scope-decision functions, so it needs
     %% rabbitmq_auth_backend_oauth2 loadable on the broker; skip gracefully if it
     %% is not (mirrors the eunit maybe_skip_authz and the LDAP suite's slapd skip).
+    %% The available-but-should-not-be portability regression is caught separately
+    %% by oauth_authz_portability_tripwire, which fails from a test-case body so it
+    %% turns CI red regardless of the exit_status option (a ct:fail here, in
+    %% init_per_testcase, would only auto-skip).
     case rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_available, []) of
         false ->
-            %% available/0 is false. Distinguish the reasons (Luke's blocking
-            %% coverage-gap note). Only fail when the evaluator was compiled in
-            %% (the Makefile saw the arity-4 API) AND the backend is loaded, yet
-            %% available/0 is still false -- a genuine portability regression.
-            %% A pre-floor broker series (evaluator NOT compiled in) or a node
-            %% without the backend running is a legitimate skip, the same way the
-            %% LDAP suite skips without slapd. Gate on evaluator_compiled_in, not
-            %% backend_loaded alone: rabbitmq_auth_backend_oauth2 is in TEST_DEPS
-            %% and so loadable even on a pre-floor series.
-            EvaluatorCompiledIn = rabbit_ct_broker_helpers:rpc(
-                Config, 0, ?MODULE, oauth2_evaluator_compiled_in, []
-            ),
-            BackendLoaded = rabbit_ct_broker_helpers:rpc(
-                Config, 0, ?MODULE, oauth2_backend_loaded, []
-            ),
-            case EvaluatorCompiledIn andalso BackendLoaded of
-                true ->
-                    ct:fail(
-                        "rabbitmq_auth_backend_oauth2 is loaded on the broker node and "
-                        "the authz evaluator was compiled in, but "
-                        "aws_auth_validate_oauth_authz:available/0 is false: the backend "
-                        "does not export the arity-4 scope API this layer requires. The "
-                        "build guard admitted an unsupported broker series."
-                    );
-                false ->
-                    {skip,
-                        "OAuth authz evaluation unavailable on this broker node "
-                        "(pre-floor series or backend not loaded)"}
-            end;
+            {skip,
+                "OAuth authz evaluation unavailable on this broker node "
+                "(pre-floor series or backend not loaded)"};
         true ->
             rabbit_ct_broker_helpers:rpc(
                 Config,
@@ -596,6 +576,55 @@ oauth_response_no_secret(Config) ->
     Body = (oauth_body())#{<<"client_secret">> => Secret},
     {ok, {{_, _Code, _}, _, ResBody}} = put_request(Config, ?OAUTH_API, Body),
     ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Secret)).
+
+%% Portability tripwire for the build guard. When the evaluator was compiled in
+%% (the Makefile saw the arity-4 scope API in oauth2.hrl) and the oauth2 backend
+%% is loaded, available/0 MUST be true; if it is false, the build guard admitted
+%% a broker series whose backend lacks the arity-4 API this layer calls -- a
+%% portability regression. Every matrix arm exercises exactly one outcome: on
+%% v4.2.x/v4.3.x/main the evaluator is compiled in, the backend is loaded and
+%% available/0 is true, so this passes; on a pre-floor series (e.g. v3.13.7) the
+%% evaluator is not compiled in, so this skips like the two cases below.
+%%
+%% This fails from a TEST-CASE BODY, not init_per_testcase, on purpose: a
+%% ct:fail in an init clause auto-skips the case, which turns the run red only
+%% via Common Test's default exit_status (auto-skip -> non-zero). Under
+%% -exit_status ignore_config -- a common way to tolerate infra-dependent skips
+%% (this suite skips without slapd, without the backend, ...) -- that auto-skip
+%% would pass green and silence the regression. A failure from a test-case body
+%% increments the Failed count, which ct_run maps to a non-zero exit before the
+%% exit_status branch is consulted, so this tripwire stays red unconditionally.
+oauth_authz_portability_tripwire(Config) ->
+    Available = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_available, []),
+    EvaluatorCompiledIn = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, oauth2_evaluator_compiled_in, []
+    ),
+    BackendLoaded = rabbit_ct_broker_helpers:rpc(
+        Config, 0, ?MODULE, oauth2_backend_loaded, []
+    ),
+    case Available of
+        true ->
+            ok;
+        false ->
+            %% Gate the hard failure on evaluator_compiled_in, not backend_loaded
+            %% alone: rabbitmq_auth_backend_oauth2 is in TEST_DEPS and so loadable
+            %% even on a pre-floor series where the evaluator was correctly not
+            %% compiled in -- that is a legitimate skip, not a regression.
+            case EvaluatorCompiledIn andalso BackendLoaded of
+                true ->
+                    ct:fail(
+                        "rabbitmq_auth_backend_oauth2 is loaded on the broker node and "
+                        "the authz evaluator was compiled in, but "
+                        "aws_auth_validate_oauth_authz:available/0 is false: the backend "
+                        "does not export the arity-4 scope API this layer requires. The "
+                        "build guard admitted an unsupported broker series."
+                    );
+                false ->
+                    {skip,
+                        "OAuth authz evaluation unavailable on this broker node "
+                        "(pre-floor series or backend not loaded)"}
+            end
+    end.
 
 %% Optional authorization-evaluation layer, driven END-TO-END through the full
 %% Cowboy pipeline: auth gate -> body-size cap -> JSON decode -> semaphore ->
