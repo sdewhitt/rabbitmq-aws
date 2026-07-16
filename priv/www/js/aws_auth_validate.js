@@ -57,8 +57,10 @@ var AWS_AUTH_VALIDATE_CATEGORY = {
     tls_failed:         {cls: 'status-red',    text: 'TLS failed: handshake or certificate verification did not succeed.'},
     query_invalid:      {cls: 'status-red',    text: 'Query invalid: an authorization query could not be parsed.'},
     auth_failed:        {cls: 'status-yellow', text: 'Auth failed: the server was reached but did not authenticate/respond as expected.'},
-    config_conflict:    {cls: 'status-yellow', text: 'Config conflict: the supplied options are mutually inconsistent (for example an ARN is referenced with no assume_role configured).'},
-    authz_unverified:   {cls: 'status-yellow', text: 'Authorization unverified: a configured authorization check could not be confirmed.'},
+    token_invalid:      {cls: 'status-red',    text: 'Token invalid: the supplied access token failed signature verification, or no fetched JWKS key matched its key id -- the broker would also reject it.'},
+    token_expired:      {cls: 'status-yellow', text: 'Token expired: the supplied access token is past its exp (transient -- re-mint the token and retry).'},
+    config_conflict:    {cls: 'status-yellow', text: 'Config conflict: the supplied options are mutually inconsistent (for example an ARN is referenced with no assume_role configured, or an authorization check was requested but the oauth2 backend is not loaded on this broker).'},
+    authz_unverified:   {cls: 'status-yellow', text: 'Authorization unverified: the token is authentic but the requested permission could not be confirmed on the vhost/resource. Check scope_prefix, resource_server_id, additional_scopes_key, and scope_aliases.'},
     method_disabled:    {cls: 'status-yellow', text: 'Method disabled: enable it with aws.auth_validation.enabled_methods.<method> = true (every method is opt-in).'},
     unknown_method:     {cls: 'status-red',    text: 'Unknown method.'},
     insufficient_user_tag: {cls: 'status-red', text: 'Your user lacks the tag required to call this endpoint.'},
@@ -69,16 +71,27 @@ var AWS_AUTH_VALIDATE_CATEGORY = {
 
 // Read the visible method form into a JSON request body. Only non-empty fields
 // are included so an omitted optional field keeps the backend default. ssl_options
-// is collected from a small fixed set of sub-fields; ARN fields nest under it to
-// match the backend shape (ssl_options.cacertfile_arn etc.).
+// is collected from the selected method's own ssl sub-fields; ARN fields nest
+// under it to match the backend shape (ssl_options.cacertfile_arn etc.).
+//
+// The scan is scoped to the SELECTED method's field container
+// (#aws-av-fields-<method>), never the whole form. Each method group carries its
+// own data-av-field / data-av-ssl inputs (the ssl_options key set differs per
+// backend -- e.g. ldap wants server_name_indication and has no client cert,
+// while http/oauth want sni + certfile/keyfile), and switching methods only
+// HIDES the other groups. A whole-form scan would therefore merge a previously-
+// selected method's (now hidden) values into this body -- producing a request
+// with foreign keys the backend rejects as input_invalid, and a permanent
+// divergence from the conf box. Scoping to the active group is what keeps the
+// body method-pure.
 function aws_auth_validate_build_body(method) {
     var body = {};
-    var $form = $('#aws-auth-validate-form');
+    var $scope = $('#aws-av-fields-' + method);
 
-    // Flat top-level fields per method. A checkbox contributes a boolean true
-    // only when checked (an unchecked box is omitted so the backend keeps its
-    // default); every other input contributes its non-empty value.
-    $form.find('[data-av-field]').each(function() {
+    // Flat top-level fields for THIS method. A checkbox contributes a boolean
+    // true only when checked (an unchecked box is omitted so the backend keeps
+    // its default); every other input contributes its non-empty value.
+    $scope.find('[data-av-field]').each(function() {
         var el = $(this);
         var key = el.attr('data-av-field');
         if (el.is(':checkbox')) {
@@ -101,9 +114,9 @@ function aws_auth_validate_build_body(method) {
         if (!isNaN(p)) { body.port = p; } else { delete body.port; }
     }
 
-    // ssl_options sub-object (shared shape across methods that support TLS).
+    // ssl_options sub-object, collected from THIS method's ssl sub-fields only.
     var ssl = {};
-    $form.find('[data-av-ssl]').each(function() {
+    $scope.find('[data-av-ssl]').each(function() {
         var key = $(this).attr('data-av-ssl');
         var el = $(this);
         var val = el.is(':checkbox') ? el.is(':checked') : el.val();
@@ -116,7 +129,103 @@ function aws_auth_validate_build_body(method) {
     if (Object.keys(ssl).length > 0) {
         body.ssl_options = ssl;
     }
+
+    // LDAP authorization queries: a map of {query_name: dsl_string} assembled
+    // from the four data-av-query textareas. Each value is sent as a raw DSL
+    // string; the backend parses it (query_invalid on failure) and, when a
+    // username was supplied, evaluates it for that principal. An empty box
+    // contributes no entry so the backend keeps that query unset.
+    if (method === 'ldap') {
+        var queries = aws_auth_validate_build_queries($scope);
+        if (Object.keys(queries).length > 0) {
+            body.queries = queries;
+        }
+    }
+
+    // OAuth authorization-evaluation layer. The generic loop above collected the
+    // scalar authz-config fields (scope_prefix, additional_scopes_key,
+    // scope_pattern_syntax) as-is. Two shapes need building by hand: scope_aliases
+    // is a map the backend expects as {alias: [scopes]} (entered as lines here),
+    // and authz_check is assembled from its own data-av-authz inputs. Everything
+    // here is optional -- an empty permission means "no authz check", matching the
+    // backend, which treats authz_check as absent unless a check block is present.
+    if (method === 'oauth') {
+        if (typeof body.scope_aliases === 'string') {
+            var aliases = aws_auth_validate_parse_scope_aliases(body.scope_aliases);
+            if (aliases && Object.keys(aliases).length > 0) {
+                body.scope_aliases = aliases;
+            } else {
+                // Blank or comment-only text: omit the field entirely so the
+                // backend keeps its default rather than seeing an empty object.
+                delete body.scope_aliases;
+            }
+        }
+        var authz = aws_auth_validate_build_authz_check($scope);
+        if (authz !== null) {
+            body.authz_check = authz;
+        }
+    }
     return body;
+}
+
+// Assemble the LDAP `queries` map from the four data-av-query textareas within
+// the ldap field group. Each non-empty box contributes {query_name: dsl_string}
+// where the value is the raw DSL text (trimmed); the backend parses and, when a
+// username is present, evaluates it. An empty box is omitted so the backend
+// keeps that query unset. The DSL string is sent verbatim -- the backend owns
+// the grammar (query_invalid on a parse failure), so the UI does not pre-parse.
+function aws_auth_validate_build_queries($scope) {
+    var queries = {};
+    $scope.find('[data-av-query]').each(function() {
+        var el = $(this);
+        var name = el.attr('data-av-query');
+        var val = ('' + el.val()).trim();
+        if (val.length > 0) { queries[name] = val; }
+    });
+    return queries;
+}
+
+// Parse the scope_aliases textarea (one "alias = scope1 scope2 ..." per line)
+// into the map shape the backend requires: {alias: [scope, ...]}. Blank lines
+// and #-comment lines are ignored. A line with no '=' or no scopes is skipped
+// (the backend rejects a malformed scope_aliases with input_invalid; we simply
+// do not emit an ill-formed entry, so the operator sees their real typo rather
+// than a silently-mangled value). Values are kept case-sensitive.
+function aws_auth_validate_parse_scope_aliases(text) {
+    var out = {};
+    var lines = ('' + text).split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (line.length === 0 || line.charAt(0) === '#') { continue; }
+        var eq = line.indexOf('=');
+        if (eq === -1) { continue; }
+        var alias = line.substring(0, eq).trim();
+        var scopes = line.substring(eq + 1).trim().split(/\s+/)
+            .filter(function(s) { return s.length > 0; });
+        if (alias.length === 0 || scopes.length === 0) { continue; }
+        out[alias] = scopes;
+    }
+    return out;
+}
+
+// Assemble the authz_check object from its form inputs. Returns null when no
+// permission is selected (the check is opt-in: no permission means the operator
+// is not asking for an authorization decision, so the field is omitted and the
+// backend runs reachability + token verification only). vhost is omitted when
+// blank so the backend applies its documented default ("/").
+function aws_auth_validate_build_authz_check($form) {
+    var perm = $form.find('[data-av-authz="permission"]').val();
+    if (!perm || ('' + perm).length === 0) { return null; }
+    var check = {permission: perm};
+    var resource = $form.find('[data-av-authz="resource"]').val();
+    if (resource !== null && resource !== undefined && ('' + resource).length > 0) {
+        check.resource = resource;
+    }
+    var vhost = $form.find('[data-av-authz="vhost"]').val();
+    if (vhost !== null && vhost !== undefined && ('' + vhost).length > 0) {
+        check.vhost = vhost;
+    }
+    return check;
 }
 
 // The JSON body that most recently returned 204, as a normalized string. Used
@@ -131,24 +240,35 @@ var AWS_AUTH_VALIDATE_LAST_VALID = null;
 // A "method" key, if present, selects the matching method tab and is not treated
 // as a form field (the real endpoint takes the method from the URL, not the body).
 function aws_auth_validate_populate_form(method, body) {
-    var $form = $('#aws-auth-validate-form');
+    var $scope = $('#aws-av-fields-' + method);
 
-    // Clear the currently-visible method's fields and the shared ssl_options.
-    $('#aws-av-fields-' + method).find('[data-av-field]').each(function() {
+    // Fields with no rabbitmq.conf representation (oauth scope_aliases /
+    // authz_check, ldap username / queries) carry runtime validation intent the
+    // pasted conf knows nothing about. A parse must NOT silently wipe them, so
+    // snapshot their current values and restore them after the clear-and-
+    // repopulate below.
+    var preservedNonConf = aws_auth_validate_snapshot_nonconf(method);
+
+    // Clear the selected method's fields and its own ssl_options. Both scans are
+    // scoped to this method's group: ssl inputs now live per-method (the key set
+    // differs per backend), so a form-wide clear would wipe another method's
+    // values.
+    $scope.find('[data-av-field]').each(function() {
         var el = $(this);
         if (el.is(':checkbox')) { el.prop('checked', false); } else { el.val(''); }
     });
-    $form.find('[data-av-ssl]').each(function() {
+    $scope.find('[data-av-ssl]').each(function() {
         var el = $(this);
         if (el.is(':checkbox')) { el.prop('checked', false); } else { el.val(''); }
     });
+    aws_auth_validate_restore_nonconf(method, preservedNonConf);
 
     if (!body || typeof body !== 'object') { return; }
 
     var ssl = (body.ssl_options && typeof body.ssl_options === 'object') ? body.ssl_options : {};
 
     // Top-level fields for the selected method.
-    $('#aws-av-fields-' + method).find('[data-av-field]').each(function() {
+    $scope.find('[data-av-field]').each(function() {
         var el = $(this);
         var key = el.attr('data-av-field');
         if (!Object.prototype.hasOwnProperty.call(body, key)) { return; }
@@ -162,8 +282,8 @@ function aws_auth_validate_populate_form(method, body) {
         }
     });
 
-    // Shared ssl_options sub-fields.
-    $form.find('[data-av-ssl]').each(function() {
+    // This method's ssl_options sub-fields.
+    $scope.find('[data-av-ssl]').each(function() {
         var el = $(this);
         var key = el.attr('data-av-ssl');
         if (!Object.prototype.hasOwnProperty.call(ssl, key)) { return; }
@@ -204,11 +324,11 @@ var AWS_AUTH_VALIDATE_CONF = {
             'auth_ldap.dn_lookup_base':                         {path: ['dn_lookup_base'], type: 'string', ex: 'dc=example,dc=com'},
             'auth_ldap.dn_lookup_attribute':                    {path: ['dn_lookup_attribute'], type: 'string', ex: 'sAMAccountName'},
             'auth_ldap.ssl_options.verify':                     {path: ['ssl_options', 'verify'], type: 'string', ex: 'verify_peer'},
-            'auth_ldap.ssl_options.sni':                        {path: ['ssl_options', 'sni'], type: 'string', ex: 'ldap.example.com'},
+            // LDAP's ssl_options accepts server_name_indication (NOT sni) and has
+            // no client-cert/mTLS material, so no certfile/keyfile ARN lines.
+            'auth_ldap.ssl_options.server_name_indication':     {path: ['ssl_options', 'server_name_indication'], type: 'string', ex: 'ldap.example.com'},
             'aws.arns.auth_ldap.dn_lookup_bind.password':       {path: ['password_arn'], type: 'string', ex: 'arn:aws:secretsmanager:us-west-2:111122223333:secret:RabbitMqDnLookupUserPassword'},
-            'aws.arns.auth_ldap.ssl_options.cacertfile':        {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'},
-            'aws.arns.auth_ldap.ssl_options.certfile':          {path: ['ssl_options', 'certfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/client-cert.pem'},
-            'aws.arns.auth_ldap.ssl_options.keyfile':           {path: ['ssl_options', 'keyfile_arn'], type: 'string', ex: 'arn:aws:secretsmanager:us-west-2:111122223333:secret:RabbitMqClientKey'}
+            'aws.arns.auth_ldap.ssl_options.cacertfile':        {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'}
         },
         formOnly: []
     },
@@ -234,6 +354,9 @@ var AWS_AUTH_VALIDATE_CONF = {
             'auth_oauth2.jwks_uri':                             {path: ['jwks_uri'], type: 'string', ex: 'https://idp.example.com/.well-known/jwks.json'},
             'auth_oauth2.issuer':                               {path: ['issuer'], type: 'string', ex: 'https://idp.example.com/'},
             'auth_oauth2.resource_server_id':                   {path: ['resource_server_id'], type: 'string', ex: 'rabbitmq'},
+            'auth_oauth2.scope_prefix':                         {path: ['scope_prefix'], type: 'string', ex: 'rabbitmq.'},
+            'auth_oauth2.additional_scopes_key':               {path: ['additional_scopes_key'], type: 'string', ex: 'roles'},
+            'auth_oauth2.scope_pattern_syntax':                 {path: ['scope_pattern_syntax'], type: 'string', ex: 'wildcard'},
             'auth_oauth2.ssl_options.verify':                   {path: ['ssl_options', 'verify'], type: 'string', ex: 'verify_peer'},
             'auth_oauth2.ssl_options.sni':                      {path: ['ssl_options', 'sni'], type: 'string', ex: 'idp.example.com'},
             'aws.arns.auth_oauth2.ssl_options.cacertfile':      {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'},
@@ -247,18 +370,19 @@ var AWS_AUTH_VALIDATE_CONF = {
     tls: {
         // TLS validation targets a broker listener; the mTLS/SSL tutorials
         // configure ssl_options at the top level (no auth_<backend> prefix).
+        // The material is inbound-listener trust config: cacertfile_arn, verify,
+        // and fail_if_no_peer_cert only -- no sni and no client cert/key (the
+        // server cert is AWS-managed).
         backend: null,
         map: {
             'ssl_options.verify':                               {path: ['ssl_options', 'verify'], type: 'string', ex: 'verify_peer'},
-            'ssl_options.sni':                                  {path: ['ssl_options', 'sni'], type: 'string', ex: 'listener.example.com'},
-            'aws.arns.ssl_options.cacertfile':                  {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'},
-            'aws.arns.ssl_options.certfile':                    {path: ['ssl_options', 'certfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/client-cert.pem'},
-            'aws.arns.ssl_options.keyfile':                     {path: ['ssl_options', 'keyfile_arn'], type: 'string', ex: 'arn:aws:secretsmanager:us-west-2:111122223333:secret:RabbitMqClientKey'}
+            'ssl_options.fail_if_no_peer_cert':                 {path: ['ssl_options', 'fail_if_no_peer_cert'], type: 'bool', ex: 'true'},
+            'aws.arns.ssl_options.cacertfile':                  {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'}
         },
         // `target` names the listener under test; it is a validation concept,
         // not a rabbitmq.conf key.
         formOnly: ['target'],
-        notes: ['# target: enter the listener name in the "Target" form field above (a validation concept, not a rabbitmq.conf key).']
+        notes: ['# target: enter "listener" or "management" in the "Target" form field above (a validation concept, not a rabbitmq.conf key).']
     }
 };
 
@@ -455,18 +579,27 @@ function aws_auth_validate_merge_conf(method, existingText, body) {
                 }
                 // Drop the original server line (replaced by the block above).
             } else {
-                out.push(line); // form has no servers -- leave existing untouched
+                // Form has no servers -- leave the existing line untouched.
+                out.push(line);
             }
             continue;
         }
 
-        // Managed scalar key the form supplies: update value in place, keeping
-        // the operator's original indentation and key spelling.
+        // Managed scalar key the form supplies: update the FIRST occurrence in
+        // place, keeping the operator's original indentation and key spelling.
         if (Object.prototype.hasOwnProperty.call(desired, k) && !seen[k]) {
             var leadingWs = line.match(/^\s*/)[0];
             var origKey = trimmed.substring(0, eq).trim();
             out.push(leadingWs + origKey + ' = ' + desired[k].value);
             seen[k] = true;
+            continue;
+        }
+        // A LATER duplicate of a managed key we already updated: drop it. cuttlefish
+        // is last-wins, so a stale duplicate left after the updated line would
+        // override our value at config-load time -- the exact silent-drift this
+        // sync is meant to prevent. Only managed keys are de-duplicated; unrelated
+        // duplicate config is none of our business and is preserved below.
+        if (Object.prototype.hasOwnProperty.call(desired, k) && seen[k]) {
             continue;
         }
 
@@ -527,6 +660,87 @@ function aws_auth_validate_overlay_form_only(method, body) {
         } else if (val !== null && val !== undefined && ('' + val).length > 0) {
             body[key] = val;
         }
+    }
+}
+
+// Body fields that have NO rabbitmq.conf representation and so must be ignored
+// when comparing the fields against the conf box (they can only ever live in the
+// form):
+//   * oauth scope_aliases (encoded in conf as dynamic sub-keys, not a single
+//     line) and authz_check (a runtime validation concept, never broker config).
+//   * ldap username (a runtime principal identifier, not config) and queries
+//     (the conf map has no auth_ldap.queries.* entries, so the query DSL is only
+//     ever entered in the form).
+// access_token / target are already handled via formOnly + overlay, so they are
+// not repeated here. Returns a shallow copy with these keys removed.
+var AWS_AUTH_VALIDATE_NONCONF_FIELDS = {
+    oauth: ['scope_aliases', 'authz_check'],
+    ldap: ['username', 'queries']
+};
+function aws_auth_validate_strip_nonconf(method, body) {
+    var drop = AWS_AUTH_VALIDATE_NONCONF_FIELDS[method] || [];
+    if (drop.length === 0 || !body || typeof body !== 'object') { return body; }
+    var out = {};
+    for (var k in body) {
+        if (!Object.prototype.hasOwnProperty.call(body, k)) { continue; }
+        if (drop.indexOf(k) !== -1) { continue; }
+        out[k] = body[k];
+    }
+    return out;
+}
+
+// Return a shallow copy of `body` with any top-level key whose value is boolean
+// `false` removed. Used ONLY to normalize the divergence comparison (see the
+// submit handler): to every backend an absent boolean equals an explicit
+// `false', so an unchecked box (key omitted) and a pasted `= false' (key present
+// as false) must compare equal. Non-boolean values and `true' are left as-is, so
+// this never masks a real difference. Nested objects (ssl_options) are not
+// descended into: their booleans (e.g. tls fail_if_no_peer_cert) are only ever
+// present when the operator set them, so the omit-vs-false asymmetry does not
+// arise there.
+function aws_auth_validate_strip_false_bools(body) {
+    if (!body || typeof body !== 'object') { return body; }
+    var out = {};
+    for (var k in body) {
+        if (!Object.prototype.hasOwnProperty.call(body, k)) { continue; }
+        if (body[k] === false) { continue; }
+        out[k] = body[k];
+    }
+    return out;
+}
+
+// The DOM inputs backing the non-conf fields for a method. Snapshot/restore lets
+// "Parse into fields" reload the conf-backed fields without discarding work the
+// pasted conf cannot express:
+//   * oauth: the scope_aliases textarea (a data-av-field with no conf key) and
+//     the authz_check sub-inputs (data-av-authz).
+//   * ldap: the username field and the four query textareas (data-av-query).
+function aws_auth_validate_nonconf_inputs(method) {
+    var $group = $('#aws-av-fields-' + method);
+    if (method === 'oauth') {
+        return $group.find('[data-av-field="scope_aliases"]')
+                     .add($group.find('[data-av-authz]'));
+    }
+    if (method === 'ldap') {
+        return $group.find('[data-av-field="username"]')
+                     .add($group.find('[data-av-query]'));
+    }
+    return $();
+}
+function aws_auth_validate_snapshot_nonconf(method) {
+    var snap = [];
+    aws_auth_validate_nonconf_inputs(method).each(function() {
+        var el = $(this);
+        snap.push({el: el, checkbox: el.is(':checkbox'),
+                   value: el.is(':checkbox') ? el.is(':checked') : el.val()});
+    });
+    return snap;
+}
+function aws_auth_validate_restore_nonconf(_method, snap) {
+    if (!snap) { return; }
+    for (var i = 0; i < snap.length; i++) {
+        var s = snap[i];
+        if (s.checkbox) { s.el.prop('checked', !!s.value); } else { s.el.val(s.value); }
     }
 }
 
@@ -594,8 +808,25 @@ $(document).on('click', '#aws-auth-validate-submit', function() {
         // they have no conf key and would otherwise read as a false divergence.
         var pastedBody = aws_auth_validate_conf_to_body(method, raw).body;
         aws_auth_validate_overlay_form_only(method, pastedBody);
-        if (aws_auth_validate_normalize_body(pastedBody) !==
-            aws_auth_validate_normalize_body(body)) {
+        // Some fields have no rabbitmq.conf representation at all (oauth
+        // scope_aliases uses dynamic sub-keys; authz_check is a runtime
+        // validation concept, not config). The conf box can never carry them, so
+        // comparing them would always read as divergence. Drop them from BOTH
+        // sides for the comparison only -- the real request body keeps them.
+        //
+        // Booleans are also normalized away when false: an unchecked box omits
+        // the key entirely while a pasted `use_ssl = false' parses to
+        // {use_ssl:false}. To the backend an absent boolean and an explicit
+        // `false' are identical (both mean "off"), so treating that difference as
+        // divergence would wrongly block Validate. Stripping false-valued keys
+        // from both sides makes the comparison match the backend's semantics
+        // without altering the request body actually sent.
+        var pastedCmp = aws_auth_validate_strip_false_bools(
+            aws_auth_validate_strip_nonconf(method, pastedBody));
+        var fieldsCmp = aws_auth_validate_strip_false_bools(
+            aws_auth_validate_strip_nonconf(method, body));
+        if (aws_auth_validate_normalize_body(pastedCmp) !==
+            aws_auth_validate_normalize_body(fieldsCmp)) {
             aws_auth_validate_config_status(
                 'The config box differs from the fields. Validation runs on the ' +
                 'fields -- click "Parse into fields" to use the pasted config, or ' +
@@ -768,11 +999,27 @@ function aws_auth_validate_req(method, body, confText) {
         req.setRequestHeader('authorization', header);
     }
     req.setRequestHeader('content-type', 'application/json');
+    // Register with the console's in-flight request list (when present) so a
+    // navigate-away aborts this PUT along with every other pending request --
+    // main.js abort loop walks outstanding_reqs. Guarded because it is an
+    // external console global; a standalone/older console without it still works
+    // (the request just is not centrally abortable, as before).
+    if (typeof outstanding_reqs !== 'undefined' && outstanding_reqs &&
+        typeof outstanding_reqs.push === 'function') {
+        outstanding_reqs.push(req);
+    }
     // The conf text on screen; on 204 this becomes the "last validated config"
     // so the copy button can flag later edits. The wire body stays JSON (the
     // endpoint's contract) -- only the textarea and clipboard use conf.
     req.onreadystatechange = function() {
         if (req.readyState !== 4) return;
+        // De-register from the console's in-flight list before rendering, so a
+        // completed request is not left for a later navigate-away to abort.
+        if (typeof outstanding_reqs !== 'undefined' && outstanding_reqs &&
+            typeof jQuery !== 'undefined') {
+            var ix = jQuery.inArray(req, outstanding_reqs);
+            if (ix !== -1) { outstanding_reqs.splice(ix, 1); }
+        }
         aws_auth_validate_render_result(req, confText);
     };
     req.send(JSON.stringify(body));
@@ -803,20 +1050,24 @@ function aws_auth_validate_render_result(req, confText) {
     var info = AWS_AUTH_VALIDATE_CATEGORY[category] ||
         {cls: 'status-red', text: 'Unexpected response (' + req.status + ').'};
     var html = '<div class="' + info.cls + '" style="padding:8px;">' +
-        '<strong>' + fmt_escape_html(category) + '</strong> &mdash; ' +
-        fmt_escape_html(info.text);
+        '<strong>' + aws_av_escape_html(category) + '</strong> &mdash; ' +
+        aws_av_escape_html(info.text);
     // The backend message is a fixed, non-secret string; safe to show, still escaped.
     if (message) {
-        html += '<br/><span class="argument">' + fmt_escape_html(message) + '</span>';
+        html += '<br/><span class="argument">' + aws_av_escape_html(message) + '</span>';
     }
     html += ' <span class="argument">(HTTP ' + (req.status || 'n/a') + ')</span></div>';
     $('#aws-auth-validate-result').html(html);
 }
 
-// Minimal HTML escaper (the console bundles fmt_escape_html in newer releases;
-// fall back to a local one so this works across broker versions).
-function fmt_escape_html(s) {
-    if (typeof window.fmt_escape_html === 'function' && window.fmt_escape_html !== fmt_escape_html) {
+// Minimal HTML escaper, private to this view. Named with the aws_av_ prefix (not
+// fmt_escape_html) so it never shadows the console's own global fmt_escape_html
+// (defined in the management plugin's formatters.js and relied on by other
+// views, e.g. for \n -> <br/> rendering). Prefer the console's global when it is
+// present so behavior matches the rest of the UI; fall back to this local
+// implementation on older brokers that do not bundle it.
+function aws_av_escape_html(s) {
+    if (typeof window.fmt_escape_html === 'function') {
         return window.fmt_escape_html(s);
     }
     return ('' + s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
