@@ -196,8 +196,9 @@
     "a resource string, and an optional vhost string"
 >>).
 -define(REASON_BAD_AUTHZ_CONFIG, <<
-    "scope_aliases must be an object, additional_scopes_key/scope_prefix a "
-    "string, and scope_pattern_syntax one of wildcard|regex"
+    "scope_aliases must be an object mapping each alias name (string) to a list "
+    "of scope strings, additional_scopes_key/scope_prefix a string, and "
+    "scope_pattern_syntax one of wildcard|regex"
 >>).
 -define(REASON_AUTHZ_NEEDS_TOKEN, <<
     "authz_check requires an access_token to evaluate"
@@ -587,7 +588,7 @@ parse_authz_scope_config(Body, Acc) ->
     Syntax = maps:get(<<"scope_pattern_syntax">>, Body, <<"wildcard">>),
     case
         {
-            valid_opt(Aliases, fun is_map/1),
+            valid_opt(Aliases, fun valid_scope_aliases/1),
             valid_opt(AddKey, fun erlang:is_binary/1),
             valid_opt(Prefix, fun erlang:is_binary/1),
             parse_syntax(Syntax)
@@ -614,6 +615,40 @@ parse_authz_scope_config(Body, Acc) ->
 
 valid_opt(undefined, _Pred) -> true;
 valid_opt(V, Pred) -> Pred(V).
+
+%% scope_aliases must match the shape the broker's #resource_server{} record
+%% holds: a map of alias-name binary => list of scope binaries. The oauth2
+%% schema (rabbit_oauth2_schema:translate_scope_aliases/1) produces exactly
+%% #{binary() => [binary()]}, so a request that supplies any other shape is
+%% describing a config the broker could never hold.
+%%
+%% Beyond the parity gap, an unvalidated value is a crash footgun (the same
+%% class as the authz_check.vhost fix): when a token scope matches an alias key,
+%% the backend runs rabbit_data_coercion:to_binary/1 over the value, which has
+%% no clause for a float or a map and raises. The outer network catch would then
+%% misreport that crash as a connection failure -- the exact misclassification
+%% the pure-phase guards exist to prevent. Reject the bad shape here with
+%% input_invalid so the caller is told their scope_aliases is malformed.
+%%
+%% We require a list of scope strings (not a bare string) so there is no
+%% ambiguity about space-splitting: the config path space-splits a string into a
+%% list, but the caller supplies the already-split list directly here.
+valid_scope_aliases(Map) when is_map(Map) ->
+    maps:fold(
+        fun
+            (K, V, true) -> is_binary(K) andalso is_list_of_binaries(V);
+            (_K, _V, false) -> false
+        end,
+        true,
+        Map
+    );
+valid_scope_aliases(_) ->
+    false.
+
+is_list_of_binaries(L) when is_list(L) ->
+    lists:all(fun erlang:is_binary/1, L);
+is_list_of_binaries(_) ->
+    false.
 
 maybe_put(_Key, undefined, Acc) -> Acc;
 maybe_put(Key, Value, Acc) -> Acc#{Key => Value}.

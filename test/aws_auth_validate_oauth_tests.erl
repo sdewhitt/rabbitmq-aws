@@ -1064,6 +1064,55 @@ authz_check_non_binary_vhost_rejected_test() ->
     },
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
 
+%% scope_aliases must be a map of alias-name => list-of-scope-strings (the shape
+%% the broker's #resource_server{} record holds). These pure-phase tests assert
+%% the malformed shapes that would otherwise reach the broker matcher and crash
+%% rabbit_data_coercion:to_binary/1 (float / map values), or describe a config
+%% the broker could never hold, are rejected as input_invalid before any network
+%% or crypto. A valid authz_check + resource_server_id + access_token are
+%% supplied so the request reaches parse_authz_scope_config rather than an
+%% earlier guard.
+authz_scope_aliases_helper_body(Aliases) ->
+    #{sign := Sign} = rsa_signer(<<"k1">>),
+    Token = Sign(#{<<"exp">> => future()}),
+    (jwks_body())#{
+        <<"access_token">> => Token,
+        <<"resource_server_id">> => <<"rabbitmq">>,
+        <<"scope_aliases">> => Aliases,
+        <<"authz_check">> => #{
+            <<"resource">> => <<"q">>,
+            <<"permission">> => <<"read">>
+        }
+    }.
+
+%% A float alias value would crash to_binary/1 on a matching scope; reject it.
+authz_scope_aliases_float_value_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => 1.5}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A nested-object alias value would crash to_binary/1; reject it.
+authz_scope_aliases_object_value_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => #{<<"x">> => 1}}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A bare-string alias value is not the record shape (broker holds a list);
+%% require the caller to supply the already-split list, so reject a string.
+authz_scope_aliases_bare_string_value_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => <<"rabbitmq.read:*/*">>}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% A list containing a non-binary (mixed list) crashes to_binary/1 element-wise;
+%% reject the whole value.
+authz_scope_aliases_mixed_list_rejected_test() ->
+    Body = authz_scope_aliases_helper_body(#{<<"admin">> => [<<"ok">>, 1.5]}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:validate(Body)).
+
+%% Note: the valid scope_aliases shape (alias => list of scope strings) is
+%% already exercised end-to-end through the JWKS mock by
+%% authz_iam_scope_alias_grants_access_test_/0, which asserts a grant, so no
+%% separate positive shape test is added here (a bare validate/1 without the
+%% network mock would attempt a real JWKS fetch).
+
 %% Run Fun only if the oauth2 backend's arity-4 scope API is available.
 %%
 %% Distinct states, deliberately handled differently (Luke's blocking
