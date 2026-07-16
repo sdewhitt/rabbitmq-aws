@@ -397,12 +397,21 @@ function aws_auth_validate_merge_conf(method, existingText, body) {
     var spec = AWS_AUTH_VALIDATE_CONF[method];
 
     // Desired scalar key -> rendered value, for managed keys the form supplies.
+    // remove holds boolean keys the form does NOT supply: an unchecked checkbox
+    // is omitted from the body, and for booleans that means "off", so any stale
+    // line for it must be dropped rather than preserved. (Empty string/int fields
+    // are left absent from both maps and preserved verbatim below, so we never
+    // wipe config the operator did not touch.)
     var desired = {};
+    var remove = {};
     for (var key in spec.map) {
         if (!Object.prototype.hasOwnProperty.call(spec.map, key)) { continue; }
         var desc = spec.map[key];
         var v = aws_auth_validate_get_path(body, desc.path);
-        if (v === undefined || v === null || ('' + v).length === 0) { continue; }
+        if (v === undefined || v === null || ('' + v).length === 0) {
+            if (desc.type === 'bool') { remove[key.toLowerCase()] = true; }
+            continue;
+        }
         if (desc.type === 'bool') { v = v ? 'true' : 'false'; }
         desired[key.toLowerCase()] = {canonical: key, value: '' + v};
     }
@@ -461,8 +470,14 @@ function aws_auth_validate_merge_conf(method, existingText, body) {
             continue;
         }
 
-        // Any other line (unrelated config, another method's keys, a managed key
-        // the form left empty, assume_role) is preserved verbatim.
+        // Managed boolean key the form left unchecked ("off"): drop the stale
+        // line so unchecking (e.g. use_starttls) removes it from the config.
+        if (Object.prototype.hasOwnProperty.call(remove, k)) {
+            continue;
+        }
+
+        // Any other line (unrelated config, another method's keys, a managed
+        // string/int key the form left empty, assume_role) is preserved verbatim.
         out.push(line);
     }
 
@@ -558,33 +573,84 @@ function aws_auth_validate_config_status(text, cls) {
         .attr('class', 'argument' + (cls ? ' ' + cls : ''));
 }
 
-// Submit the current method. The rabbitmq.conf textarea is authoritative when it
-// holds content (an operator may have pasted or hand-edited config lines), so we
-// parse and send that; otherwise we build the body from the visible form and
-// reflect it back into the textarea as conf so what was validated is always
-// visible. Form-only fields (oauth access_token, tls target) have no conf key,
-// so they are always overlaid from the form. Bound as a delegated click so it
+// Submit the current method. The left-hand fields are the single source of
+// truth for validation; the rabbitmq.conf box is a paste/copy convenience that
+// never drives the request. This prevents the source-of-truth trap where the
+// fields are invalid but a differing pasted config looks valid -- we would
+// otherwise validate one thing while the operator reads another. If the box has
+// content that diverges from the fields, we block and point the operator at the
+// Parse / Update buttons to reconcile first. Bound as a delegated click so it
 // survives re-renders. Never a GET/route param -- the body may carry an ARN.
 $(document).on('click', '#aws-auth-validate-submit', function() {
     var method = $('#aws-auth-validate-method').val();
+    // Always build the request from the visible fields.
+    var body = aws_auth_validate_build_body(method);
+
     var raw = ('' + $('#aws-auth-validate-config').val()).trim();
-    var body;
     if (raw.length > 0) {
-        var parsed = aws_auth_validate_conf_to_body(method, raw);
-        body = parsed.body;
-        // Form-only fields never appear in conf; take them from the form.
-        aws_auth_validate_overlay_form_only(method, body);
+        // The box is non-empty: make sure it matches the fields before we run,
+        // so what is validated is exactly what is displayed. Overlay form-only
+        // fields (oauth access_token, tls target) onto the parsed body since
+        // they have no conf key and would otherwise read as a false divergence.
+        var pastedBody = aws_auth_validate_conf_to_body(method, raw).body;
+        aws_auth_validate_overlay_form_only(method, pastedBody);
+        if (aws_auth_validate_normalize_body(pastedBody) !==
+            aws_auth_validate_normalize_body(body)) {
+            aws_auth_validate_config_status(
+                'The config box differs from the fields. Validation runs on the ' +
+                'fields -- click "Parse into fields" to use the pasted config, or ' +
+                '"Update config from fields" to sync the box, then Validate again.',
+                'status-yellow');
+            return false;
+        }
     } else {
-        body = aws_auth_validate_build_body(method);
+        // Nothing pasted: reflect the fields into the box so the validated
+        // config is always visible and copyable.
         aws_auth_validate_set_config_text(aws_auth_validate_body_to_conf(method, body));
     }
+
     // Remember the exact conf text on screen so a 204 can mark it validated and
-    // the copy button can flag later edits. If the operator pasted conf we keep
-    // their text verbatim (comments and all); otherwise it is the generated conf.
+    // the copy button can flag later edits. It is now guaranteed consistent with
+    // the fields (verified above, or generated from them).
     var confText = '' + $('#aws-auth-validate-config').val();
+    // Clear any prior result and show a spinner immediately. A slow failure can
+    // take several seconds, during which a stale success banner would otherwise
+    // linger and mislead; the spinner makes "in progress" unambiguous.
+    aws_auth_validate_show_loading();
     aws_auth_validate_req(method, body, confText);
     return false;
 });
+
+// Stable stringification of a request body for divergence comparison: object
+// keys are sorted recursively so key order and whitespace never trigger a false
+// mismatch. Array order is preserved (the ldap servers list is meaningful).
+function aws_auth_validate_normalize_body(body) {
+    return JSON.stringify(aws_auth_validate_sort_keys(body));
+}
+function aws_auth_validate_sort_keys(v) {
+    if (Object.prototype.toString.call(v) === '[object Array]') {
+        return v.map(aws_auth_validate_sort_keys);
+    }
+    if (v && typeof v === 'object') {
+        var out = {};
+        Object.keys(v).sort().forEach(function(k) {
+            out[k] = aws_auth_validate_sort_keys(v[k]);
+        });
+        return out;
+    }
+    return v;
+}
+
+// Replace the result area with a spinner while a request is in flight. Cleared
+// by aws_auth_validate_render_result when the response (or transport error)
+// arrives.
+function aws_auth_validate_show_loading() {
+    $('#aws-auth-validate-result').html(
+        '<div class="status-grey" style="padding:8px;">' +
+        '<span class="aws-av-spinner"></span>' +
+        '<span class="argument">Validating&hellip;</span></div>'
+    );
+}
 
 // Parse the textarea rabbitmq.conf into the form fields. Lines that do not apply
 // to the selected method are ignored; aws.arns.assume_role_arn is skipped (read

@@ -20,6 +20,22 @@ SPDX-License-Identifier: Apache-2.0
 /* Keep the field-title column on a single line (don't let the wider inputs
    squeeze the labels into wrapping). */
 #aws-auth-validate-form table.form th { white-space: nowrap; }
+
+/* Loading indicator shown while a validation request is in flight. A slow
+   failure can take several seconds; the spinner replaces any prior result so a
+   stale success banner is never shown mid-run. */
+#aws-auth-validate-result .aws-av-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin-right: 8px;
+  vertical-align: middle;
+  border: 2px solid #ccc;
+  border-top-color: #555;
+  border-radius: 50%;
+  animation: aws-av-spin 0.7s linear infinite;
+}
+@keyframes aws-av-spin { to { transform: rotate(360deg); } }
 </style>
 
 <h1>Auth Validation</h1>
@@ -158,7 +174,7 @@ SPDX-License-Identifier: Apache-2.0
               spellcheck="false" autocomplete="off" autocapitalize="off"
               style="width:100%; font-family:monospace; box-sizing:border-box;"
               placeholder="auth_backends.1 = ldap&#10;auth_ldap.servers.1 = ldap.example.com&#10;auth_ldap.port = 636&#10;auth_ldap.use_ssl = true&#10;auth_ldap.dn_lookup_bind.user_dn = cn=admin,dc=example,dc=com&#10;auth_ldap.ssl_options.verify = verify_peer&#10;aws.arns.auth_ldap.dn_lookup_bind.password = arn:aws:secretsmanager:..."></textarea>
-    <div style="margin-top:6px;">
+    <div style="margin-top:6px; display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
       <button type="button" id="aws-auth-validate-parse">Parse into fields</button>
       <button type="button" id="aws-auth-validate-build">Update config from fields</button>
       <button type="button" id="aws-auth-validate-copy">Copy config</button>
