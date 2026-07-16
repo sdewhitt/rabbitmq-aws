@@ -1066,33 +1066,57 @@ authz_check_non_binary_vhost_rejected_test() ->
 
 %% Run Fun only if the oauth2 backend's arity-4 scope API is available.
 %%
-%% Three distinct states, deliberately handled differently (Luke's blocking
-%% coverage-gap note): a bare `available() -> false' skip would collapse the two
-%% false cases together and let a portability regression pass CI green.
-%%   * available()                       -> run the tests.
-%%   * NOT available, backend not loaded -> legitimate skip (return []), the same
-%%     way the LDAP suite skips without slapd. The feature genuinely cannot run.
-%%   * NOT available, backend IS loaded  -> HARD FAILURE. The oauth2 backend is
-%%     present but too old to expose resource_access/4 etc.; that is exactly the
-%%     build-guard portability bug. It must turn CI red, not silently skip.
+%% Distinct states, deliberately handled differently (Luke's blocking
+%% coverage-gap note): a bare `available() -> false' skip would let a
+%% portability regression pass CI green.
+%%   * available()                                 -> run the tests.
+%%   * NOT available, evaluator NOT compiled in    -> legitimate skip ([]). This
+%%     is a pre-floor broker series (oauth2.hrl lacks the arity-4 scope API), so
+%%     the feature is genuinely unavailable by design -- same as the LDAP suite
+%%     skipping without slapd.
+%%   * NOT available, evaluator compiled in, but
+%%     backend loaded                              -> HARD FAILURE. The evaluator
+%%     was built (the Makefile saw the arity-4 API) and the backend is loaded,
+%%     yet available/0 is false at runtime: a genuine portability regression. It
+%%     must turn CI red, not silently skip.
+%%   * NOT available, evaluator compiled in,
+%%     backend NOT loaded                          -> legitimate skip ([]): the
+%%     backend simply is not running on this node.
+%%
+%% NOTE: gate the hard failure on evaluator_compiled_in/0, not backend_loaded/0
+%% alone. rabbitmq_auth_backend_oauth2 is in TEST_DEPS, so the module is loadable
+%% even on a pre-floor series where the evaluator was correctly NOT compiled in;
+%% keying the hard failure on backend_loaded alone would wrongly fail that
+%% legitimate case.
 maybe_skip_authz(Fun) ->
     case aws_auth_validate_oauth_authz:available() of
         true ->
             Fun();
         false ->
-            case aws_auth_validate_oauth_authz:backend_loaded() of
-                false ->
-                    %% Backend genuinely absent -- legitimate skip.
-                    [];
-                true ->
-                    %% Present-but-unusable: fail loudly rather than skip.
-                    [
-                        ?_assertEqual(
-                            backend_loaded_but_authz_api_absent,
-                            available_with_loaded_backend
-                        )
-                    ]
-            end
+            maybe_skip_authz_unavailable(),
+            []
+    end.
+
+%% available/0 is false. If the evaluator was compiled in AND the backend is
+%% loaded, that is the portability regression -- fail loudly (a runtime error,
+%% not a two-literal ?assertEqual, which erlc rejects with a "guard evaluates to
+%% false" warning under warnings-as-errors). Otherwise the unavailability is
+%% legitimate and the caller skips.
+maybe_skip_authz_unavailable() ->
+    case
+        aws_auth_validate_oauth_authz:evaluator_compiled_in() andalso
+            aws_auth_validate_oauth_authz:backend_loaded()
+    of
+        true ->
+            erlang:error(
+                {backend_loaded_but_authz_api_absent,
+                    "rabbitmq_auth_backend_oauth2 is loaded and the authz evaluator "
+                    "was compiled in, but available/0 is false: the arity-4 scope API "
+                    "this layer requires is missing. The build guard admitted an "
+                    "unsupported broker series."}
+            );
+        false ->
+            ok
     end.
 
 %% True when an {error, _, Reason} result's Reason binary contains Substr. Used

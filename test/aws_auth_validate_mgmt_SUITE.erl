@@ -60,6 +60,7 @@
 -export([
     oauth2_backend_available/0,
     oauth2_backend_loaded/0,
+    oauth2_evaluator_compiled_in/0,
     mock_oauth_network/1,
     unmock_oauth_network/0
 ]).
@@ -246,21 +247,34 @@ init_per_testcase(TC, Config) when
     %% is not (mirrors the eunit maybe_skip_authz and the LDAP suite's slapd skip).
     case rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_available, []) of
         false ->
-            %% available/0 is false. Distinguish the two reasons (Luke's blocking
-            %% coverage-gap note): if the oauth2 backend is not loaded at all,
-            %% skip legitimately (mirrors the LDAP suite's slapd skip); but if it
-            %% IS loaded and merely lacks the arity-4 scope API, that is the
-            %% build-guard portability bug and must FAIL rather than skip green.
-            case rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, oauth2_backend_loaded, []) of
-                false ->
-                    {skip, "rabbitmq_auth_backend_oauth2 is not loaded on the broker node"};
+            %% available/0 is false. Distinguish the reasons (Luke's blocking
+            %% coverage-gap note). Only fail when the evaluator was compiled in
+            %% (the Makefile saw the arity-4 API) AND the backend is loaded, yet
+            %% available/0 is still false -- a genuine portability regression.
+            %% A pre-floor broker series (evaluator NOT compiled in) or a node
+            %% without the backend running is a legitimate skip, the same way the
+            %% LDAP suite skips without slapd. Gate on evaluator_compiled_in, not
+            %% backend_loaded alone: rabbitmq_auth_backend_oauth2 is in TEST_DEPS
+            %% and so loadable even on a pre-floor series.
+            EvaluatorCompiledIn = rabbit_ct_broker_helpers:rpc(
+                Config, 0, ?MODULE, oauth2_evaluator_compiled_in, []
+            ),
+            BackendLoaded = rabbit_ct_broker_helpers:rpc(
+                Config, 0, ?MODULE, oauth2_backend_loaded, []
+            ),
+            case EvaluatorCompiledIn andalso BackendLoaded of
                 true ->
                     ct:fail(
-                        "rabbitmq_auth_backend_oauth2 is loaded on the broker node but "
+                        "rabbitmq_auth_backend_oauth2 is loaded on the broker node and "
+                        "the authz evaluator was compiled in, but "
                         "aws_auth_validate_oauth_authz:available/0 is false: the backend "
                         "does not export the arity-4 scope API this layer requires. The "
                         "build guard admitted an unsupported broker series."
-                    )
+                    );
+                false ->
+                    {skip,
+                        "OAuth authz evaluation unavailable on this broker node "
+                        "(pre-floor series or backend not loaded)"}
             end;
         true ->
             rabbit_ct_broker_helpers:rpc(
@@ -655,6 +669,13 @@ oauth2_backend_available() ->
 %% "backend present but too old" (hard failure) -- see Luke's coverage-gap note.
 oauth2_backend_loaded() ->
     aws_auth_validate_oauth_authz:backend_loaded().
+
+%% Runs ON THE BROKER NODE. True when the record-typed authz evaluator was
+%% compiled into the aws plugin build (the Makefile saw the arity-4 scope API in
+%% oauth2.hrl). Lets init_per_testcase scope the present-but-unusable hard
+%% failure to a genuine portability regression rather than a pre-floor series.
+oauth2_evaluator_compiled_in() ->
+    aws_auth_validate_oauth_authz:evaluator_compiled_in().
 
 %% Runs ON THE BROKER NODE. Stub ONLY the network seam so the REAL backend +
 %% registry + authz layer run: (1) aws_auth_validate_net:resolve_and_pin/2 skips

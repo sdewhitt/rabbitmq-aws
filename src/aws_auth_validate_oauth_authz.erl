@@ -71,7 +71,7 @@
 %% keeps validation parity with a broker configured for regex scopes.
 -module(aws_auth_validate_oauth_authz).
 
--export([maybe_check/2, available/0, backend_loaded/0]).
+-export([maybe_check/2, available/0, backend_loaded/0, evaluator_compiled_in/0]).
 
 %% persistent_term key caching a positive availability result (see available/0).
 -define(AVAIL_CACHE_KEY, {?MODULE, available}).
@@ -216,6 +216,18 @@ module_ready(Mod) ->
 -spec backend_loaded() -> boolean().
 backend_loaded() ->
     module_ready(?OAUTH2_MOD).
+
+%% True when the record-typed evaluator was compiled into this build (i.e. the
+%% Makefile saw the arity-4 scope API in oauth2.hrl and defined the macro). This
+%% is the COMPILE-TIME property; available/0 is the RUNTIME one. Tests use this
+%% to scope the "present-but-unusable" hard failure: only when the evaluator was
+%% compiled in but available/0 is still false at runtime is there a genuine
+%% portability regression to fail on. When the evaluator was NOT compiled in
+%% (a pre-floor broker series), a supplied authz_check is legitimately
+%% unavailable, so tests skip rather than fail.
+-spec evaluator_compiled_in() -> boolean().
+evaluator_compiled_in() ->
+    true.
 -else.
 %% Built against a broker series with no oauth2 resource_server record: the
 %% evaluator cannot be compiled in, so authz is unconditionally unavailable.
@@ -231,6 +243,11 @@ backend_loaded() ->
         {module, ?OAUTH2_MOD} -> true;
         _ -> false
     end.
+
+%% Evaluator was not compiled in on this build branch (pre-floor series).
+-spec evaluator_compiled_in() -> boolean().
+evaluator_compiled_in() ->
+    false.
 -endif.
 
 %% Optional layer: when the request carried an `authz_check' block, evaluate it
