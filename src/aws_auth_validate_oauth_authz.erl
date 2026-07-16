@@ -73,9 +73,6 @@
 
 -export([maybe_check/2, available/0, backend_loaded/0, evaluator_compiled_in/0]).
 
-%% persistent_term key caching a positive availability result (see available/0).
--define(AVAIL_CACHE_KEY, {?MODULE, available}).
-
 %% The evaluation path builds the broker's #resource_server{} record, so it needs
 %% that record's shape (from oauth2.hrl). But rabbitmq_auth_backend_oauth2 is a
 %% RUNTIME soft dependency, not a build DEPS: the plugin is compiled against a
@@ -173,28 +170,18 @@
 %% we actually want -- and stays false only when the backend genuinely is not
 %% deployed on this broker.
 %%
-%% Memoization: a positive result is cached in persistent_term so the per-request
-%% probe (3x code:ensure_loaded + 4x function_exported) runs at most once per
-%% boot. We cache ONLY `true' -- never `false' -- so a backend that loads AFTER
-%% the first call (e.g. plugin enabled at runtime) is still picked up on a later
-%% request rather than being pinned "unavailable" for the node's lifetime.
+%% The probe (3x code:ensure_loaded + 4x function_exported) runs on every request.
+%% It is deliberately not memoized: once the modules are loaded each check is a
+%% cheap in-VM hash lookup against the active code-index tables -- code:ensure_loaded
+%% short-circuits on erlang:module_loaded (no code-server round-trip), and
+%% function_exported/3 looks up the export table -- the endpoint is a rarely-hit,
+%% semaphore-bounded triage aid, and a stateless probe stays correct in both
+%% directions: it picks up a backend enabled after boot and, equally, reports a
+%% backend disabled at runtime (whose modules rabbit_plugins purges), where a
+%% cached `true' would leave available/0 stale and misreport the request.
 -spec available() -> boolean().
 -ifdef(HAVE_OAUTH2_RESOURCE_SERVER).
 available() ->
-    case persistent_term:get(?AVAIL_CACHE_KEY, false) of
-        true ->
-            true;
-        false ->
-            case probe_available() of
-                true ->
-                    persistent_term:put(?AVAIL_CACHE_KEY, true),
-                    true;
-                false ->
-                    false
-            end
-    end.
-
-probe_available() ->
     module_ready(?SCOPE_MOD) andalso
         module_ready(?OAUTH2_MOD) andalso
         module_ready(?RS_MOD) andalso
