@@ -94,32 +94,33 @@ accept_content(Req0, Context) ->
         true ->
             T0 = erlang:monotonic_time(millisecond),
             SourceIP = peer_ip(Req0),
+            User = username(Context),
             Method = cowboy_req:binding(method, Req0),
-            with_body(T0, SourceIP, Method, Req0, Context)
+            with_body(T0, SourceIP, User, Method, Req0, Context)
     end.
 
-with_body(T0, SourceIP, Method, Req0, Context) ->
+with_body(T0, SourceIP, User, Method, Req0, Context) ->
     MaxBytes = max_body_size(),
     case read_body(Req0, MaxBytes) of
         {error, body_too_large, Req1} ->
-            audit(Method, SourceIP, input_invalid, T0),
+            audit(Method, SourceIP, User, body_too_large, T0),
             reply_error(400, body_too_large, <<"Request body too large">>, Req1, Context);
         {ok, RawBody, Req1} ->
             case decode_json(RawBody) of
                 {error, _} ->
-                    audit(Method, SourceIP, input_invalid, T0),
+                    audit(Method, SourceIP, User, input_invalid, T0),
                     reply_error(400, input_invalid, <<"Invalid JSON body">>, Req1, Context);
                 {ok, BodyMap} when is_map(BodyMap) ->
-                    with_semaphore(T0, SourceIP, Method, BodyMap, Req1, Context);
+                    with_semaphore(T0, SourceIP, User, Method, BodyMap, Req1, Context);
                 {ok, _NotMap} ->
-                    audit(Method, SourceIP, input_invalid, T0),
+                    audit(Method, SourceIP, User, input_invalid, T0),
                     reply_error(
                         400, input_invalid, <<"JSON body must be an object">>, Req1, Context
                     )
             end
     end.
 
-with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
+with_semaphore(T0, SourceIP, User, Method, BodyMap, Req, Context) ->
     %% acquire/0 is a gen_server:call to the semaphore worker. The worker is
     %% started by aws_sup only at boot when the feature is enabled; if the env
     %% was flipped to true at runtime (no restart) or the supervisor gave up on
@@ -129,7 +130,7 @@ with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
     %% semaphore. Any other exit propagates (it is a genuine fault).
     case try_acquire() of
         not_ready ->
-            audit(Method, SourceIP, capacity_exhausted, T0),
+            audit(Method, SourceIP, User, capacity_exhausted, T0),
             reply_error(
                 503,
                 capacity_exhausted,
@@ -138,7 +139,7 @@ with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
                 Context
             );
         {error, full} ->
-            audit(Method, SourceIP, capacity_exhausted, T0),
+            audit(Method, SourceIP, User, capacity_exhausted, T0),
             reply_error(503, capacity_exhausted, <<"Service at capacity">>, Req, Context);
         {ok, Ref} ->
             try
@@ -155,11 +156,11 @@ with_semaphore(T0, SourceIP, Method, BodyMap, Req, Context) ->
                 %% rather than a 400 connection_failed, which would wrongly tell
                 %% the caller their LDAP server is unreachable.
                 Result = aws_auth_validate_registry:dispatch(Method, BodyMap),
-                audit(Method, SourceIP, result_category(Result), T0),
+                audit(Method, SourceIP, User, result_category(Result), T0),
                 respond(Result, Req, Context)
             catch
                 _Class:_Reason:_Stack ->
-                    audit(Method, SourceIP, internal_error, T0),
+                    audit(Method, SourceIP, User, internal_error, T0),
                     reply_error(
                         500,
                         internal_error,
@@ -287,12 +288,26 @@ decode_json(<<>>) ->
 decode_json(Raw) ->
     rabbit_json:try_decode(Raw).
 
-audit(Method, SourceIP, ResultCategory, T0) ->
+audit(Method, SourceIP, User, ResultCategory, T0) ->
     Duration = erlang:monotonic_time(millisecond) - T0,
     ?AWS_LOG_INFO(
-        "auth_validate: method=~ts source_ip=~ts result=~ts duration_ms=~B",
-        [Method, format_ip(SourceIP), ResultCategory, Duration]
+        "auth_validate: method=~ts user=~ts source_ip=~ts result=~ts duration_ms=~B",
+        [Method, User, format_ip(SourceIP), ResultCategory, Duration]
     ).
+
+%% The authenticated management user's name, for the audit trail. This endpoint
+%% is admin-gated and makes outbound connections to caller-chosen targets (an
+%% SSRF surface), so the acting principal -- not just the TCP peer IP, which
+%% behind the management load balancer is often the LB -- must be attributable.
+%% is_authorized/2 populates Context#context.user before accept_content/2 runs;
+%% an OPTIONS preflight is let through unauthenticated (user=undefined), but the
+%% feature toggle short-circuits OPTIONS before any audit, so a `<<"unknown">>'
+%% here only ever reflects an unexpected shape, never a real unaudited PUT. Only
+%% the username is logged -- never tags, target host, URL, or DN (R4/R6).
+username(#context{user = #user{username = Name}}) when is_binary(Name) ->
+    Name;
+username(_) ->
+    <<"unknown">>.
 
 format_ip(IP) when is_tuple(IP) ->
     case inet:ntoa(IP) of

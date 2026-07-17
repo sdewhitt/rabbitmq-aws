@@ -267,6 +267,17 @@ server_blocks_nat64_imds_test() ->
 server_allows_nat64_public_test() ->
     ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("64:ff9b::8.8.8.8")).
 
+%% 6to4 (2002::/16) embeds a v4 address in the 2nd/3rd words; on a host with a
+%% 6to4 route, 2002:a9fe:a9fe:: routes to IMDS 169.254.169.254, so it must be
+%% blocked just like the NAT64/v4-mapped forms.
+server_blocks_6to4_imds_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("2002:a9fe:a9fe::")).
+
+%% 6to4 wrapping a public v4 stays allowed: the embedded address, not the 2002
+%% prefix, decides.
+server_allows_6to4_public_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:is_allowed_server("2002:808:808::")).
+
 %% 240.0.0.0/4 (reserved/Class E) and the 255.255.255.255 limited broadcast.
 server_blocks_reserved_and_broadcast_test() ->
     ?assertEqual(false, aws_auth_validate_ldap:is_allowed_server("240.0.0.1")),
@@ -319,6 +330,16 @@ peer_allowed_rebound_to_nat64_imds_blocked_test() ->
         blocked,
         aws_auth_validate_ldap:peer_allowed(
             {ok, {{16#0064, 16#ff9b, 0, 0, 0, 0, 16#a9fe, 16#a9fe}, 389}}
+        )
+    ).
+
+%% A peer that rebound to 6to4-wrapped IMDS (2002:a9fe:a9fe::) must be caught on
+%% the live socket, matching the pre-connect is_allowed_server/1 check.
+peer_allowed_rebound_to_6to4_imds_blocked_test() ->
+    ?assertEqual(
+        blocked,
+        aws_auth_validate_ldap:peer_allowed(
+            {ok, {{16#2002, 16#a9fe, 16#a9fe, 0, 0, 0, 0, 0}, 389}}
         )
     ).
 

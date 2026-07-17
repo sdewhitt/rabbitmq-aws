@@ -559,17 +559,22 @@ is_private_ip(_) -> false.
 %%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
 %%                  address fd00:ec2::254 -- the whole point of this block.
 %%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
-%% IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), and NAT64
-%% (64:ff9b::a.b.c.d) addresses embed a v4 address in the low 32 bits; re-check
-%% those against the v4 ranges so e.g. ::ffff:169.254.169.254 (and the NAT64
-%% form 64:ff9b::169.254.169.254, which a host with a NAT64/DNS64 resolver would
-%% translate to IMDS) cannot reach IMDS.
+%% IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), NAT64
+%% (64:ff9b::a.b.c.d), and 6to4 (2002:a.b.c.d::/16) addresses embed a v4 address;
+%% re-check those against the v4 ranges so e.g. ::ffff:169.254.169.254 (and the
+%% NAT64 form 64:ff9b::169.254.169.254, which a host with a NAT64/DNS64 resolver
+%% would translate to IMDS, or the 6to4 form 2002:a9fe:a9fe:: on a host with a
+%% 6to4 route) cannot reach IMDS. Mirrors the embedded-v4 unwrapping in the
+%% shared aws_auth_validate_net:classify_ip/2 so the two SSRF classifiers stay in
+%% step.
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
 is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
 is_private_ip6({0, 0, 0, 0, 0, 16#ffff, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6({16#0064, 16#ff9b, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
+%% 6to4 2002::/16: the embedded v4 lives in the 2nd and 3rd 16-bit words.
+is_private_ip6({16#2002, W2, W3, _, _, _, _, _}) -> is_private_ip(v6_words_to_v4(W2, W3));
 is_private_ip6({0, 0, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
 is_private_ip6(_) -> false.
 
@@ -753,7 +758,8 @@ resolve_principal_dn(Handle, #{
         eldap:search(Handle, [
             {base, Base},
             {filter, eldap:equalityMatch(Attr, Username)},
-            {attributes, ["distinguishedName"]}
+            {attributes, ["distinguishedName"]},
+            {timeout, search_time_limit_seconds()}
         ])
     of
         {ok, #eldap_search_result{entries = [#eldap_entry{object_name = Dn}]}} ->
@@ -948,7 +954,8 @@ member_exists(Handle, GroupDn, Desc, UserDn) ->
             {base, GroupDn},
             {filter, eldap:equalityMatch(Desc, UserDn)},
             {attributes, ["objectClass"]},
-            {scope, eldap:baseObject()}
+            {scope, eldap:baseObject()},
+            {timeout, search_time_limit_seconds()}
         ])
     of
         {ok, #eldap_search_result{entries = Entries}} ->
@@ -972,7 +979,8 @@ object_exists(Handle, DN) ->
             {base, DN},
             {filter, eldap:present("objectClass")},
             {attributes, ["objectClass"]},
-            {scope, eldap:baseObject()}
+            {scope, eldap:baseObject()},
+            {timeout, search_time_limit_seconds()}
         ])
     of
         {ok, #eldap_search_result{entries = Entries}} ->
@@ -1075,3 +1083,14 @@ resolve_arn(Arn, State) when is_binary(Arn) ->
 
 connection_timeout_ms() ->
     aws_auth_validate_ssl:connection_timeout_ms(#{default => ?DEFAULT_TIMEOUT_MS, max => 60_000}).
+
+%% Server-side LDAP search time limit, in whole seconds, for the post-bind
+%% probes (dn_lookup, principal resolution, membership/existence). eldap's
+%% open/2 timeout already bounds each socket recv on the client side; this adds
+%% the protocol-level timeLimit so a server that accepts the bind and then
+%% dribbles a search response cannot keep a probe -- and thus a semaphore slot --
+%% busy for the full connection timeout on every one of a request's several
+%% sequential searches. Derived from the same request-timeout config (ms -> s,
+%% rounded up, floored at 1s) so it tracks the operator's configured budget.
+search_time_limit_seconds() ->
+    max(1, (connection_timeout_ms() + 999) div 1000).
