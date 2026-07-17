@@ -1,0 +1,388 @@
+<!--
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+<style type="text/css">
+/* Widen the text inputs in the left-hand field boxes so long placeholder
+   examples and values (DNs, ARNs, URLs) are not truncated. Scoped to this
+   view's field containers so the rest of the console is unaffected. Checkboxes
+   and the number input keep their natural size. */
+#aws-av-fields-ldap input[type=text],
+#aws-av-fields-ldap input[type=password],
+#aws-av-fields-http input[type=text],
+#aws-av-fields-http input[type=password],
+#aws-av-fields-oauth input[type=text],
+#aws-av-fields-oauth input[type=password],
+#aws-av-fields-tls input[type=text],
+#aws-av-fields-tls input[type=password],
+#aws-auth-validate-form div.section-hidden input[type=text],
+#aws-auth-validate-form div.section-hidden input[type=password] {
+  width: 320px;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+/* Keep the field-title column on a single line (don't let the wider inputs
+   squeeze the labels into wrapping). */
+#aws-auth-validate-form table.form th { white-space: nowrap; }
+
+/* Loading indicator shown while a validation request is in flight. A slow
+   failure can take several seconds; the spinner replaces any prior result so a
+   stale success banner is never shown mid-run. */
+#aws-auth-validate-result .aws-av-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin-right: 8px;
+  vertical-align: middle;
+  border: 2px solid #ccc;
+  border-top-color: #555;
+  border-radius: 50%;
+  animation: aws-av-spin 0.7s linear infinite;
+}
+@keyframes aws-av-spin { to { transform: rotate(360deg); } }
+</style>
+
+<h1>Auth Validation</h1>
+<p class="description">
+  Validate an authentication-backend configuration (LDAP, HTTP, OAuth2, or TLS)
+  without a broker restart. The result is a fixed category; no target host,
+  certificate, or backend error detail is returned.
+</p>
+
+<div class="section">
+  <h2>Request</h2>
+  <table class="form">
+    <tr>
+      <th><label for="aws-auth-validate-method">Method:</label></th>
+      <td>
+        <select id="aws-auth-validate-method" name="method">
+          <option value="ldap">ldap</option>
+          <option value="http">http</option>
+          <option value="oauth">oauth</option>
+          <option value="tls">tls</option>
+        </select>
+        <p class="argument">
+          Each method must be enabled server-side
+          (<code>aws.auth_validation.enabled = true</code> plus
+          <code>aws.auth_validation.enabled_methods.&lt;method&gt; = true</code>);
+          a disabled method returns <code>method_disabled</code> below.
+        </p>
+      </td>
+    </tr>
+  </table>
+
+  <form id="aws-auth-validate-form">
+
+  <!-- Two columns: individual field boxes on the left, the equivalent
+       rabbitmq.conf on the right. Wraps to stacked on narrow viewports. -->
+  <div style="display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap;">
+
+  <div style="flex:1 1 360px; min-width:300px;">
+
+    <!-- Per-method ssl_options key sets differ by backend (each backend HARD-
+         REJECTS an unknown ssl_options key as input_invalid), so the ssl fields
+         live INSIDE each method group rather than in one shared block:
+           * ldap: cacertfile_arn, verify, server_name_indication
+                   (note: the key is server_name_indication, NOT sni; ldap has
+                    no client-cert/mTLS support -- no certfile_arn/keyfile_arn).
+           * http/oauth: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni.
+           * tls: cacertfile_arn, verify (no sni, no client cert/key).
+         Because every field a method sends now lives under its own
+         #aws-av-fields-<method> container, aws_auth_validate_build_body scopes
+         its scan to that container and can never pick up another method's
+         (hidden) fields. -->
+
+    <!-- ldap -->
+    <div id="aws-av-fields-ldap" class="aws-av-method-fields">
+      <table class="form">
+        <tr><th><label>Servers:</label></th>
+          <td><input type="text" data-av-field="servers" placeholder="ldap1.example.com ldap2.example.com" />
+            <span class="argument">space-separated hostnames</span></td></tr>
+        <tr><th><label>Port:</label></th>
+          <td><input type="number" data-av-field="port" min="1" max="65535" placeholder="389" /></td></tr>
+        <tr><th><label>User DN:</label></th>
+          <td><input type="text" data-av-field="user_dn" placeholder="cn=admin,dc=example,dc=com" /></td></tr>
+        <tr><th><label>Password ARN:</label></th>
+          <td><input type="text" data-av-field="password_arn" placeholder="arn:aws:secretsmanager:..." /></td></tr>
+        <tr><th><label>DN lookup base:</label></th>
+          <td><input type="text" data-av-field="dn_lookup_base" placeholder="dc=example,dc=com" /></td></tr>
+        <tr><th><label>DN lookup attribute:</label></th>
+          <td><input type="text" data-av-field="dn_lookup_attribute" placeholder="sAMAccountName" /></td></tr>
+        <tr><th><label>Use SSL (LDAPS):</label></th>
+          <td><input type="checkbox" data-av-field="use_ssl" /></td></tr>
+        <tr><th><label>Use StartTLS:</label></th>
+          <td><input type="checkbox" data-av-field="use_starttls" /></td></tr>
+      </table>
+
+      <!-- Optional authorization layer. `username` is an IDENTIFIER, not a
+           credential: no principal password is ever accepted. When supplied
+           (and a DN lookup is configured), the service connection resolves it
+           to a user DN and the queries' ${username}/${user_dn} placeholders are
+           filled so membership is actually evaluated. Left blank, the queries
+           run in literal-DN reachability mode (any placeholder-free DN they
+           reference is checked for existence only). The four query names mirror
+           the broker's auth_ldap.queries.* keys; each value is a query-DSL
+           string parsed with the broker-compatible grammar (a parse failure
+           returns query_invalid; a referenced object that cannot be verified
+           returns authz_unverified). These are runtime validation inputs with
+           no single rabbitmq.conf line, so they are entered here rather than in
+           the rabbitmq.conf box. -->
+      <div class="section-hidden" style="margin-top:10px;">
+        <h3>Authorization checks (optional)</h3>
+        <p class="argument">
+          Supply a <strong>Username</strong> to evaluate the queries for a real
+          principal; leave it blank to only reachability-check any literal DNs
+          the queries reference. The username is an identifier, never a
+          password.
+        </p>
+        <table class="form">
+          <tr><th><label>Username:</label></th>
+            <td><input type="text" data-av-field="username" placeholder="(optional) e.g. alice" />
+              <span class="argument">identifier only -- no password</span></td></tr>
+          <tr><th valign="top"><label>Tags query:</label></th>
+            <td><textarea data-av-query="tags" rows="2" spellcheck="false" autocomplete="off"
+                          style="width:320px; max-width:100%; font-family:monospace; box-sizing:border-box;"
+                          placeholder="{in_group,&quot;cn=admin,ou=groups,dc=example,dc=com&quot;}"></textarea></td></tr>
+          <tr><th valign="top"><label>Vhost access query:</label></th>
+            <td><textarea data-av-query="vhost_access" rows="2" spellcheck="false" autocomplete="off"
+                          style="width:320px; max-width:100%; font-family:monospace; box-sizing:border-box;"
+                          placeholder="{exists,&quot;ou=${vhost},dc=example,dc=com&quot;}"></textarea></td></tr>
+          <tr><th valign="top"><label>Resource access query:</label></th>
+            <td><textarea data-av-query="resource_access" rows="2" spellcheck="false" autocomplete="off"
+                          style="width:320px; max-width:100%; font-family:monospace; box-sizing:border-box;"
+                          placeholder="{constant,true}"></textarea></td></tr>
+          <tr><th valign="top"><label>Topic access query:</label></th>
+            <td><textarea data-av-query="topic_access" rows="2" spellcheck="false" autocomplete="off"
+                          style="width:320px; max-width:100%; font-family:monospace; box-sizing:border-box;"
+                          placeholder="{constant,true}"></textarea></td></tr>
+        </table>
+        <p class="argument">
+          One query-DSL expression per box (same grammar as
+          <code>auth_ldap.queries.&lt;name&gt;</code>). <code>${username}</code>
+          and <code>${user_dn}</code> are filled from the Username above; other
+          placeholders (<code>${vhost}</code>, <code>${resource}</code>) are
+          grammar-checked only.
+        </p>
+      </div>
+
+      <!-- ldap ssl_options: cacertfile_arn, verify, server_name_indication.
+           LDAP does NOT accept sni, certfile_arn, or keyfile_arn. -->
+      <div class="section-hidden">
+        <h3>ssl_options</h3>
+        <table class="form">
+          <tr><th><label>CA cert ARN:</label></th>
+            <td><input type="text" data-av-ssl="cacertfile_arn" placeholder="arn:aws:s3:::.../ca.pem" /></td></tr>
+          <tr><th><label>Verify:</label></th>
+            <td><select data-av-ssl="verify"><option value="">(default)</option>
+              <option value="verify_peer">verify_peer</option>
+              <option value="verify_none">verify_none</option></select></td></tr>
+          <tr><th><label>Server name indication:</label></th>
+            <td><input type="text" data-av-ssl="server_name_indication" placeholder="ldap.example.com" /></td></tr>
+        </table>
+        <p class="argument">
+          ARN fields are resolved server-side under the configured
+          <code>aws.arns.assume_role_arn</code> and are never echoed back.
+        </p>
+      </div>
+    </div>
+
+    <!-- http -->
+    <div id="aws-av-fields-http" class="aws-av-method-fields" style="display:none;">
+      <table class="form">
+        <tr><th><label>User path:</label></th>
+          <td><input type="text" data-av-field="user_path" placeholder="https://auth.example.com/user" />
+            <span class="argument">required</span></td></tr>
+        <tr><th><label>Vhost path:</label></th>
+          <td><input type="text" data-av-field="vhost_path" placeholder="https://auth.example.com/vhost" /></td></tr>
+        <tr><th><label>Resource path:</label></th>
+          <td><input type="text" data-av-field="resource_path" placeholder="https://auth.example.com/resource" /></td></tr>
+        <tr><th><label>Topic path:</label></th>
+          <td><input type="text" data-av-field="topic_path" placeholder="https://auth.example.com/topic" /></td></tr>
+        <tr><th><label>HTTP method:</label></th>
+          <td><select data-av-field="http_method"><option value="">(default)</option>
+            <option value="get">get</option><option value="post">post</option></select></td></tr>
+      </table>
+
+      <!-- http ssl_options: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni. -->
+      <div class="section-hidden">
+        <h3>ssl_options</h3>
+        <table class="form">
+          <tr><th><label>CA cert ARN:</label></th>
+            <td><input type="text" data-av-ssl="cacertfile_arn" placeholder="arn:aws:s3:::.../ca.pem" /></td></tr>
+          <tr><th><label>Client cert ARN:</label></th>
+            <td><input type="text" data-av-ssl="certfile_arn" placeholder="(mTLS) arn:aws:s3:::.../cert.pem" /></td></tr>
+          <tr><th><label>Client key ARN:</label></th>
+            <td><input type="text" data-av-ssl="keyfile_arn" placeholder="(mTLS) arn:aws:secretsmanager:.../key" /></td></tr>
+          <tr><th><label>Verify:</label></th>
+            <td><select data-av-ssl="verify"><option value="">(default)</option>
+              <option value="verify_peer">verify_peer</option>
+              <option value="verify_none">verify_none</option></select></td></tr>
+          <tr><th><label>SNI:</label></th>
+            <td><input type="text" data-av-ssl="sni" placeholder="auth.example.com" /></td></tr>
+        </table>
+        <p class="argument">
+          ARN fields are resolved server-side under the configured
+          <code>aws.arns.assume_role_arn</code> and are never echoed back.
+        </p>
+      </div>
+    </div>
+
+    <!-- oauth -->
+    <div id="aws-av-fields-oauth" class="aws-av-method-fields" style="display:none;">
+      <table class="form">
+        <tr><th><label>JWKS URI:</label></th>
+          <td><input type="text" data-av-field="jwks_uri" placeholder="https://idp.example.com/.well-known/jwks.json" /></td></tr>
+        <tr><th><label>Issuer:</label></th>
+          <td><input type="text" data-av-field="issuer" placeholder="https://idp.example.com/" /></td></tr>
+        <tr><th><label>Resource server id:</label></th>
+          <td><input type="text" data-av-field="resource_server_id" placeholder="rabbitmq" /></td></tr>
+        <tr><th><label>Access token:</label></th>
+          <td><input type="password" data-av-field="access_token" autocomplete="off"
+                     placeholder="(optional) enables signature/exp/aud checks" /></td></tr>
+      </table>
+
+      <!-- Optional authorization-evaluation layer. Reachability + JWKS
+           well-formedness need none of this; supplying an access_token adds
+           signature/exp/aud checks; supplying an authz_check goes one step
+           further and asks "would the broker GRANT this token <permission> on
+           <vhost>/<resource>?" using the broker's own scope-decision code. The
+           scope-config fields below shape that decision the same way the
+           customer's rabbitmq.conf would. Left entirely empty, none of this
+           runs -- the OAuth check stays a pure reachability probe. -->
+      <div class="section-hidden" style="margin-top:10px;">
+        <h3>Authorization check (optional)</h3>
+        <p class="argument">
+          Evaluates the supplied <strong>Access token</strong> against the
+          broker's own OAuth scope logic. Requires both an
+          <strong>Access token</strong> and a <strong>Resource server id</strong>
+          above; leave the permission blank to skip authorization entirely.
+          <code>scope_aliases</code> is entered here (one alias per line) rather
+          than in the rabbitmq.conf box.
+        </p>
+        <table class="form">
+          <tr><th><label>Permission:</label></th>
+            <td><select data-av-authz="permission">
+                  <option value="">(skip authz check)</option>
+                  <option value="configure">configure</option>
+                  <option value="write">write</option>
+                  <option value="read">read</option>
+                </select></td></tr>
+          <tr><th><label>Resource:</label></th>
+            <td><input type="text" data-av-authz="resource" placeholder="my-queue" /></td></tr>
+          <tr><th><label>Vhost:</label></th>
+            <td><input type="text" data-av-authz="vhost" placeholder="/ (default)" /></td></tr>
+          <tr><th><label>Scope prefix:</label></th>
+            <td><input type="text" data-av-field="scope_prefix" placeholder="rabbitmq.(default)" /></td></tr>
+          <tr><th><label>Additional scopes key:</label></th>
+            <td><input type="text" data-av-field="additional_scopes_key" placeholder="(optional) e.g. roles" /></td></tr>
+          <tr><th><label>Scope pattern syntax:</label></th>
+            <td><select data-av-field="scope_pattern_syntax">
+                  <option value="">(default: wildcard)</option>
+                  <option value="wildcard">wildcard</option>
+                  <option value="regex">regex</option>
+                </select></td></tr>
+          <tr><th valign="top"><label>Scope aliases:</label></th>
+            <td><textarea data-av-field="scope_aliases" rows="3"
+                          spellcheck="false" autocomplete="off"
+                          style="width:320px; max-width:100%; font-family:monospace; box-sizing:border-box;"
+                          placeholder="admin = rabbitmq.tag:administrator rabbitmq.configure:*/*&#10;monitor = rabbitmq.tag:monitoring"></textarea>
+              <span class="argument">one <code>alias = scope1 scope2 ...</code> per line</span></td></tr>
+        </table>
+      </div>
+
+      <!-- oauth ssl_options: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni. -->
+      <div class="section-hidden">
+        <h3>ssl_options</h3>
+        <table class="form">
+          <tr><th><label>CA cert ARN:</label></th>
+            <td><input type="text" data-av-ssl="cacertfile_arn" placeholder="arn:aws:s3:::.../ca.pem" /></td></tr>
+          <tr><th><label>Client cert ARN:</label></th>
+            <td><input type="text" data-av-ssl="certfile_arn" placeholder="(mTLS) arn:aws:s3:::.../cert.pem" /></td></tr>
+          <tr><th><label>Client key ARN:</label></th>
+            <td><input type="text" data-av-ssl="keyfile_arn" placeholder="(mTLS) arn:aws:secretsmanager:.../key" /></td></tr>
+          <tr><th><label>Verify:</label></th>
+            <td><select data-av-ssl="verify"><option value="">(default)</option>
+              <option value="verify_peer">verify_peer</option>
+              <option value="verify_none">verify_none</option></select></td></tr>
+          <tr><th><label>SNI:</label></th>
+            <td><input type="text" data-av-ssl="sni" placeholder="idp.example.com" /></td></tr>
+        </table>
+        <p class="argument">
+          ARN fields are resolved server-side under the configured
+          <code>aws.arns.assume_role_arn</code> and are never echoed back.
+        </p>
+      </div>
+    </div>
+
+    <!-- tls -->
+    <div id="aws-av-fields-tls" class="aws-av-method-fields" style="display:none;">
+      <table class="form">
+        <tr><th><label>Target:</label></th>
+          <td><select data-av-field="target"><option value="listener">listener</option>
+            <option value="management">management</option></select></td></tr>
+      </table>
+
+      <!-- tls ssl_options: cacertfile_arn, verify, fail_if_no_peer_cert.
+           TLS validates inbound-listener material only: no sni, no client
+           cert/key. cacertfile_arn is required for this method. -->
+      <div class="section-hidden">
+        <h3>ssl_options</h3>
+        <table class="form">
+          <tr><th><label>CA cert ARN:</label></th>
+            <td><input type="text" data-av-ssl="cacertfile_arn" placeholder="(required) arn:aws:s3:::.../ca.pem" /></td></tr>
+          <tr><th><label>Verify:</label></th>
+            <td><select data-av-ssl="verify"><option value="">(default)</option>
+              <option value="verify_peer">verify_peer</option>
+              <option value="verify_none">verify_none</option></select></td></tr>
+          <tr><th><label>Fail if no peer cert:</label></th>
+            <td><input type="checkbox" data-av-ssl="fail_if_no_peer_cert" /></td></tr>
+        </table>
+        <p class="argument">
+          ARN fields are resolved server-side under the configured
+          <code>aws.arns.assume_role_arn</code> and are never echoed back.
+        </p>
+      </div>
+    </div>
+
+  </div><!-- /left column (individual fields) -->
+
+  <!-- Right column: the equivalent rabbitmq.conf. -->
+  <div class="section-hidden" style="flex:1 1 360px; min-width:300px; margin-top:0;">
+    <h3>rabbitmq.conf</h3>
+    <p class="argument">
+      Paste your rabbitmq.conf here:
+    </p>
+    <textarea id="aws-auth-validate-config" rows="18"
+              spellcheck="false" autocomplete="off" autocapitalize="off"
+              style="width:100%; font-family:monospace; box-sizing:border-box;"
+              placeholder="auth_backends.1 = ldap&#10;auth_ldap.servers.1 = ldap.example.com&#10;auth_ldap.port = 636&#10;auth_ldap.use_ssl = true&#10;auth_ldap.dn_lookup_bind.user_dn = cn=admin,dc=example,dc=com&#10;auth_ldap.ssl_options.verify = verify_peer&#10;aws.arns.auth_ldap.dn_lookup_bind.password = arn:aws:secretsmanager:..."></textarea>
+    <div style="margin-top:6px; display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
+      <button type="button" id="aws-auth-validate-parse">Parse into fields</button>
+      <button type="button" id="aws-auth-validate-build">Update config from fields</button>
+      <button type="button" id="aws-auth-validate-copy">Copy config</button>
+      <span id="aws-auth-validate-copy-status" class="argument"></span>
+    </div>
+  </div><!-- /right column (rabbitmq.conf) -->
+
+  </div><!-- /two-column row -->
+
+    <div style="margin-top:10px;">
+      <input type="submit" id="aws-auth-validate-submit" value="Validate" />
+    </div>
+  </form>
+</div>
+
+<div class="section">
+  <h2>Result</h2>
+  <div id="aws-auth-validate-result">
+    <p class="argument">Submit a request to see the categorized result here.</p>
+  </div>
+</div>
+
+<script type="text/javascript">
+// Runs after the management console injects this template (jQuery .html()
+// executes inline scripts). Primes the preview with the full field template for
+// the initially-selected method. Defined in aws_auth_validate.js.
+if (typeof aws_auth_validate_on_render === 'function') { aws_auth_validate_on_render(); }
+</script>
