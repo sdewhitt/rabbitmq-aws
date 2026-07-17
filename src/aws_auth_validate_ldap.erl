@@ -46,9 +46,11 @@
 
 -ifdef(TEST).
 %% Exposed for unit tests: build_ssl_opts/1 translates validated ssl_options
-%% to the eldap proplist; peer_allowed/1 is the post-connect SSRF re-check on a
-%% peername result. Both are otherwise internal.
--export([build_ssl_opts/1, is_allowed_server/1, peer_allowed/1]).
+%% to the eldap proplist; build_tls_opts/2 layers the shared verify-mode policy
+%% on top (returning the fail-loud {ok,_}|{error,tls_failed,_} contract);
+%% peer_allowed/1 is the post-connect SSRF re-check on a peername result. All
+%% are otherwise internal.
+-export([build_ssl_opts/1, build_tls_opts/2, is_allowed_server/1, peer_allowed/1]).
 -endif.
 
 -include_lib("eldap/include/eldap.hrl").
@@ -316,8 +318,9 @@ resolve_password(Body, #{aws_state := State} = Params) ->
 %% A resolve OR a PEM-decode failure is reported as input_invalid -- mirroring
 %% resolve_password/2 -- rather than silently leaving the connection without a
 %% trust anchor. The latter would let `verify' fall back to verify_none (see
-%% apply_verify_default/1) and report a TLS config as valid that the operator
-%% believes is certificate-verified -- a silent security degradation. The
+%% build_tls_opts/2 and the shared apply_verify_default/2) and report a TLS
+%% config as valid that the operator believes is certificate-verified -- a
+%% silent security degradation. The
 %% decoded certs are stored under the atom `cacerts' key in ssl_options so
 %% build_ssl_opts/1 consumes them directly instead of re-resolving the ARN
 %% (and re-clobbering the region) at connect time.
@@ -610,7 +613,21 @@ do_ldap_validate(#{password := _} = Params) ->
             {error, connection_failed, ?REASON_CONNECTION}
     end.
 
-do_ldap_bind(
+do_ldap_bind(#{use_ssl := UseSsl, use_starttls := UseStartTls, ssl_options := SslOpts} = Params) ->
+    %% Build the eldap ssl option list once, up front, so the verify-mode policy
+    %% (aws_auth_validate_ssl:apply_verify_default/2) runs before we open the
+    %% connection: an EXPLICIT verify_peer with no trust anchor fails loud here as
+    %% tls_failed -- with an actionable reason -- instead of surfacing as an opaque
+    %% unknown_ca handshake error. This matches the http/oauth backends, which
+    %% already delegate to the same shared helper.
+    case build_tls_opts(UseSsl orelse UseStartTls, SslOpts) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, TlsOpts} ->
+            do_ldap_connect(Params, TlsOpts)
+    end.
+
+do_ldap_connect(
     #{
         servers := Servers,
         port := Port,
@@ -618,11 +635,11 @@ do_ldap_bind(
         password := Password,
         use_ssl := UseSsl,
         use_starttls := UseStartTls,
-        ssl_options := SslOpts,
         timeout := Timeout
-    } = Params
+    } = Params,
+    TlsOpts
 ) ->
-    OpenOpts = [{port, Port}, {timeout, Timeout}] ++ ssl_open_opts(UseSsl, SslOpts),
+    OpenOpts = [{port, Port}, {timeout, Timeout}] ++ ssl_open_opts(UseSsl, TlsOpts),
     case eldap:open(Servers, OpenOpts) of
         {error, _Reason} ->
             {error, connection_failed, ?REASON_CONNECTION};
@@ -640,7 +657,7 @@ do_ldap_bind(
                     blocked ->
                         {error, connection_failed, ?REASON_CONNECTION};
                     ok ->
-                        case maybe_start_tls(Handle, UseStartTls, SslOpts, Timeout) of
+                        case maybe_start_tls(Handle, UseStartTls, TlsOpts, Timeout) of
                             {error, _Reason} ->
                                 {error, tls_failed, ?REASON_TLS_HANDSHAKE};
                             ok ->
@@ -964,15 +981,15 @@ object_exists(Handle, DN) ->
             false
     end.
 
-ssl_open_opts(true, SslOpts) ->
-    [{ssl, true}, {sslopts, build_ssl_opts(SslOpts)}];
-ssl_open_opts(false, _SslOpts) ->
+ssl_open_opts(true, TlsOpts) ->
+    [{ssl, true}, {sslopts, TlsOpts}];
+ssl_open_opts(false, _TlsOpts) ->
     [{ssl, false}].
 
-maybe_start_tls(_Handle, false, _SslOpts, _Timeout) ->
+maybe_start_tls(_Handle, false, _TlsOpts, _Timeout) ->
     ok;
-maybe_start_tls(Handle, true, SslOpts, Timeout) ->
-    eldap:start_tls(Handle, build_ssl_opts(SslOpts), Timeout).
+maybe_start_tls(Handle, true, TlsOpts, Timeout) ->
+    eldap:start_tls(Handle, TlsOpts, Timeout).
 
 %% Translate the JSON ssl_options map into an Erlang ssl options proplist
 %% suitable for eldap. Both the key surface AND every value are validated up
@@ -981,6 +998,11 @@ maybe_start_tls(Handle, true, SslOpts, Timeout) ->
 %% good: the verify/depth/versions/sni translators below are total over the
 %% validated domain and cannot fail on a mis-typed option -- that was already
 %% rejected with input_invalid in the pure phase.
+%%
+%% This produces the raw translation only; the verify-mode default (and its
+%% fail-loud no-anchor policy) is applied by build_tls_opts/2 via the shared
+%% aws_auth_validate_ssl:apply_verify_default/2. Kept separate so the unit tests
+%% can pin the translation independently of the trust-anchor policy.
 %%
 %% No `catch' here. The previous `(catch Fun(Value))' swallowed every error,
 %% which the value-validation in parse_ssl_options/2 has now made unnecessary
@@ -1000,7 +1022,7 @@ build_ssl_opts(Map) when is_map(Map) ->
         {versions, <<"versions">>, fun aws_auth_validate_ssl:to_versions/1},
         {server_name_indication, <<"server_name_indication">>, fun aws_auth_validate_ssl:to_list/1}
     ],
-    Translated = lists:foldl(
+    lists:foldl(
         fun({SslKey, JsonKey, Fun}, Acc) ->
             case maps:get(JsonKey, Map, undefined) of
                 undefined -> Acc;
@@ -1009,8 +1031,7 @@ build_ssl_opts(Map) when is_map(Map) ->
         end,
         [],
         Pairs
-    ),
-    apply_verify_default(Translated).
+    ).
 
 add_ssl_opt(SslKey, Fun, Value, Acc) ->
     case Fun(Value) of
@@ -1018,32 +1039,30 @@ add_ssl_opt(SslKey, Fun, Value, Acc) ->
         Translated -> [{SslKey, Translated} | Acc]
     end.
 
-%% OTP's ssl defaults `verify' to verify_none, which silently accepts any
-%% certificate -- insecure, and a poor thing to validate a config against.
-%% When the caller did not specify `verify', prefer verify_peer -- BUT only
-%% when a trust anchor is actually available to verify against (the caller's
-%% cacertfile_arn, or the validator host's OS trust store). Forcing
-%% verify_peer with no CA would make the handshake fail with unknown_ca and
-%% report tls_failed/connection_failed for a config the real broker (default
-%% verify_none) would accept -- a host-environment artifact, not a customer
-%% config error, breaking decision parity. With no trust source we therefore
-%% leave `verify' unset (broker-parity verify_none). An explicit `verify'
-%% from the caller is always left untouched (verify_none stays opt-in).
-%% OTP's ssl defaults `verify' to verify_none. When the caller did not specify
-%% `verify', prefer verify_peer -- but only when a trust anchor is available (the
-%% caller's cacertfile_arn, or the host OS store). trust_source/1 is shared with
-%% the http/oauth backends (aws_auth_validate_ssl). An explicit `verify' is left
-%% untouched.
-apply_verify_default(Opts) ->
-    case lists:keymember(verify, 1, Opts) of
-        true ->
-            Opts;
-        false ->
-            case aws_auth_validate_ssl:trust_source(Opts) of
-                {ok, Opts1} -> [{verify, verify_peer} | Opts1];
-                none -> Opts
-            end
-    end.
+%% Build the final eldap ssl option list, applying the shared verify-mode policy.
+%% TlsInUse is (use_ssl orelse use_starttls); on a plaintext request there is no
+%% TLS to shape, so return an empty list unused by ssl_open_opts(false, _).
+%%
+%% The verify-mode default is delegated to aws_auth_validate_ssl:apply_verify_default/2
+%% -- the SAME helper the http/oauth backends use -- so all three outbound backends
+%% share one policy:
+%%   * an EXPLICIT verify_peer with no trust anchor FAILS loud as tls_failed (never
+%%     silently downgraded -- the false positive this endpoint exists to prevent),
+%%   * a DEFAULTED verify_peer with no anchor downgrades to verify_none (broker
+%%     parity -- a plain reachability probe still works without a CA store),
+%%   * an explicit verify_none is untouched, and every verify_peer path also gets
+%%     the RFC 6125 https hostname-match fun so wildcard IdP/LDAPS certs verify the
+%%     way mainstream clients do.
+%% VerifyExplicit is whether the caller set `verify' themselves; it governs the
+%% fail-vs-downgrade branch for the no-anchor case.
+-spec build_tls_opts(boolean(), map()) ->
+    {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary()}.
+build_tls_opts(false, _SslOpts) ->
+    {ok, []};
+build_tls_opts(true, SslOpts) ->
+    Translated = build_ssl_opts(SslOpts),
+    VerifyExplicit = maps:is_key(<<"verify">>, SslOpts),
+    aws_auth_validate_ssl:apply_verify_default(Translated, VerifyExplicit).
 
 %%--------------------------------------------------------------------
 

@@ -412,6 +412,59 @@ ldap_build_ssl_opts_keeps_explicit_verify_none_test() ->
     Opts = aws_auth_validate_ldap:build_ssl_opts(#{<<"verify">> => <<"verify_none">>}),
     ?assertEqual(verify_none, proplists:get_value(verify, Opts)).
 
+%%--------------------------------------------------------------------
+%% build_tls_opts/2: LDAP now shares the http/oauth verify-mode policy
+%% (aws_auth_validate_ssl:apply_verify_default/2). These pin the LDAP-side
+%% wiring; the policy's own branch matrix is covered exhaustively in
+%% aws_auth_validate_shared_tests. The OS trust store is forced empty so the
+%% "no anchor" branches are deterministic regardless of the host CA store.
+%%--------------------------------------------------------------------
+
+%% Plaintext (neither use_ssl nor use_starttls): no TLS to shape, no policy run.
+ldap_build_tls_opts_plaintext_is_empty_test() ->
+    ?assertEqual({ok, []}, aws_auth_validate_ldap:build_tls_opts(false, #{})).
+
+with_empty_os_store(Fun) ->
+    {setup,
+        fun() ->
+            ok = meck:new(public_key, [unstick, passthrough]),
+            meck:expect(public_key, cacerts_get, fun() -> [] end),
+            ok
+        end,
+        fun(_) -> meck:unload(public_key) end, Fun}.
+
+%% LOAD-BEARING parity assertion: an EXPLICIT verify_peer with no trust anchor
+%% MUST fail closed with tls_failed -- never silently downgraded to verify_none.
+%% This is the behaviour LDAP previously lacked (it passed the bare list through
+%% and failed later as an opaque unknown_ca handshake error).
+ldap_build_tls_opts_explicit_verify_peer_without_anchor_fails_test_() ->
+    with_empty_os_store(fun() ->
+        Result = aws_auth_validate_ldap:build_tls_opts(true, #{<<"verify">> => <<"verify_peer">>}),
+        [?_assertMatch({error, tls_failed, _}, Result)]
+    end).
+
+%% A DEFAULTED verify (caller did not set it) with no anchor stays unset --
+%% broker-parity verify_none -- so a plain reachability probe still works.
+ldap_build_tls_opts_absent_verify_without_anchor_stays_unset_test_() ->
+    with_empty_os_store(fun() ->
+        {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{}),
+        [?_assertNot(lists:keymember(verify, 1, Opts))]
+    end).
+
+%% Explicit verify_peer WITH a supplied cacerts anchor is accepted (cacerts
+%% short-circuits before the OS store, so no mock needed).
+ldap_build_tls_opts_explicit_verify_peer_with_anchor_ok_test() ->
+    {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{
+        <<"verify">> => <<"verify_peer">>,
+        cacerts => [<<"der">>]
+    }),
+    ?assertEqual(verify_peer, proplists:get_value(verify, Opts)).
+
+%% An explicit verify_none survives build_tls_opts/2 untouched (opt-out).
+ldap_build_tls_opts_explicit_verify_none_untouched_test() ->
+    {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{<<"verify">> => <<"verify_none">>}),
+    ?assertEqual(verify_none, proplists:get_value(verify, Opts)).
+
 ldap_config_conflict_test() ->
     Body = base_body(#{<<"use_ssl">> => true, <<"use_starttls">> => true}),
     ?assertMatch({error, config_conflict, _}, aws_auth_validate_ldap:validate(Body)).
