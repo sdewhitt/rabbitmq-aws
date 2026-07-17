@@ -292,8 +292,27 @@ audit(Method, SourceIP, User, ResultCategory, T0) ->
     Duration = erlang:monotonic_time(millisecond) - T0,
     ?AWS_LOG_INFO(
         "auth_validate: method=~ts user=~ts source_ip=~ts result=~ts duration_ms=~B",
-        [Method, User, format_ip(SourceIP), ResultCategory, Duration]
+        [sanitize_log(Method), sanitize_log(User), format_ip(SourceIP), ResultCategory, Duration]
     ).
+
+%% Strip control characters (CR, LF, TAB, any other byte < 0x20, and DEL) from a
+%% value before it is interpolated into the single-line audit record. Method
+%% comes from the URL path binding and User from the stored username -- both are
+%% caller-influenceable, so an embedded CR/LF could otherwise forge or split an
+%% audit line (log injection), defeating the attribution this record exists to
+%% provide. Each offending byte is replaced with the Unicode replacement
+%% character (U+FFFD) so the record stays on one line and the tampering is
+%% visible rather than silently dropped. UTF-8 multi-byte sequences are
+%% preserved untouched (every one of their bytes is >= 0x80).
+sanitize_log(Bin) when is_binary(Bin) ->
+    <<<<(sanitize_byte(B))/binary>> || <<B>> <= Bin>>;
+sanitize_log(Other) ->
+    Other.
+
+sanitize_byte(B) when B < 16#20; B =:= 16#7F ->
+    <<"\x{fffd}"/utf8>>;
+sanitize_byte(B) ->
+    <<B>>.
 
 %% The authenticated management user's name, for the audit trail. This endpoint
 %% is admin-gated and makes outbound connections to caller-chosen targets (an
