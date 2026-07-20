@@ -92,7 +92,7 @@
 %% network. Mirrors the HTTP/LDAP backends' -ifdef(TEST) export blocks.
 -export([
     parse_input/1,
-    parse_url/1,
+    parse_url/2,
     classify_ip/1,
     in_cidr/2,
     url_allowed/1,
@@ -426,15 +426,10 @@ parse_optional_url(_, _QueryPolicy) ->
     {error, bad_url}.
 
 %% Parse + validate an https URL. Returns a normalized representation the probe
-%% and the SSRF guard can both use. Defaults to reject_query for callers (and
-%% tests) that supply a URL that must not carry a query -- e.g. a discovered
-%% jwks_uri, whose path is used as-is but which we still normalize.
-parse_url(Bin) ->
-    parse_url(Bin, reject_query).
-
-%% QueryPolicy: reject_query bars a pre-existing query string (the caller appends
-%% a path, so a query would be ambiguous); allow_query permits it (the URL is
-%% fetched verbatim). userinfo and out-of-range ports are always rejected.
+%% and the SSRF guard can both use. QueryPolicy: reject_query bars a pre-existing
+%% query string (the caller appends a path, so a query would be ambiguous);
+%% allow_query permits it (the URL is fetched verbatim). userinfo and
+%% out-of-range ports are always rejected.
 parse_url(Bin, QueryPolicy) when is_binary(Bin) ->
     Str = binary_to_list(Bin),
     case uri_string:parse(Str) of
