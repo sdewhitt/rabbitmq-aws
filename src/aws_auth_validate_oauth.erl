@@ -387,10 +387,14 @@ parse_input([Step | Rest], Body, Acc0) ->
     end.
 
 %% Parse jwks_uri and issuer. At least one must be present and a valid https URL.
+%% jwks_uri is fetched VERBATIM, so a pre-existing query string is allowed (some
+%% IdPs publish one, and the live broker's uaa_jwks:get/2 fetches it as-is);
+%% issuer has the OIDC well-known path appended, so a query there is ambiguous
+%% and stays rejected.
 parse_urls(Body, Acc) ->
     JwksRaw = maps:get(<<"jwks_uri">>, Body, undefined),
     IssuerRaw = maps:get(<<"issuer">>, Body, undefined),
-    case {parse_optional_url(JwksRaw), parse_optional_url(IssuerRaw)} of
+    case {parse_optional_url(JwksRaw, allow_query), parse_optional_url(IssuerRaw, reject_query)} of
         {{error, _}, _} ->
             {error, input_invalid, ?REASON_BAD_URL};
         {_, {error, _}} ->
@@ -411,17 +415,27 @@ parse_urls(Body, Acc) ->
             {ok, Acc2}
     end.
 
-%% Parse an optional URL field: undefined -> none, valid -> {ok, Parsed}, invalid -> {error, _}.
-parse_optional_url(undefined) ->
+%% Parse an optional URL field: undefined -> none, valid -> {ok, Parsed}, invalid
+%% -> {error, _}. QueryPolicy is allow_query (jwks_uri, fetched verbatim) or
+%% reject_query (issuer, has the well-known path appended).
+parse_optional_url(undefined, _QueryPolicy) ->
     none;
-parse_optional_url(V) when is_binary(V), byte_size(V) > 0 ->
-    parse_url(V);
-parse_optional_url(_) ->
+parse_optional_url(V, QueryPolicy) when is_binary(V), byte_size(V) > 0 ->
+    parse_url(V, QueryPolicy);
+parse_optional_url(_, _QueryPolicy) ->
     {error, bad_url}.
 
 %% Parse + validate an https URL. Returns a normalized representation the probe
-%% and the SSRF guard can both use.
-parse_url(Bin) when is_binary(Bin) ->
+%% and the SSRF guard can both use. Defaults to reject_query for callers (and
+%% tests) that supply a URL that must not carry a query -- e.g. a discovered
+%% jwks_uri, whose path is used as-is but which we still normalize.
+parse_url(Bin) ->
+    parse_url(Bin, reject_query).
+
+%% QueryPolicy: reject_query bars a pre-existing query string (the caller appends
+%% a path, so a query would be ambiguous); allow_query permits it (the URL is
+%% fetched verbatim). userinfo and out-of-range ports are always rejected.
+parse_url(Bin, QueryPolicy) when is_binary(Bin) ->
     Str = binary_to_list(Bin),
     case uri_string:parse(Str) of
         #{scheme := Scheme, host := Host} = Parsed when
@@ -430,13 +444,14 @@ parse_url(Bin) when is_binary(Bin) ->
             %% Reject:
             %%   * out-of-range port (else httpc crashes at request time)
             %%   * userinfo (embedded credentials)
-            %%   * pre-existing query string (OIDC discovery appends well-known path)
+            %%   * a pre-existing query string, only under reject_query
             Port = maps:get(port, Parsed, undefined),
             HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
+            QueryRejected = HasQuery andalso QueryPolicy =:= reject_query,
             case Port of
                 P when is_integer(P), (P < 1 orelse P > 65535) ->
                     {error, bad_url};
-                _ when HasQuery ->
+                _ when QueryRejected ->
                     {error, bad_url};
                 _ ->
                     case maps:is_key(userinfo, Parsed) of
@@ -1052,7 +1067,9 @@ parse_discovery_doc(Body) ->
         {ok, Map} when is_map(Map) ->
             case maps:get(<<"jwks_uri">>, Map, undefined) of
                 JwksUriBin when is_binary(JwksUriBin), byte_size(JwksUriBin) > 0 ->
-                    case parse_url(JwksUriBin) of
+                    %% A discovered jwks_uri is fetched verbatim (same path as a
+                    %% directly-supplied one), so allow a query string here too.
+                    case parse_url(JwksUriBin, allow_query) of
                         {ok, Parsed} -> {ok, Parsed};
                         {error, _} -> {error, auth_failed, ?REASON_DISCOVERY}
                     end;

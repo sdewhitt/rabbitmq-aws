@@ -53,6 +53,7 @@ var AWS_AUTH_VALIDATE_METHODS = ['ldap', 'http', 'oauth', 'tls'];
 var AWS_AUTH_VALIDATE_CATEGORY = {
     success:            {cls: 'status-green',  text: 'Validation succeeded (204).'},
     input_invalid:      {cls: 'status-red',    text: 'Input invalid: the request failed pure validation before any connection.'},
+    body_too_large:     {cls: 'status-red',    text: 'Request body too large: reduce the config size and retry.'},
     connection_failed:  {cls: 'status-red',    text: 'Connection failed: the target could not be reached.'},
     tls_failed:         {cls: 'status-red',    text: 'TLS failed: handshake or certificate verification did not succeed.'},
     query_invalid:      {cls: 'status-red',    text: 'Query invalid: an authorization query could not be parsed.'},
