@@ -70,20 +70,13 @@ var AWS_AUTH_VALIDATE_CATEGORY = {
 };
 
 // Read the visible method form into a JSON request body. Only non-empty fields
-// are included so an omitted optional field keeps the backend default. ssl_options
-// is collected from the selected method's own ssl sub-fields; ARN fields nest
-// under it to match the backend shape (ssl_options.cacertfile_arn etc.).
+// are included so an omitted optional field keeps the backend default; ARN
+// fields nest under ssl_options to match the backend shape.
 //
-// The scan is scoped to the SELECTED method's field container
-// (#aws-av-fields-<method>), never the whole form. Each method group carries its
-// own data-av-field / data-av-ssl inputs (the ssl_options key set differs per
-// backend -- e.g. ldap wants server_name_indication and has no client cert,
-// while http/oauth want sni + certfile/keyfile), and switching methods only
-// HIDES the other groups. A whole-form scan would therefore merge a previously-
-// selected method's (now hidden) values into this body -- producing a request
-// with foreign keys the backend rejects as input_invalid, and a permanent
-// divergence from the conf box. Scoping to the active group is what keeps the
-// body method-pure.
+// The scan is scoped to the SELECTED method's container (#aws-av-fields-<method>),
+// never the whole form: each method's ssl_options key set differs, and switching
+// methods only HIDES the other groups, so a whole-form scan would merge a hidden
+// method's values in and produce foreign keys the backend rejects.
 function aws_auth_validate_build_body(method) {
     var body = {};
     var $scope = $('#aws-av-fields-' + method);
@@ -327,6 +320,11 @@ var AWS_AUTH_VALIDATE_CONF = {
             // LDAP's ssl_options accepts server_name_indication (NOT sni) and has
             // no client-cert/mTLS material, so no certfile/keyfile ARN lines.
             'auth_ldap.ssl_options.server_name_indication':     {path: ['ssl_options', 'server_name_indication'], type: 'string', ex: 'ldap.example.com'},
+            // Mirrors the broker's auth_ldap.ssl_options.hostname_verification
+            // (wildcard|none); unset means strict OTP matching. Modeled so the
+            // validator matches the broker's hostname check rather than always
+            // using the lenient wildcard fun.
+            'auth_ldap.ssl_options.hostname_verification':      {path: ['ssl_options', 'hostname_verification'], type: 'string', ex: 'wildcard'},
             'aws.arns.auth_ldap.dn_lookup_bind.password':       {path: ['password_arn'], type: 'string', ex: 'arn:aws:secretsmanager:us-west-2:111122223333:secret:RabbitMqDnLookupUserPassword'},
             'aws.arns.auth_ldap.ssl_options.cacertfile':        {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'}
         },
@@ -340,6 +338,9 @@ var AWS_AUTH_VALIDATE_CONF = {
             'auth_http.resource_path':                          {path: ['resource_path'], type: 'string', ex: 'https://auth.example.com/auth/resource'},
             'auth_http.topic_path':                             {path: ['topic_path'], type: 'string', ex: 'https://auth.example.com/auth/topic'},
             'auth_http.http_method':                            {path: ['http_method'], type: 'string', ex: 'post'},
+            // The four ssl_options entries below are identical in shape to the
+            // oauth ssl_options entries; keep the two hand-synced on any change
+            // (only the auth_http/auth_oauth2 conf-key prefix differs).
             'auth_http.ssl_options.verify':                     {path: ['ssl_options', 'verify'], type: 'string', ex: 'verify_peer'},
             'auth_http.ssl_options.sni':                        {path: ['ssl_options', 'sni'], type: 'string', ex: 'auth.example.com'},
             'aws.arns.auth_http.ssl_options.cacertfile':        {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'},
@@ -689,21 +690,27 @@ function aws_auth_validate_strip_nonconf(method, body) {
     return out;
 }
 
-// Return a shallow copy of `body` with any top-level key whose value is boolean
-// `false` removed. Used ONLY to normalize the divergence comparison (see the
-// submit handler): to every backend an absent boolean equals an explicit
-// `false', so an unchecked box (key omitted) and a pasted `= false' (key present
-// as false) must compare equal. Non-boolean values and `true' are left as-is, so
-// this never masks a real difference. Nested objects (ssl_options) are not
-// descended into: their booleans (e.g. tls fail_if_no_peer_cert) are only ever
-// present when the operator set them, so the omit-vs-false asymmetry does not
-// arise there.
+// Return a copy of `body` with any key whose value is boolean `false` removed,
+// descending one level into ssl_options. Used ONLY to normalize the divergence
+// comparison (see the submit handler): to every backend an absent boolean equals
+// an explicit `false', so an unchecked box (key omitted) and a pasted `= false'
+// (key present as false) must compare equal. This applies to nested ssl_options
+// booleans too -- the tls method's ssl_options.fail_if_no_peer_cert is a checkbox
+// that omits the key when unchecked but parses to `false' when pasted, so without
+// recursing it would read as a false divergence. An ssl_options object emptied by
+// stripping is dropped so it matches a fields side that never set it. Non-boolean
+// values and `true' are left as-is, so this never masks a real difference.
 function aws_auth_validate_strip_false_bools(body) {
     if (!body || typeof body !== 'object') { return body; }
     var out = {};
     for (var k in body) {
         if (!Object.prototype.hasOwnProperty.call(body, k)) { continue; }
         if (body[k] === false) { continue; }
+        if (k === 'ssl_options' && body[k] && typeof body[k] === 'object') {
+            var ssl = aws_auth_validate_strip_false_bools(body[k]);
+            if (Object.keys(ssl).length > 0) { out[k] = ssl; }
+            continue;
+        }
         out[k] = body[k];
     }
     return out;
@@ -821,6 +828,10 @@ $(document).on('click', '#aws-auth-validate-submit', function() {
         // divergence would wrongly block Validate. Stripping false-valued keys
         // from both sides makes the comparison match the backend's semantics
         // without altering the request body actually sent.
+        // The pasted side carries the false-vs-absent asymmetry (a pasted
+        // `= false' vs an unchecked box). build_body never emits `false' today,
+        // so the fields-side strip is currently a no-op, but it is kept symmetric
+        // so the two sides stay comparable if build_body ever starts emitting one.
         var pastedCmp = aws_auth_validate_strip_false_bools(
             aws_auth_validate_strip_nonconf(method, pastedBody));
         var fieldsCmp = aws_auth_validate_strip_false_bools(

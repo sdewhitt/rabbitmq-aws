@@ -166,8 +166,9 @@ SPDX-License-Identifier: Apache-2.0
         </p>
       </div>
 
-      <!-- ldap ssl_options: cacertfile_arn, verify, server_name_indication.
-           LDAP does NOT accept sni, certfile_arn, or keyfile_arn. -->
+      <!-- ldap ssl_options: cacertfile_arn, verify, server_name_indication,
+           hostname_verification. LDAP does NOT accept sni, certfile_arn, or
+           keyfile_arn. -->
       <div class="section-hidden">
         <h3>ssl_options</h3>
         <table class="form">
@@ -179,6 +180,10 @@ SPDX-License-Identifier: Apache-2.0
               <option value="verify_none">verify_none</option></select></td></tr>
           <tr><th><label>Server name indication:</label></th>
             <td><input type="text" data-av-ssl="server_name_indication" placeholder="ldap.example.com" /></td></tr>
+          <tr><th><label>Hostname verification:</label></th>
+            <td><select data-av-ssl="hostname_verification"><option value="">(default: strict)</option>
+              <option value="wildcard">wildcard</option>
+              <option value="none">none</option></select></td></tr>
         </table>
         <p class="argument">
           ARN fields are resolved server-side under the configured
@@ -204,7 +209,10 @@ SPDX-License-Identifier: Apache-2.0
             <option value="get">get</option><option value="post">post</option></select></td></tr>
       </table>
 
-      <!-- http ssl_options: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni. -->
+      <!-- http ssl_options: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni.
+           NOTE: this block is byte-identical to the oauth ssl_options block below;
+           the per-method split keeps them separate on purpose, so any ssl change
+           here must be hand-synced to the oauth copy (and its CONF map entry). -->
       <div class="section-hidden">
         <h3>ssl_options</h3>
         <table class="form">
@@ -291,7 +299,9 @@ SPDX-License-Identifier: Apache-2.0
         </table>
       </div>
 
-      <!-- oauth ssl_options: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni. -->
+      <!-- oauth ssl_options: cacertfile_arn, certfile_arn, keyfile_arn, verify, sni.
+           NOTE: byte-identical to the http ssl_options block above; keep the two
+           (and their CONF map entries) hand-synced on any ssl change. -->
       <div class="section-hidden">
         <h3>ssl_options</h3>
         <table class="form">
