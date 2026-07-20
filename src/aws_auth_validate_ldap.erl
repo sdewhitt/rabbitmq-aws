@@ -59,6 +59,7 @@
     peer_allowed/1,
     is_private_ip/1,
     is_private_ip6/1,
+    parse_port/2,
     search_time_limit_seconds/0
 ]).
 -endif.
@@ -66,6 +67,12 @@
 -include_lib("eldap/include/eldap.hrl").
 
 -define(DEFAULT_TIMEOUT_MS, 5_000).
+
+%% Default LDAP port when the request omits `port'. Mirrors the broker's
+%% rabbit_auth_backend_ldap default (application env `port', 389 -- the broker
+%% does NOT bump to 636 for TLS), so a config that omits port validates the same
+%% way the live broker would connect rather than being rejected input_invalid.
+-define(DEFAULT_LDAP_PORT, 389).
 
 %% Accepted query names within the `queries' object. Mirrors the broker's
 %% auth_ldap.queries.* config keys.
@@ -302,6 +309,10 @@ parse_servers(Body, Acc) ->
 
 parse_port(Body, Acc) ->
     case maps:get(<<"port">>, Body, undefined) of
+        %% Omitted port defaults to the broker's default (389), so a config the
+        %% live broker would accept is not rejected here for parity's sake.
+        undefined ->
+            {ok, Acc#{port => ?DEFAULT_LDAP_PORT}};
         Port when is_integer(Port), Port >= 1, Port =< 65535 ->
             {ok, Acc#{port => Port}};
         _ ->
@@ -530,8 +541,6 @@ is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 %% Server address validation: resolve the hostname and reject addresses in
 %% private, loopback, link-local, or metadata IP ranges. This prevents SSRF
 %% via the validation endpoint while still allowing legitimate LDAP servers.
-%% Bypassed when auth_validation_allow_private_networks is true (for testing
-%% against local slapd instances).
 %%
 %% This is the FIRST of two SSRF checks (defence in depth). It resolves Server
 %% and rejects a blocked IP before any connection is attempted, so a malformed
@@ -541,65 +550,108 @@ is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 %% closed by the SECOND check, verify_connected_peer/1, which re-validates the
 %% actual connected socket's peer (see do_ldap_bind/1). We keep this pre-connect
 %% check too: it rejects bad input cheaply (no socket, clearer input_invalid
-%% category) and avoids dialing out for the common case. Both checks are
-%% bypassed under auth_validation_allow_private_networks for local-slapd tests.
+%% category) and avoids dialing out for the common case.
+%%
+%% The test-only auth_validation_allow_private_networks flag relaxes ONLY
+%% loopback (see is_denied_ip/1), not the whole denylist -- it must not grant the
+%% LDAP backend a broader test-mode bypass than the http/oauth backends get from
+%% aws_auth_validate_net (which relaxes loopback alone). IMDS, link-local,
+%% RFC1918, CGNAT, and reserved space stay denied even with the flag on, so a
+%% test env cannot accidentally prove a path to instance metadata that the
+%% stricter guard would block.
 is_allowed_server(Server) ->
-    case application:get_env(aws, auth_validation_allow_private_networks, false) of
-        true -> true;
-        _ -> check_server_ip(Server)
-    end.
+    check_server_ip(Server).
 
 check_server_ip(Server) ->
     case inet:getaddr(Server, inet) of
         {ok, IP} ->
-            not is_private_ip(IP);
+            not is_denied_ip(IP);
         {error, _} ->
             %% Also try IPv6
             case inet:getaddr(Server, inet6) of
-                {ok, IP6} -> not is_private_ip6(IP6);
+                {ok, IP6} -> not is_denied_ip6(IP6);
                 {error, _} -> false
             end
     end.
 
-%% Block RFC 1918, loopback, link-local, CGNAT, and cloud metadata ranges.
-%%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space (second
-%%   octet 64..127); it can route to provider/internal infrastructure, so it is
-%%   denied alongside the RFC 1918 ranges.
-is_private_ip({127, _, _, _}) -> true;
-is_private_ip({10, _, _, _}) -> true;
-is_private_ip({172, B, _, _}) when B >= 16, B =< 31 -> true;
-is_private_ip({192, 168, _, _}) -> true;
-is_private_ip({169, 254, _, _}) -> true;
-is_private_ip({100, B, _, _}) when B >= 64, B =< 127 -> true;
-is_private_ip({0, _, _, _}) -> true;
-%% 240.0.0.0/4 (reserved/Class E, including 255.255.255.255 limited broadcast).
-is_private_ip({B, _, _, _}) when B >= 240 -> true;
-is_private_ip(_) -> false.
+%% A range-policy-denied address is normally blocked. The ONE relaxation is
+%% loopback when auth_validation_allow_private_networks is set (test-only,
+%% default false), so an integration suite can reach a local slapd on
+%% 127.0.0.1/::1. Mirrors aws_auth_validate_net:classify_denied/1 exactly, so the
+%% two backends grant the identical (loopback-only) test-mode relaxation.
+is_denied_ip(IP) ->
+    is_private_ip(IP) andalso not relaxed_loopback(IP).
 
-%% Block the IPv6 ranges that correspond to the v4 blocks above, so the filter
-%% cannot be bypassed by handing the endpoint a v6 (or v6-encoded) address.
-%%   ::1            loopback
-%%   ::             unspecified
-%%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
-%%                  address fd00:ec2::254 -- the whole point of this block.
-%%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
-%% v4-carrying notations (IPv4-mapped, IPv4-compatible, NAT64 64:ff9b::/96,
-%% 6to4 2002::/16) are unwrapped by the shared aws_auth_validate_net:embedded_v4/1
-%% and re-checked against the v4 ranges, so e.g. ::ffff:169.254.169.254 or the
-%% 6to4 form 2002:a9fe:a9fe:: cannot reach IMDS. Sharing that unwrapper (rather
-%% than a hand-copied one) keeps the two SSRF classifiers decoding the same
-%% encodings while LDAP keeps its own stricter range policy (is_private_ip/1
-%% denies all RFC1918/CGNAT, not just broker infra).
-is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) ->
-    true;
-is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) ->
-    true;
-is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
-is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
+is_denied_ip6(IP) ->
+    is_private_ip6(IP) andalso not relaxed_loopback(IP).
+
+relaxed_loopback(IP) ->
+    is_loopback(IP) andalso allow_private_networks().
+
+is_loopback({127, _, _, _}) -> true;
+is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_loopback(_) -> false.
+
+allow_private_networks() ->
+    application:get_env(aws, auth_validation_allow_private_networks, false) =:= true.
+
+%% LDAP's SSRF range policy, as CIDR lists. This is deliberately BROADER than the
+%% http/oauth infra-only denylist in aws_auth_validate_net: LDAP denies ALL
+%% RFC1918/CGNAT/reserved space, not just broker infra. Expressed as
+%% {Network, PrefixBits} tuples run through the shared
+%% aws_auth_validate_net:in_any_cidr/2 so both backends enumerate ranges in ONE
+%% vocabulary -- a future range fix (or a segment-math change) cannot silently
+%% apply to only one classifier. This mirrors #153, which unified the embedded-v4
+%% unwrapper for exactly this reason; here we unify the range-matching mechanism
+%% while each backend keeps its own distinct list.
+%%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space; it can
+%%     route to provider/internal infrastructure, so it is denied too.
+%%   240.0.0.0/4 is reserved/Class E, including 255.255.255.255 limited broadcast.
+-define(LDAP_DENIED_V4_CIDRS, [
+    {{127, 0, 0, 0}, 8},
+    {{10, 0, 0, 0}, 8},
+    {{172, 16, 0, 0}, 12},
+    {{192, 168, 0, 0}, 16},
+    {{169, 254, 0, 0}, 16},
+    {{100, 64, 0, 0}, 10},
+    {{0, 0, 0, 0}, 8},
+    {{240, 0, 0, 0}, 4}
+]).
+
+%% The IPv6 ranges corresponding to the v4 blocks above, so the filter cannot be
+%% bypassed with a v6 address.
+%%   ::1/128       loopback
+%%   ::/128        unspecified
+%%   fc00::/7      unique local addresses (ULA). Includes the IPv6 IMDS address
+%%                 fd00:ec2::254 -- the whole point of this block.
+%%   fe80::/10     link-local (spans fe80..febf, NOT just fe80)
+%% v4-carrying notations (IPv4-mapped, IPv4-compatible, NAT64 64:ff9b::/96, 6to4
+%% 2002::/16) are NOT listed here: they are unwrapped by the shared
+%% aws_auth_validate_net:embedded_v4/1 and re-checked against the v4 CIDRs, so
+%% e.g. ::ffff:169.254.169.254 or 2002:a9fe:a9fe:: still cannot reach IMDS.
+-define(LDAP_DENIED_V6_CIDRS, [
+    {{0, 0, 0, 0, 0, 0, 0, 1}, 128},
+    {{0, 0, 0, 0, 0, 0, 0, 0}, 128},
+    {{16#fc00, 0, 0, 0, 0, 0, 0, 0}, 7},
+    {{16#fe80, 0, 0, 0, 0, 0, 0, 0}, 10}
+]).
+
+%% Deny the LDAP range policy's v4 blocks (see ?LDAP_DENIED_V4_CIDRS).
+is_private_ip({_, _, _, _} = V4) ->
+    aws_auth_validate_net:in_any_cidr(V4, ?LDAP_DENIED_V4_CIDRS).
+
+%% Deny the LDAP range policy's v6 blocks, then fall through to the shared
+%% embedded-v4 unwrapper so a v6-encoded v4 address is re-checked against the v4
+%% policy. Keeps LDAP's stricter range policy while sharing the unwrap mechanism.
 is_private_ip6({_, _, _, _, _, _, _, _} = V6) ->
-    case aws_auth_validate_net:embedded_v4(V6) of
-        {ok, V4} -> is_private_ip(V4);
-        none -> false
+    case aws_auth_validate_net:in_any_cidr(V6, ?LDAP_DENIED_V6_CIDRS) of
+        true ->
+            true;
+        false ->
+            case aws_auth_validate_net:embedded_v4(V6) of
+                {ok, V4} -> is_private_ip(V4);
+                none -> false
+            end
     end;
 is_private_ip6(_) ->
     false.
@@ -702,15 +754,13 @@ do_ldap_connect(
 %% Re-validate the IP eldap actually connected to, closing the DNS-rebinding
 %% TOCTOU between is_allowed_server/1 (pre-connect, on a resolved IP) and this
 %% live socket. Reads the peer from the open handle rather than re-resolving the
-%% hostname, so what we check is exactly what we will talk to. Bypassed under
-%% auth_validation_allow_private_networks (local-slapd testing), matching
-%% is_allowed_server/1. Fails closed: if the peer cannot be determined, treat it
+%% hostname, so what we check is exactly what we will talk to. Always runs; the
+%% test-only loopback relaxation lives in is_denied_ip/1 (see is_allowed_server/1),
+%% so a local-slapd suite reaches 127.0.0.1/::1 while IMDS/RFC1918/etc stay denied
+%% even under the flag. Fails closed: if the peer cannot be determined, treat it
 %% as blocked.
 verify_connected_peer(Handle) ->
-    case application:get_env(aws, auth_validation_allow_private_networks, false) of
-        true -> ok;
-        _ -> check_peer_ip(Handle)
-    end.
+    check_peer_ip(Handle).
 
 check_peer_ip(Handle) ->
     case eldap:info(Handle) of
@@ -720,12 +770,12 @@ check_peer_ip(Handle) ->
     end.
 
 peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 4 ->
-    case is_private_ip(IP) of
+    case is_denied_ip(IP) of
         true -> blocked;
         false -> ok
     end;
 peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 8 ->
-    case is_private_ip6(IP) of
+    case is_denied_ip6(IP) of
         true -> blocked;
         false -> ok
     end;

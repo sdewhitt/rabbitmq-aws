@@ -334,6 +334,69 @@ server_rejects_unresolvable_test() ->
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
     ).
 
+%% Test-only auth_validation_allow_private_networks relaxes ONLY loopback, not the
+%% whole denylist, so the LDAP backend does not get a broader test-mode bypass than
+%% aws_auth_validate_net grants http/oauth. Loopback (127/8, ::1) becomes reachable;
+%% IMDS/link-local/RFC1918/CGNAT stay denied even with the flag on.
+server_flag_relaxes_loopback_only_test_() ->
+    {setup,
+        fun() ->
+            application:set_env(aws, auth_validation_allow_private_networks, true)
+        end,
+        fun(_) ->
+            application:unset_env(aws, auth_validation_allow_private_networks)
+        end,
+        [
+            %% Loopback is now reachable (the intended local-slapd relaxation).
+            ?_assertEqual(true, aws_auth_validate_ldap:is_allowed_server("127.0.0.1")),
+            ?_assertEqual(true, aws_auth_validate_ldap:is_allowed_server("::1")),
+            %% IMDS is still denied even under the flag -- the whole point.
+            ?_assertEqual(
+                false, aws_auth_validate_ldap:is_allowed_server("169.254.169.254")
+            ),
+            %% RFC1918 and CGNAT stay denied too.
+            ?_assertEqual(false, aws_auth_validate_ldap:is_allowed_server("10.0.0.5")),
+            ?_assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.64.0.1")),
+            %% The post-connect peer check honours the same loopback-only relaxation.
+            ?_assertEqual(
+                ok, aws_auth_validate_ldap:peer_allowed({ok, {{127, 0, 0, 1}, 389}})
+            ),
+            ?_assertEqual(
+                blocked,
+                aws_auth_validate_ldap:peer_allowed({ok, {{169, 254, 169, 254}, 80}})
+            )
+        ]}.
+
+%%--------------------------------------------------------------------
+%% Port default (broker parity)
+%%--------------------------------------------------------------------
+
+%% An omitted port defaults to the broker's default (389) rather than being
+%% rejected input_invalid, so a config the live broker would accept validates.
+parse_port_defaults_to_389_when_absent_test() ->
+    ?assertEqual({ok, #{port => 389}}, aws_auth_validate_ldap:parse_port(#{}, #{})).
+
+%% A supplied in-range port is honoured unchanged.
+parse_port_honours_supplied_test() ->
+    ?assertEqual(
+        {ok, #{port => 636}},
+        aws_auth_validate_ldap:parse_port(#{<<"port">> => 636}, #{})
+    ).
+
+%% An out-of-range or non-integer port is still rejected.
+parse_port_rejects_out_of_range_test() ->
+    ?assertMatch(
+        {error, input_invalid, _}, aws_auth_validate_ldap:parse_port(#{<<"port">> => 0}, #{})
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_ldap:parse_port(#{<<"port">> => 70000}, #{})
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_ldap:parse_port(#{<<"port">> => <<"636">>}, #{})
+    ).
+
 %%--------------------------------------------------------------------
 %% Post-connect peer re-check (DNS-rebinding TOCTOU defence)
 %%--------------------------------------------------------------------
