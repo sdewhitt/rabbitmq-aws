@@ -201,7 +201,7 @@ http_ssl_options_shape_test_() ->
         ?_assertMatch(
             {error, input_invalid, <<
                 "ssl_options contains an unknown key; allowed keys are cacertfile_arn, "
-                "certfile_arn, keyfile_arn, verify, depth, versions, sni"
+                "certfile_arn, keyfile_arn, verify, depth, versions, sni, hostname_verification"
             >>},
             aws_auth_validate_http:validate(
                 body_with_ssl(#{<<"verfy">> => <<"verify_peer">>})
@@ -790,6 +790,59 @@ http_response_contract_test_() ->
         ?_assertEqual(Expected, aws_auth_validate_http:classify_response(Key, Body))
      || {Key, Body, Expected} <- Cases
     ].
+
+%%--------------------------------------------------------------------
+%% hostname_verification (broker parity): the http backend must default to
+%% STRICT matching (no RFC 6125 https match fun) and only add the wildcard fun
+%% when ssl_options.hostname_verification = wildcard -- mirroring
+%% rabbit_auth_backend_http, which applies it only on ssl_hostname_verification =
+%% wildcard. build_client_ssl_opts/1 is called directly (no network); an OS
+%% trust anchor is mocked so verify_peer keeps a trust anchor and the
+%% match-fun branch is reachable.
+%%--------------------------------------------------------------------
+
+http_hostname_verification_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(public_key, [unstick, passthrough]),
+            %% Non-empty OS store -> verify_peer has a trust anchor.
+            meck:expect(public_key, cacerts_get, fun() -> [<<"der">>] end),
+            ok
+        end,
+        fun(_) -> meck:unload(public_key) end, fun(_) ->
+            Build = fun(Ssl) ->
+                aws_auth_validate_http:build_client_ssl_opts(#{
+                    ssl_options => Ssl, aws_state => none
+                })
+            end,
+            {ok, Unset} = Build(#{<<"verify">> => <<"verify_peer">>}),
+            {ok, Wild} = Build(#{
+                <<"verify">> => <<"verify_peer">>,
+                <<"hostname_verification">> => <<"wildcard">>
+            }),
+            {ok, NoneMode} = Build(#{
+                <<"verify">> => <<"verify_peer">>,
+                <<"hostname_verification">> => <<"none">>
+            }),
+            [
+                %% Unset defaults to strict: no https match fun (the #151 parity
+                %% fix, now extended to http).
+                ?_assertNot(lists:keymember(customize_hostname_check, 1, Unset)),
+                %% none is also strict.
+                ?_assertNot(lists:keymember(customize_hostname_check, 1, NoneMode)),
+                %% wildcard opts into the RFC 6125 https match fun.
+                ?_assert(lists:keymember(customize_hostname_check, 1, Wild))
+            ]
+        end}.
+
+%% An unknown hostname_verification value is rejected in the pure phase.
+http_hostname_verification_bad_value_test() ->
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_http:validate(
+            body_with_ssl(#{<<"hostname_verification">> => <<"bogus">>})
+        )
+    ).
 
 %%--------------------------------------------------------------------
 %% Helpers

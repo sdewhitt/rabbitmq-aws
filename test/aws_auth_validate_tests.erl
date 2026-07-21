@@ -11,6 +11,8 @@
 -module(aws_auth_validate_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
 -include("aws_lib.hrl").
 
 %%--------------------------------------------------------------------
@@ -122,6 +124,7 @@ registry_field_filter_override_test_() ->
 
 status_for_category_known_test() ->
     ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(input_invalid)),
+    ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(body_too_large)),
     ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(connection_failed)),
     ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(tls_failed)),
     ?assertEqual(400, aws_auth_validate_mgmt:status_for_category(query_invalid)),
@@ -132,6 +135,49 @@ status_for_category_known_test() ->
 %% A category outside the documented set maps to 500 rather than crashing.
 status_for_category_unknown_test() ->
     ?assertEqual(500, aws_auth_validate_mgmt:status_for_category(some_future_category)).
+
+%%--------------------------------------------------------------------
+%% Audit-log sanitizer + principal extraction (issue #154 coverage)
+%%--------------------------------------------------------------------
+
+%% A plain value with no control chars is returned byte-for-byte.
+sanitize_log_plain_unchanged_test() ->
+    ?assertEqual(<<"ldap">>, aws_auth_validate_mgmt:sanitize_log(<<"ldap">>)).
+
+%% CR and LF are replaced with U+FFFD so an embedded newline cannot forge or
+%% split an audit line (log injection). The record stays on one line.
+sanitize_log_strips_crlf_test() ->
+    Out = aws_auth_validate_mgmt:sanitize_log(<<"admin\r\nfake result=success">>),
+    ?assertEqual(nomatch, binary:match(Out, <<"\r">>)),
+    ?assertEqual(nomatch, binary:match(Out, <<"\n">>)),
+    %% Both control bytes became the 3-byte UTF-8 replacement char.
+    ?assertEqual(<<"admin"/utf8, 16#fffd/utf8, 16#fffd/utf8, "fake result=success"/utf8>>, Out).
+
+%% Any C0 control (< 0x20), TAB, and DEL (0x7F) are all replaced.
+sanitize_log_strips_c0_tab_del_test() ->
+    ?assertEqual(<<16#fffd/utf8>>, aws_auth_validate_mgmt:sanitize_log(<<0>>)),
+    ?assertEqual(<<16#fffd/utf8>>, aws_auth_validate_mgmt:sanitize_log(<<"\t">>)),
+    ?assertEqual(<<16#fffd/utf8>>, aws_auth_validate_mgmt:sanitize_log(<<16#7f>>)).
+
+%% Multi-byte UTF-8 (every byte >= 0x80) is preserved untouched, as documented.
+sanitize_log_preserves_utf8_test() ->
+    In = <<"user-é-名"/utf8>>,
+    ?assertEqual(In, aws_auth_validate_mgmt:sanitize_log(In)).
+
+%% Non-binary input passes through unchanged (defensive).
+sanitize_log_non_binary_passthrough_test() ->
+    ?assertEqual(an_atom, aws_auth_validate_mgmt:sanitize_log(an_atom)).
+
+%% username/1 happy path: the authenticated principal's binary name.
+username_extracts_principal_test() ->
+    Ctx = #context{user = #user{username = <<"alice">>}},
+    ?assertEqual(<<"alice">>, aws_auth_validate_mgmt:username(Ctx)).
+
+%% username/1 fallback: a context with no user (e.g. an unauthenticated OPTIONS)
+%% or an unexpected shape yields <<"unknown">> rather than crashing the audit.
+username_fallback_on_no_user_test() ->
+    ?assertEqual(<<"unknown">>, aws_auth_validate_mgmt:username(#context{user = undefined})),
+    ?assertEqual(<<"unknown">>, aws_auth_validate_mgmt:username(not_a_context)).
 
 %%--------------------------------------------------------------------
 %% Mgmt body-size bound
@@ -485,6 +531,100 @@ ldap_build_tls_opts_explicit_verify_peer_with_anchor_ok_test() ->
 ldap_build_tls_opts_explicit_verify_none_untouched_test() ->
     {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{<<"verify">> => <<"verify_none">>}),
     ?assertEqual(verify_none, proplists:get_value(verify, Opts)).
+
+%%--------------------------------------------------------------------
+%% hostname_verification: LDAP must match the broker, which applies the RFC 6125
+%% https match fun ONLY when auth_ldap.ssl_options.hostname_verification =
+%% wildcard. The validator previously applied it always (too lenient), so a
+%% wildcard LDAPS cert the broker rejects passed the validator green.
+%%--------------------------------------------------------------------
+
+%% Default (hostname_verification unset): strict OTP matching -- NO https match
+%% fun injected, even on an explicit verify_peer with an anchor.
+ldap_build_tls_opts_default_is_strict_no_match_fun_test() ->
+    {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{
+        <<"verify">> => <<"verify_peer">>,
+        cacerts => [<<"der">>]
+    }),
+    ?assertNot(lists:keymember(customize_hostname_check, 1, Opts)).
+
+%% Explicit `wildcard' opts into the https match fun (broker's wildcard mode).
+ldap_build_tls_opts_wildcard_adds_match_fun_test() ->
+    {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{
+        <<"verify">> => <<"verify_peer">>,
+        <<"hostname_verification">> => <<"wildcard">>,
+        cacerts => [<<"der">>]
+    }),
+    ?assert(lists:keymember(customize_hostname_check, 1, Opts)).
+
+%% Explicit `none' is strict (the broker treats non-wildcard as strict): no fun.
+ldap_build_tls_opts_none_is_strict_test() ->
+    {ok, Opts} = aws_auth_validate_ldap:build_tls_opts(true, #{
+        <<"verify">> => <<"verify_peer">>,
+        <<"hostname_verification">> => <<"none">>,
+        cacerts => [<<"der">>]
+    }),
+    ?assertNot(lists:keymember(customize_hostname_check, 1, Opts)).
+
+%% hostname_verification is a control input, not a direct ssl option: it must NOT
+%% leak into the translated eldap opts.
+ldap_build_ssl_opts_ignores_hostname_verification_test() ->
+    Opts = aws_auth_validate_ldap:build_ssl_opts(#{<<"hostname_verification">> => <<"wildcard">>}),
+    ?assertEqual(undefined, proplists:get_value(hostname_verification, Opts)),
+    ?assertEqual([], Opts).
+
+%% A bad hostname_verification value is rejected in the pure phase.
+ldap_rejects_bad_hostname_verification_test() ->
+    Body = base_body(#{<<"ssl_options">> => #{<<"hostname_verification">> => <<"lenient">>}}),
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_ldap:validate(Body)).
+
+%%--------------------------------------------------------------------
+%% Post-bind search time limit (issue #154 coverage)
+%%--------------------------------------------------------------------
+
+%% Units: the limit is the LDAP protocol timeLimit in whole SECONDS, derived from
+%% the ms connection timeout (rounded up). A units regression (dropping div 1000)
+%% would blow this up by ~1000x.
+ldap_search_time_limit_seconds_units_test() ->
+    application:set_env(aws, auth_validation_connection_timeout_ms, 5000),
+    try
+        ?assertEqual(5, aws_auth_validate_ldap:search_time_limit_seconds())
+    after
+        application:unset_env(aws, auth_validation_connection_timeout_ms)
+    end.
+
+%% Rounds UP to the next whole second so a sub-second budget never truncates.
+ldap_search_time_limit_seconds_rounds_up_test() ->
+    application:set_env(aws, auth_validation_connection_timeout_ms, 4001),
+    try
+        ?assertEqual(5, aws_auth_validate_ldap:search_time_limit_seconds())
+    after
+        application:unset_env(aws, auth_validation_connection_timeout_ms)
+    end.
+
+%% Floored at 1s: a sub-1s budget must never yield 0 (eldap reads 0 as "no
+%% time limit", the opposite of the intent).
+ldap_search_time_limit_seconds_floor_test() ->
+    application:set_env(aws, auth_validation_connection_timeout_ms, 200),
+    try
+        ?assertEqual(1, aws_auth_validate_ldap:search_time_limit_seconds())
+    after
+        application:unset_env(aws, auth_validation_connection_timeout_ms)
+    end.
+
+%%--------------------------------------------------------------------
+%% is_private_ip6/1 6to4 unwrapping (issue #154 coverage). is_allowed_server/1
+%% already covers the resolve path; these pin the classifier directly so a
+%% regression in the shared embedded_v4 unwrap is caught without DNS.
+%%--------------------------------------------------------------------
+
+ldap_is_private_ip6_6to4_imds_blocked_test() ->
+    %% 2002:a9fe:a9fe:: wraps 169.254.169.254 (IMDS) -> private.
+    ?assert(aws_auth_validate_ldap:is_private_ip6({16#2002, 16#a9fe, 16#a9fe, 0, 0, 0, 0, 0})).
+
+ldap_is_private_ip6_6to4_public_allowed_test() ->
+    %% 2002:0808:0808:: wraps 8.8.8.8 (public) -> not private.
+    ?assertNot(aws_auth_validate_ldap:is_private_ip6({16#2002, 16#0808, 16#0808, 0, 0, 0, 0, 0})).
 
 ldap_config_conflict_test() ->
     Body = base_body(#{<<"use_ssl">> => true, <<"use_starttls">> => true}),

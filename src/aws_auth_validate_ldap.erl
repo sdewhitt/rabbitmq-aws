@@ -48,9 +48,19 @@
 %% Exposed for unit tests: build_ssl_opts/1 translates validated ssl_options
 %% to the eldap proplist; build_tls_opts/2 layers the shared verify-mode policy
 %% on top (returning the fail-loud {ok,_}|{error,tls_failed,_} contract);
-%% peer_allowed/1 is the post-connect SSRF re-check on a peername result. All
-%% are otherwise internal.
--export([build_ssl_opts/1, build_tls_opts/2, is_allowed_server/1, peer_allowed/1]).
+%% peer_allowed/1 is the post-connect SSRF re-check on a peername result;
+%% is_private_ip/1 + is_private_ip6/1 are the SSRF address classifiers (incl. the
+%% v6-embedded-v4 unwrapping); search_time_limit_seconds/0 is the post-bind
+%% search timeLimit. All are otherwise internal.
+-export([
+    build_ssl_opts/1,
+    build_tls_opts/2,
+    is_allowed_server/1,
+    peer_allowed/1,
+    is_private_ip/1,
+    is_private_ip6/1,
+    search_time_limit_seconds/0
+]).
 -endif.
 
 -include_lib("eldap/include/eldap.hrl").
@@ -75,8 +85,14 @@
     <<"verify">>,
     <<"depth">>,
     <<"versions">>,
-    <<"server_name_indication">>
+    <<"server_name_indication">>,
+    <<"hostname_verification">>
 ]).
+
+%% Accepted values for `hostname_verification'. Mirrors the broker's
+%% auth_ldap.ssl_options.hostname_verification enum ({wildcard, none}); the
+%% broker's default (key unset) is strict OTP matching.
+-define(SSL_HOSTNAME_VERIFICATION_VALUES, [<<"wildcard">>, <<"none">>]).
 
 %% Accepted values for the `verify' ssl option. Mirrors the ssl app's two
 %% modes; anything else is a mis-typed value and rejected up front rather
@@ -104,12 +120,15 @@
 -define(REASON_BAD_SSL_OPTIONS, <<"ssl_options must be an object">>).
 -define(REASON_UNKNOWN_SSL_OPTION, <<
     "ssl_options contains an unknown key; allowed keys are cacertfile_arn, "
-    "verify, depth, versions, server_name_indication"
+    "verify, depth, versions, server_name_indication, hostname_verification"
 >>).
 -define(REASON_BAD_SSL_VERIFY, <<"ssl_options.verify must be verify_peer or verify_none">>).
 -define(REASON_BAD_SSL_DEPTH, <<"ssl_options.depth must be a non-negative integer">>).
 -define(REASON_BAD_SSL_VERSIONS, <<"ssl_options.versions must be a list of known TLS versions">>).
 -define(REASON_BAD_SSL_SNI, <<"ssl_options.server_name_indication must be a string">>).
+-define(REASON_BAD_SSL_HOSTNAME_VERIFICATION,
+    <<"ssl_options.hostname_verification must be wildcard or none">>
+).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
 -define(REASON_CACERT_ARN_RESOLVE, <<"failed to resolve ssl_options.cacertfile_arn">>).
 -define(REASON_CACERT_PEM_INVALID,
@@ -418,6 +437,11 @@ valid_ssl_value(<<"server_name_indication">>, V) ->
         true -> ok;
         false -> {error, input_invalid, ?REASON_BAD_SSL_SNI}
     end;
+valid_ssl_value(<<"hostname_verification">>, V) ->
+    case lists:member(V, ?SSL_HOSTNAME_VERIFICATION_VALUES) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_HOSTNAME_VERIFICATION}
+    end;
 valid_ssl_value(<<"cacertfile_arn">>, V) ->
     case is_nonempty_binary(V) of
         true -> ok;
@@ -559,28 +583,26 @@ is_private_ip(_) -> false.
 %%   fc00::/7       unique local addresses (ULA). Includes the IPv6 IMDS
 %%                  address fd00:ec2::254 -- the whole point of this block.
 %%   fe80::/10      link-local (spans fe80..febf, NOT just fe80)
-%% IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), NAT64
-%% (64:ff9b::a.b.c.d), and 6to4 (2002:a.b.c.d::/16) addresses embed a v4 address;
-%% re-check those against the v4 ranges so e.g. ::ffff:169.254.169.254 (and the
-%% NAT64 form 64:ff9b::169.254.169.254, which a host with a NAT64/DNS64 resolver
-%% would translate to IMDS, or the 6to4 form 2002:a9fe:a9fe:: on a host with a
-%% 6to4 route) cannot reach IMDS. Mirrors the embedded-v4 unwrapping in the
-%% shared aws_auth_validate_net:classify_ip/2 so the two SSRF classifiers stay in
-%% step.
-is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
-is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
+%% v4-carrying notations (IPv4-mapped, IPv4-compatible, NAT64 64:ff9b::/96,
+%% 6to4 2002::/16) are unwrapped by the shared aws_auth_validate_net:embedded_v4/1
+%% and re-checked against the v4 ranges, so e.g. ::ffff:169.254.169.254 or the
+%% 6to4 form 2002:a9fe:a9fe:: cannot reach IMDS. Sharing that unwrapper (rather
+%% than a hand-copied one) keeps the two SSRF classifiers decoding the same
+%% encodings while LDAP keeps its own stricter range policy (is_private_ip/1
+%% denies all RFC1918/CGNAT, not just broker infra).
+is_private_ip6({0, 0, 0, 0, 0, 0, 0, 1}) ->
+    true;
+is_private_ip6({0, 0, 0, 0, 0, 0, 0, 0}) ->
+    true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fc00, W1 =< 16#fdff -> true;
 is_private_ip6({W1, _, _, _, _, _, _, _}) when W1 >= 16#fe80, W1 =< 16#febf -> true;
-is_private_ip6({0, 0, 0, 0, 0, 16#ffff, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
-is_private_ip6({16#0064, 16#ff9b, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
-%% 6to4 2002::/16: the embedded v4 lives in the 2nd and 3rd 16-bit words.
-is_private_ip6({16#2002, W2, W3, _, _, _, _, _}) -> is_private_ip(v6_words_to_v4(W2, W3));
-is_private_ip6({0, 0, 0, 0, 0, 0, W7, W8}) -> is_private_ip(v6_words_to_v4(W7, W8));
-is_private_ip6(_) -> false.
-
-%% Split the low 32 bits of a v4-mapped/compatible v6 address into a v4 tuple.
-v6_words_to_v4(W7, W8) ->
-    {W7 bsr 8, W7 band 16#ff, W8 bsr 8, W8 band 16#ff}.
+is_private_ip6({_, _, _, _, _, _, _, _} = V6) ->
+    case aws_auth_validate_net:embedded_v4(V6) of
+        {ok, V4} -> is_private_ip(V4);
+        none -> false
+    end;
+is_private_ip6(_) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% Config conflict
@@ -1009,8 +1031,12 @@ maybe_start_tls(Handle, true, TlsOpts, Timeout) ->
 %%
 %% This produces the raw translation only; the verify-mode default (and its
 %% fail-loud no-anchor policy) is applied by build_tls_opts/2 via the shared
-%% aws_auth_validate_ssl:apply_verify_default/2. Kept separate so the unit tests
+%% aws_auth_validate_ssl:apply_verify_default/3. Kept separate so the unit tests
 %% can pin the translation independently of the trust-anchor policy.
+%%
+%% `hostname_verification' is intentionally NOT translated here: it is a control
+%% input for the shared helper's hostname-match mode, not a direct ssl option, so
+%% build_tls_opts/2 reads it and passes the resolved mode alongside.
 %%
 %% No `catch' here. The previous `(catch Fun(Value))' swallowed every error,
 %% which the value-validation in parse_ssl_options/2 has now made unnecessary
@@ -1051,16 +1077,19 @@ add_ssl_opt(SslKey, Fun, Value, Acc) ->
 %% TlsInUse is (use_ssl orelse use_starttls); on a plaintext request there is no
 %% TLS to shape, so return an empty list unused by ssl_open_opts(false, _).
 %%
-%% The verify-mode default is delegated to aws_auth_validate_ssl:apply_verify_default/2
-%% -- the SAME helper the http/oauth backends use -- so all three outbound backends
-%% share one policy:
+%% The verify-mode default is delegated to the shared
+%% aws_auth_validate_ssl:apply_verify_default/3, so the no-anchor policy matches
+%% the http/oauth backends:
 %%   * an EXPLICIT verify_peer with no trust anchor FAILS loud as tls_failed (never
 %%     silently downgraded -- the false positive this endpoint exists to prevent),
 %%   * a DEFAULTED verify_peer with no anchor downgrades to verify_none (broker
 %%     parity -- a plain reachability probe still works without a CA store),
-%%   * an explicit verify_none is untouched, and every verify_peer path also gets
-%%     the RFC 6125 https hostname-match fun so wildcard IdP/LDAPS certs verify the
-%%     way mainstream clients do.
+%%   * an explicit verify_none is untouched.
+%% The hostname-check mode is passed explicitly (NOT the http/oauth wildcard
+%% default): LDAP mirrors rabbit_auth_backend_ldap, which applies the RFC 6125
+%% https match fun ONLY when auth_ldap.ssl_options.hostname_verification =
+%% wildcard, and otherwise uses OTP strict matching. Defaulting to wildcard here
+%% would pass a wildcard LDAPS cert the live broker rejects.
 %% VerifyExplicit is whether the caller set `verify' themselves; it governs the
 %% fail-vs-downgrade branch for the no-anchor case.
 -spec build_tls_opts(boolean(), map()) ->
@@ -1070,7 +1099,9 @@ build_tls_opts(false, _SslOpts) ->
 build_tls_opts(true, SslOpts) ->
     Translated = build_ssl_opts(SslOpts),
     VerifyExplicit = maps:is_key(<<"verify">>, SslOpts),
-    aws_auth_validate_ssl:apply_verify_default(Translated, VerifyExplicit).
+    %% Shared with http/oauth: unset/`none' = strict, `wildcard' opts in.
+    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(SslOpts),
+    aws_auth_validate_ssl:apply_verify_default(Translated, VerifyExplicit, HostnameCheck).
 
 %%--------------------------------------------------------------------
 
@@ -1085,12 +1116,12 @@ connection_timeout_ms() ->
     aws_auth_validate_ssl:connection_timeout_ms(#{default => ?DEFAULT_TIMEOUT_MS, max => 60_000}).
 
 %% Server-side LDAP search time limit, in whole seconds, for the post-bind
-%% probes (dn_lookup, principal resolution, membership/existence). eldap's
-%% open/2 timeout already bounds each socket recv on the client side; this adds
-%% the protocol-level timeLimit so a server that accepts the bind and then
-%% dribbles a search response cannot keep a probe -- and thus a semaphore slot --
-%% busy for the full connection timeout on every one of a request's several
-%% sequential searches. Derived from the same request-timeout config (ms -> s,
-%% rounded up, floored at 1s) so it tracks the operator's configured budget.
+%% probes (dn_lookup, principal resolution, membership/existence). This is the
+%% protocol-level timeLimit, which is server-COOPERATIVE: a compliant server
+%% bounds its own search time, but a server that stalls at the TCP layer ignores
+%% it -- only the eldap open/2 socket recv timeout bounds that case. It is a
+%% best-effort budget, not a hard DoS cap. Derived from the same request-timeout
+%% config (ms -> s, rounded up, floored at 1s) so it tracks the operator's
+%% configured budget.
 search_time_limit_seconds() ->
     max(1, (connection_timeout_ms() + 999) div 1000).

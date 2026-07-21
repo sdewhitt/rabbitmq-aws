@@ -106,6 +106,123 @@ has_https_match_fun(Opts) ->
     end.
 
 %%--------------------------------------------------------------------
+%% aws_auth_validate_ssl: apply_verify_default/3 hostname-check mode
+%%--------------------------------------------------------------------
+%%
+%% The /3 form lets a backend model the broker's hostname_verification setting.
+%% `wildcard' applies the RFC 6125 https match fun (http/oauth default, and the
+%% /2 form); `strict' leaves OTP's exact matching in place -- the LDAP default,
+%% mirroring rabbit_auth_backend_ldap which only applies the https fun when
+%% auth_ldap.ssl_options.hostname_verification = wildcard.
+
+%% /2 delegates to /3 with wildcard: a bare verify_peer gains the match fun.
+apply_verify_default_2_defaults_to_wildcard_test() ->
+    Opts = [{verify, verify_peer}, {cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, true),
+    ?assert(has_https_match_fun(Out)).
+
+%% /3 wildcard mode matches the /2 behaviour.
+apply_verify_default_3_wildcard_adds_hostname_check_test() ->
+    Opts = [{verify, verify_peer}, {cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, true, wildcard),
+    ?assert(has_https_match_fun(Out)).
+
+%% /3 strict mode MUST NOT inject the https match fun on an explicit verify_peer:
+%% OTP's default (exact) matching stays, matching the broker's default LDAP path.
+apply_verify_default_3_strict_no_hostname_check_test() ->
+    Opts = [{verify, verify_peer}, {cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, true, strict),
+    ?assertNot(lists:keymember(customize_hostname_check, 1, Out)),
+    ?assertEqual({verify, verify_peer}, lists:keyfind(verify, 1, Out)).
+
+%% /3 strict mode on the ABSENT-verify path: defaults to verify_peer (anchor
+%% present) but still adds no match fun.
+apply_verify_default_3_strict_absent_verify_no_hostname_check_test() ->
+    Opts = [{cacerts, [<<"der">>]}],
+    {ok, Out} = aws_auth_validate_ssl:apply_verify_default(Opts, false, strict),
+    ?assertEqual({verify, verify_peer}, lists:keyfind(verify, 1, Out)),
+    ?assertNot(lists:keymember(customize_hostname_check, 1, Out)).
+
+%% strict mode does not alter the no-anchor policy: an EXPLICIT verify_peer with
+%% no anchor still fails loud (the hostname-check mode is orthogonal to it).
+apply_verify_default_3_strict_explicit_no_anchor_still_fails_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(public_key, [unstick, passthrough]),
+            meck:expect(public_key, cacerts_get, fun() -> [] end),
+            ok
+        end,
+        fun(_) -> meck:unload(public_key) end, fun() ->
+            Result = aws_auth_validate_ssl:apply_verify_default(
+                [{verify, verify_peer}], true, strict
+            ),
+            ?assertMatch({error, tls_failed, _}, Result)
+        end}.
+
+%%--------------------------------------------------------------------
+%% aws_auth_validate_ssl: hostname_check_mode/1. Shared by http/oauth/ldap to
+%% resolve the modeled `hostname_verification' ssl_options input into the /3
+%% mode. Unset (or the broker's `none') = strict; only `wildcard' opts into the
+%% RFC 6125 https match fun -- mirroring the broker's strict-by-default gating
+%% across all three backends.
+%%--------------------------------------------------------------------
+
+hostname_check_mode_unset_is_strict_test() ->
+    ?assertEqual(strict, aws_auth_validate_ssl:hostname_check_mode(#{})).
+
+hostname_check_mode_none_is_strict_test() ->
+    ?assertEqual(
+        strict,
+        aws_auth_validate_ssl:hostname_check_mode(#{<<"hostname_verification">> => <<"none">>})
+    ).
+
+hostname_check_mode_wildcard_test() ->
+    ?assertEqual(
+        wildcard,
+        aws_auth_validate_ssl:hostname_check_mode(#{<<"hostname_verification">> => <<"wildcard">>})
+    ).
+
+%%--------------------------------------------------------------------
+%% aws_auth_validate_net: embedded_v4/1 shared unwrapper. The LDAP SSRF
+%% classifier (is_private_ip6/1) shares this helper, so its decoding must cover
+%% every v4-carrying v6 notation and leave native v6 (::, ::1) unwrapped.
+%%--------------------------------------------------------------------
+
+embedded_v4_ipv4_mapped_test() ->
+    ?assertEqual(
+        {ok, {169, 254, 169, 254}},
+        aws_auth_validate_net:embedded_v4({0, 0, 0, 0, 0, 16#ffff, 16#a9fe, 16#a9fe})
+    ).
+
+embedded_v4_ipv4_compatible_test() ->
+    ?assertEqual(
+        {ok, {8, 8, 8, 8}},
+        aws_auth_validate_net:embedded_v4({0, 0, 0, 0, 0, 0, 16#0808, 16#0808})
+    ).
+
+embedded_v4_nat64_test() ->
+    ?assertEqual(
+        {ok, {169, 254, 169, 254}},
+        aws_auth_validate_net:embedded_v4({16#64, 16#ff9b, 0, 0, 0, 0, 16#a9fe, 16#a9fe})
+    ).
+
+embedded_v4_6to4_test() ->
+    ?assertEqual(
+        {ok, {169, 254, 169, 254}},
+        aws_auth_validate_net:embedded_v4({16#2002, 16#a9fe, 16#a9fe, 0, 0, 0, 0, 0})
+    ).
+
+%% :: and ::1 are NOT unwrapped -- they must classify as v6 (::1 is v6 loopback,
+%% not v4 0.0.0.1), so the unwrapper returns `none' for them.
+embedded_v4_unspecified_and_loopback_not_unwrapped_test() ->
+    ?assertEqual(none, aws_auth_validate_net:embedded_v4({0, 0, 0, 0, 0, 0, 0, 0})),
+    ?assertEqual(none, aws_auth_validate_net:embedded_v4({0, 0, 0, 0, 0, 0, 0, 1})).
+
+%% A plain global-unicast v6 carries no embedded v4.
+embedded_v4_plain_v6_none_test() ->
+    ?assertEqual(none, aws_auth_validate_net:embedded_v4({2600, 16#1f18, 0, 0, 0, 0, 0, 1})).
+
+%%--------------------------------------------------------------------
 %% aws_auth_validate_net: the SSRF classifier is identical for the http and
 %% oauth policies (same infra denylist). Assert both backends' TEST wrappers
 %% agree with each other and with the shared module for the full v4/v6 matrix.

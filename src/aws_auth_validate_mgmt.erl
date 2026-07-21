@@ -28,8 +28,10 @@
 -ifdef(TEST).
 %% Exposed for unit tests: status_for_category/1 maps a backend error category
 %% to an HTTP status, including the catch-all for an unexpected category;
-%% max_body_size/0 resolves the configured body-size limit against its bounds.
--export([status_for_category/1, max_body_size/0]).
+%% max_body_size/0 resolves the configured body-size limit against its bounds;
+%% sanitize_log/1 strips control chars from a caller-influenceable audit field;
+%% username/1 extracts the authenticated principal (or the `unknown' fallback).
+-export([status_for_category/1, max_body_size/0, sanitize_log/1, username/1]).
 -endif.
 
 -include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
@@ -201,6 +203,7 @@ respond({error, Category, Reason}, Req, Context) when is_atom(Category), is_bina
     reply_error(Status, Category, Reason, Req, Context).
 
 status_for_category(input_invalid) -> 400;
+status_for_category(body_too_large) -> 400;
 status_for_category(connection_failed) -> 400;
 status_for_category(tls_failed) -> 400;
 status_for_category(query_invalid) -> 400;

@@ -36,6 +36,7 @@
     url_allowed/2,
     classify_address/2,
     classify_ip/2,
+    embedded_v4/1,
     resolve_and_pin/2,
     pin_url/2,
     in_cidr/2,
@@ -85,35 +86,44 @@ classify_address(#{host := Host}, Policy) ->
     end.
 
 %% classify_ip/2: allow | deny for a parsed IP tuple. Denies the broker-infra
-%% ranges only. Several IPv6 notations embed a v4 address; each is unwrapped to
-%% its v4 form and re-classified, otherwise the v6 encoding smuggles a denied v4
-%% address (e.g. 169.254.169.254) past the v4 denylist. Covered: IPv4-mapped
-%% ::ffff:a.b.c.d, IPv4-compatible ::a.b.c.d, NAT64 64:ff9b::/96, 6to4 2002::/16.
+%% ranges only. A v6 address that embeds a v4 address is unwrapped via the shared
+%% embedded_v4/1 and re-classified as v4, otherwise the v6 encoding smuggles a
+%% denied v4 address (e.g. 169.254.169.254) past the v4 denylist.
 -spec classify_ip(tuple(), policy()) -> allow | deny.
-classify_ip({0, 0, 0, 0, 0, 16#ffff, W1, W2}, Policy) ->
-    %% IPv4-mapped ::ffff:a.b.c.d
-    classify_ip(v4_from_words(W1, W2), Policy);
-classify_ip({0, 0, 0, 0, 0, 0, W1, W2}, Policy) when {W1, W2} =/= {0, 0}, {W1, W2} =/= {0, 1} ->
-    %% IPv4-compatible ::a.b.c.d (RFC4291-deprecated). The guard lets the
-    %% unspecified :: and loopback ::1 fall through to the v6 denylist instead
-    %% (::1 must be matched as v6 loopback, not as v4 0.0.0.1).
-    classify_ip(v4_from_words(W1, W2), Policy);
-classify_ip({16#64, 16#ff9b, 0, 0, 0, 0, W1, W2}, Policy) ->
-    %% NAT64 well-known prefix 64:ff9b::/96 -> embedded v4 in the low 32 bits.
-    classify_ip(v4_from_words(W1, W2), Policy);
-classify_ip({16#2002, W1, W2, _, _, _, _, _}, Policy) ->
-    %% 6to4 2002::/16 -> embedded v4 in segments 2-3.
-    classify_ip(v4_from_words(W1, W2), Policy);
+classify_ip({_, _, _, _, _, _, _, _} = V6, Policy) ->
+    case embedded_v4(V6) of
+        {ok, V4} ->
+            classify_ip(V4, Policy);
+        none ->
+            case in_any_cidr(V6, maps:get(denied_v6, Policy)) of
+                true -> classify_denied(V6);
+                false -> allow
+            end
+    end;
 classify_ip({_, _, _, _} = V4, Policy) ->
     case in_any_cidr(V4, maps:get(denied_v4, Policy)) of
         true -> classify_denied(V4);
         false -> allow
-    end;
-classify_ip({_, _, _, _, _, _, _, _} = V6, Policy) ->
-    case in_any_cidr(V6, maps:get(denied_v6, Policy)) of
-        true -> classify_denied(V6);
-        false -> allow
     end.
+
+%% embedded_v4/1: for the IPv6 notations that carry a v4 address, return
+%% {ok, V4Tuple}; otherwise `none'. Policy-independent unwrapping shared with
+%% the LDAP SSRF classifier (aws_auth_validate_ldap:is_private_ip6/1) so both
+%% classifiers decode the same encodings from one place. Covered: IPv4-mapped
+%% ::ffff:a.b.c.d, IPv4-compatible ::a.b.c.d, NAT64 64:ff9b::/96, 6to4 2002::/16.
+%% The unspecified :: and loopback ::1 are deliberately NOT unwrapped -- they
+%% must be classified as v6 (::1 is v6 loopback, not v4 0.0.0.1).
+-spec embedded_v4(tuple()) -> {ok, {byte(), byte(), byte(), byte()}} | none.
+embedded_v4({0, 0, 0, 0, 0, 16#ffff, W1, W2}) ->
+    {ok, v4_from_words(W1, W2)};
+embedded_v4({0, 0, 0, 0, 0, 0, W1, W2}) when {W1, W2} =/= {0, 0}, {W1, W2} =/= {0, 1} ->
+    {ok, v4_from_words(W1, W2)};
+embedded_v4({16#64, 16#ff9b, 0, 0, 0, 0, W1, W2}) ->
+    {ok, v4_from_words(W1, W2)};
+embedded_v4({16#2002, W1, W2, _, _, _, _, _}) ->
+    {ok, v4_from_words(W1, W2)};
+embedded_v4(_) ->
+    none.
 
 %% A denied address is normally `deny'. The ONE exception is loopback when
 %% auth_validation_allow_private_networks is set (test-only, default false): that
