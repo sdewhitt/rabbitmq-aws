@@ -49,16 +49,16 @@
 %% to the eldap proplist; build_tls_opts/2 layers the shared verify-mode policy
 %% on top (returning the fail-loud {ok,_}|{error,tls_failed,_} contract);
 %% peer_allowed/1 is the post-connect SSRF re-check on a peername result;
-%% is_private_ip/1 + is_private_ip6/1 are the SSRF address classifiers (incl. the
-%% v6-embedded-v4 unwrapping); search_time_limit_seconds/0 is the post-bind
-%% search timeLimit. All are otherwise internal.
+%% is_denied_ip/1 is the SSRF address classifier for v4 and v6 (delegating to the
+%% shared aws_auth_validate_net:classify_ip/2 with LDAP's denylist);
+%% search_time_limit_seconds/0 is the post-bind search timeLimit. All are
+%% otherwise internal.
 -export([
     build_ssl_opts/1,
     build_tls_opts/2,
     is_allowed_server/1,
     peer_allowed/1,
-    is_private_ip/1,
-    is_private_ip6/1,
+    is_denied_ip/1,
     parse_port/2,
     search_time_limit_seconds/0
 ]).
@@ -569,92 +569,50 @@ check_server_ip(Server) ->
         {error, _} ->
             %% Also try IPv6
             case inet:getaddr(Server, inet6) of
-                {ok, IP6} -> not is_denied_ip6(IP6);
+                {ok, IP6} -> not is_denied_ip(IP6);
                 {error, _} -> false
             end
     end.
 
-%% A range-policy-denied address is normally blocked. The ONE relaxation is
-%% loopback when auth_validation_allow_private_networks is set (test-only,
-%% default false), so an integration suite can reach a local slapd on
-%% 127.0.0.1/::1. Mirrors aws_auth_validate_net:classify_denied/1 exactly, so the
-%% two backends grant the identical (loopback-only) test-mode relaxation.
+%% Classify a v4 or v6 address against LDAP's range policy via the shared
+%% aws_auth_validate_net:classify_ip/2 (which dispatches on tuple shape), passing
+%% LDAP's own denylist. Sharing the classifier (not just the CIDR-matching leaf)
+%% means the v6->embedded-v4 unwrap and the loopback-only test relaxation are
+%% defined in ONE place: LDAP cannot drift from http/oauth on how a v6-encoded v4
+%% address (e.g. ::ffff:127.0.0.1) is unwrapped before the relaxation applies.
+%% LDAP keeps its own broader list.
 is_denied_ip(IP) ->
-    is_private_ip(IP) andalso not relaxed_loopback(IP).
+    aws_auth_validate_net:classify_ip(IP, ldap_cidr_policy()) =:= deny.
 
-is_denied_ip6(IP) ->
-    is_private_ip6(IP) andalso not relaxed_loopback(IP).
-
-relaxed_loopback(IP) ->
-    is_loopback(IP) andalso allow_private_networks().
-
-is_loopback({127, _, _, _}) -> true;
-is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
-is_loopback(_) -> false.
-
-allow_private_networks() ->
-    application:get_env(aws, auth_validation_allow_private_networks, false) =:= true.
-
-%% LDAP's SSRF range policy, as CIDR lists. This is deliberately BROADER than the
-%% http/oauth infra-only denylist in aws_auth_validate_net: LDAP denies ALL
-%% RFC1918/CGNAT/reserved space, not just broker infra. Expressed as
-%% {Network, PrefixBits} tuples run through the shared
-%% aws_auth_validate_net:in_any_cidr/2 so both backends enumerate ranges in ONE
-%% vocabulary -- a future range fix (or a segment-math change) cannot silently
-%% apply to only one classifier. This mirrors #153, which unified the embedded-v4
-%% unwrapper for exactly this reason; here we unify the range-matching mechanism
-%% while each backend keeps its own distinct list.
+%% LDAP's SSRF range policy, as a classify_ip/2 CIDR policy. This is deliberately
+%% BROADER than the http/oauth infra-only denylist in aws_auth_validate_net: LDAP
+%% denies ALL RFC1918/CGNAT/reserved space, not just broker infra. Sharing the
+%% classifier while keeping a distinct list means a future range or segment-math
+%% fix cannot silently apply to only one backend. Mirrors #153, one layer up.
 %%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space; it can
 %%     route to provider/internal infrastructure, so it is denied too.
 %%   240.0.0.0/4 is reserved/Class E, including 255.255.255.255 limited broadcast.
--define(LDAP_DENIED_V4_CIDRS, [
-    {{127, 0, 0, 0}, 8},
-    {{10, 0, 0, 0}, 8},
-    {{172, 16, 0, 0}, 12},
-    {{192, 168, 0, 0}, 16},
-    {{169, 254, 0, 0}, 16},
-    {{100, 64, 0, 0}, 10},
-    {{0, 0, 0, 0}, 8},
-    {{240, 0, 0, 0}, 4}
-]).
-
-%% The IPv6 ranges corresponding to the v4 blocks above, so the filter cannot be
-%% bypassed with a v6 address.
-%%   ::1/128       loopback
-%%   ::/128        unspecified
-%%   fc00::/7      unique local addresses (ULA). Includes the IPv6 IMDS address
-%%                 fd00:ec2::254 -- the whole point of this block.
-%%   fe80::/10     link-local (spans fe80..febf, NOT just fe80)
-%% v4-carrying notations (IPv4-mapped, IPv4-compatible, NAT64 64:ff9b::/96, 6to4
-%% 2002::/16) are NOT listed here: they are unwrapped by the shared
-%% aws_auth_validate_net:embedded_v4/1 and re-checked against the v4 CIDRs, so
-%% e.g. ::ffff:169.254.169.254 or 2002:a9fe:a9fe:: still cannot reach IMDS.
--define(LDAP_DENIED_V6_CIDRS, [
-    {{0, 0, 0, 0, 0, 0, 0, 1}, 128},
-    {{0, 0, 0, 0, 0, 0, 0, 0}, 128},
-    {{16#fc00, 0, 0, 0, 0, 0, 0, 0}, 7},
-    {{16#fe80, 0, 0, 0, 0, 0, 0, 0}, 10}
-]).
-
-%% Deny the LDAP range policy's v4 blocks (see ?LDAP_DENIED_V4_CIDRS).
-is_private_ip({_, _, _, _} = V4) ->
-    aws_auth_validate_net:in_any_cidr(V4, ?LDAP_DENIED_V4_CIDRS).
-
-%% Deny the LDAP range policy's v6 blocks, then fall through to the shared
-%% embedded-v4 unwrapper so a v6-encoded v4 address is re-checked against the v4
-%% policy. Keeps LDAP's stricter range policy while sharing the unwrap mechanism.
-is_private_ip6({_, _, _, _, _, _, _, _} = V6) ->
-    case aws_auth_validate_net:in_any_cidr(V6, ?LDAP_DENIED_V6_CIDRS) of
-        true ->
-            true;
-        false ->
-            case aws_auth_validate_net:embedded_v4(V6) of
-                {ok, V4} -> is_private_ip(V4);
-                none -> false
-            end
-    end;
-is_private_ip6(_) ->
-    false.
+%%   fc00::/7 includes the IPv6 IMDS address fd00:ec2::254; fe80::/10 spans
+%%     fe80..febf. v4-carrying v6 notations are unwrapped by classify_ip/2.
+ldap_cidr_policy() ->
+    #{
+        denied_v4 => [
+            {{127, 0, 0, 0}, 8},
+            {{10, 0, 0, 0}, 8},
+            {{172, 16, 0, 0}, 12},
+            {{192, 168, 0, 0}, 16},
+            {{169, 254, 0, 0}, 16},
+            {{100, 64, 0, 0}, 10},
+            {{0, 0, 0, 0}, 8},
+            {{240, 0, 0, 0}, 4}
+        ],
+        denied_v6 => [
+            {{0, 0, 0, 0, 0, 0, 0, 1}, 128},
+            {{0, 0, 0, 0, 0, 0, 0, 0}, 128},
+            {{16#fc00, 0, 0, 0, 0, 0, 0, 0}, 7},
+            {{16#fe80, 0, 0, 0, 0, 0, 0, 0}, 10}
+        ]
+    }.
 
 %%--------------------------------------------------------------------
 %% Config conflict
@@ -769,13 +727,8 @@ check_peer_ip(Handle) ->
         _ -> blocked
     end.
 
-peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 4 ->
+peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 4; tuple_size(IP) =:= 8 ->
     case is_denied_ip(IP) of
-        true -> blocked;
-        false -> ok
-    end;
-peer_allowed({ok, {IP, _Port}}) when tuple_size(IP) =:= 8 ->
-    case is_denied_ip6(IP) of
         true -> blocked;
         false -> ok
     end;

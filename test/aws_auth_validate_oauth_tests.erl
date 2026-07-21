@@ -91,6 +91,22 @@ issuer_with_query_rejected_test() ->
     Body = #{<<"issuer">> => <<"https://idp.example.com?foo=bar">>},
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:parse_input(Body)).
 
+%% A jwks_uri with a #fragment is ACCEPTED: the URL is fetched verbatim (httpc
+%% drops the fragment on the wire), so rejecting it would refuse a config the
+%% broker accepts. Pins the oauth backend's fragment-permissive behavior against
+%% the shared parser, whose default is to reject fragments (as http requires).
+jwks_uri_with_fragment_allowed_test() ->
+    Body = #{<<"jwks_uri">> => <<"https://idp.example.com/jwks#kid">>},
+    ?assertMatch({ok, #{jwks_uri := #{}}}, aws_auth_validate_oauth:parse_input(Body)).
+
+%% An issuer with a #fragment is REJECTED, unlike jwks_uri: OIDC discovery appends
+%% the well-known path to the issuer, which would land AFTER the '#' (httpc then
+%% drops it), so the discovery URL would be mangled exactly as a pre-existing
+%% query string mangles it.
+issuer_with_fragment_rejected_test() ->
+    Body = #{<<"issuer">> => <<"https://idp.example.com#frag">>},
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:parse_input(Body)).
+
 %% A URL with an out-of-range port (0) is rejected.
 url_port_zero_rejected_test() ->
     Body = #{<<"jwks_uri">> => <<"https://idp.example.com:0/jwks">>},

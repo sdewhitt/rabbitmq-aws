@@ -431,38 +431,22 @@ parse_optional_url(V, QueryPolicy) when is_binary(V), byte_size(V) > 0 ->
 parse_optional_url(_, _QueryPolicy) ->
     {error, bad_url}.
 
-%% Parse + validate an https URL. Returns a normalized representation the probe
-%% and the SSRF guard can both use. QueryPolicy: reject_query bars a pre-existing
-%% query string (the caller appends a path, so a query would be ambiguous);
-%% allow_query permits it (the URL is fetched verbatim). userinfo and
-%% out-of-range ports are always rejected.
+%% Parse + validate an https URL via the shared aws_auth_validate_net:parse_url/2.
+%% QueryPolicy reflects this backend's two cases and governs a pre-existing query
+%% string AND a #fragment identically, because both fail for the same reason:
+%% reject_query (issuer) has the well-known path appended, so a query or fragment
+%% would be mangled (the path lands after the '#' and httpc drops it), whereas
+%% allow_query (jwks_uri) is fetched verbatim, so a query or an httpc-dropped
+%% fragment is harmless. userinfo and out-of-range ports are always rejected.
 parse_url(Bin, QueryPolicy) when is_binary(Bin) ->
-    Str = binary_to_list(Bin),
-    case uri_string:parse(Str) of
-        #{scheme := Scheme, host := Host} = Parsed when
-            Host =/= [], Scheme =:= "https"
-        ->
-            %% Reject:
-            %%   * out-of-range port (else httpc crashes at request time)
-            %%   * userinfo (embedded credentials)
-            %%   * a pre-existing query string, only under reject_query
-            Port = maps:get(port, Parsed, undefined),
-            HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
-            QueryRejected = HasQuery andalso QueryPolicy =:= reject_query,
-            case Port of
-                P when is_integer(P), (P < 1 orelse P > 65535) ->
-                    {error, bad_url};
-                _ when QueryRejected ->
-                    {error, bad_url};
-                _ ->
-                    case maps:is_key(userinfo, Parsed) of
-                        true -> {error, bad_url};
-                        false -> {ok, Parsed#{url_string => Str}}
-                    end
-            end;
-        _ ->
-            {error, bad_url}
-    end.
+    aws_auth_validate_net:parse_url(Bin, #{
+        allowed_schemes => ?ALLOWED_SCHEMES,
+        query => query_opt(QueryPolicy),
+        fragment => query_opt(QueryPolicy)
+    }).
+
+query_opt(allow_query) -> allow;
+query_opt(reject_query) -> reject.
 
 parse_resource_server_id(Body, Acc) ->
     case maps:get(<<"resource_server_id">>, Body, undefined) of
