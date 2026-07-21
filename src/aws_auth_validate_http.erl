@@ -365,44 +365,14 @@ collect_paths([Key | Rest], Body, Acc, Paths) ->
             {error, input_invalid, ?REASON_BAD_PATH_VALUE}
     end.
 
-%% Parse + minimally validate an http(s) URL. Returns a normalized
-%% representation the probe and the SSRF guard can both use. Kept deliberately
-%% small here; richer parsing belongs with the guard work.
+%% Parse + minimally validate an http(s) URL via the shared
+%% aws_auth_validate_net:parse_url/2. The broker's auth_http.*_path config is
+%% query- and fragment-less and the probe appends its own ?username= params, so
+%% a pre-existing query (double-? mangling) or #fragment (probe's query dropped
+%% after the fragment) is rejected -- both are the parser's default. userinfo and
+%% out-of-range ports are always rejected.
 parse_url(Bin) when is_binary(Bin) ->
-    Str = binary_to_list(Bin),
-    case uri_string:parse(Str) of
-        #{scheme := Scheme, host := Host} = Parsed when
-            Host =/= [], (Scheme =:= "http" orelse Scheme =:= "https")
-        ->
-            %% Reject, as off-shape *_path input:
-            %%  * an out-of-range port (else httpc crashes at request time),
-            %%  * userinfo (user:pass@host) -- embedded credentials httpc would
-            %%    turn into an Authorization header,
-            %%  * a pre-existing query string OR a #fragment -- the broker's
-            %%    auth_http.*_path config is query- and fragment-less and the
-            %%    probe appends its own ?username= params. A path that already
-            %%    carried a query would be mangled into a double-? URL; a path
-            %%    with a fragment would have the probe's ?query appended AFTER
-            %%    the fragment, so httpc drops the query (fragments are not sent)
-            %%    and the probe misfires. Either way it would spuriously fail.
-            Port = maps:get(port, Parsed, undefined),
-            HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
-            HasFragment =
-                maps:is_key(fragment, Parsed) andalso maps:get(fragment, Parsed) =/= [],
-            case Port of
-                P when is_integer(P), (P < 1 orelse P > 65535) ->
-                    {error, bad_url};
-                _ when HasQuery orelse HasFragment ->
-                    {error, bad_url};
-                _ ->
-                    case maps:is_key(userinfo, Parsed) of
-                        true -> {error, bad_url};
-                        false -> {ok, Parsed#{url_string => Str}}
-                    end
-            end;
-        _ ->
-            {error, bad_url}
-    end.
+    aws_auth_validate_net:parse_url(Bin, #{allowed_schemes => ?ALLOWED_SCHEMES}).
 
 parse_http_method(Body, Acc) ->
     case maps:get(<<"http_method">>, Body, undefined) of

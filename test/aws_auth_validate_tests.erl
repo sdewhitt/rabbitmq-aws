@@ -334,6 +334,84 @@ server_rejects_unresolvable_test() ->
         false, aws_auth_validate_ldap:is_allowed_server("this.host.does.not.exist.invalid")
     ).
 
+%% Test-only auth_validation_allow_private_networks relaxes ONLY loopback, not the
+%% whole denylist, so the LDAP backend does not get a broader test-mode bypass than
+%% aws_auth_validate_net grants http/oauth. Loopback (127/8, ::1) becomes reachable;
+%% IMDS/link-local/RFC1918/CGNAT stay denied even with the flag on.
+server_flag_relaxes_loopback_only_test_() ->
+    {setup,
+        fun() ->
+            application:set_env(aws, auth_validation_allow_private_networks, true)
+        end,
+        fun(_) ->
+            application:unset_env(aws, auth_validation_allow_private_networks)
+        end,
+        [
+            %% Loopback is now reachable (the intended local-slapd relaxation).
+            ?_assertEqual(true, aws_auth_validate_ldap:is_allowed_server("127.0.0.1")),
+            ?_assertEqual(true, aws_auth_validate_ldap:is_allowed_server("::1")),
+            %% IMDS is still denied even under the flag -- the whole point.
+            ?_assertEqual(
+                false, aws_auth_validate_ldap:is_allowed_server("169.254.169.254")
+            ),
+            %% RFC1918 and CGNAT stay denied too.
+            ?_assertEqual(false, aws_auth_validate_ldap:is_allowed_server("10.0.0.5")),
+            ?_assertEqual(false, aws_auth_validate_ldap:is_allowed_server("100.64.0.1")),
+            %% The post-connect peer check honours the same loopback-only relaxation.
+            ?_assertEqual(
+                ok, aws_auth_validate_ldap:peer_allowed({ok, {{127, 0, 0, 1}, 389}})
+            ),
+            ?_assertEqual(
+                blocked,
+                aws_auth_validate_ldap:peer_allowed({ok, {{169, 254, 169, 254}, 80}})
+            ),
+            %% A v4-mapped loopback ::ffff:127.0.0.1 is unwrapped BEFORE the
+            %% loopback relaxation, so it relaxes under the flag exactly as the
+            %% bare v4 loopback does. Sharing classify_ip/2 is what guarantees
+            %% this; the prior hand-rolled path tested is_loopback on the raw v6
+            %% tuple and wrongly kept it denied.
+            ?_assertEqual(
+                false,
+                aws_auth_validate_ldap:is_denied_ip({0, 0, 0, 0, 0, 16#ffff, 16#7f00, 1})
+            ),
+            %% A v4-mapped IMDS ::ffff:169.254.169.254 stays denied even under
+            %% the flag -- relaxation is loopback-only, not any embedded v4.
+            ?_assertEqual(
+                true,
+                aws_auth_validate_ldap:is_denied_ip({0, 0, 0, 0, 0, 16#ffff, 16#a9fe, 16#a9fe})
+            )
+        ]}.
+
+%%--------------------------------------------------------------------
+%% Port default (broker parity)
+%%--------------------------------------------------------------------
+
+%% An omitted port defaults to the broker's default (389) rather than being
+%% rejected input_invalid, so a config the live broker would accept validates.
+parse_port_defaults_to_389_when_absent_test() ->
+    ?assertEqual({ok, #{port => 389}}, aws_auth_validate_ldap:parse_port(#{}, #{})).
+
+%% A supplied in-range port is honoured unchanged.
+parse_port_honours_supplied_test() ->
+    ?assertEqual(
+        {ok, #{port => 636}},
+        aws_auth_validate_ldap:parse_port(#{<<"port">> => 636}, #{})
+    ).
+
+%% An out-of-range or non-integer port is still rejected.
+parse_port_rejects_out_of_range_test() ->
+    ?assertMatch(
+        {error, input_invalid, _}, aws_auth_validate_ldap:parse_port(#{<<"port">> => 0}, #{})
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_ldap:parse_port(#{<<"port">> => 70000}, #{})
+    ),
+    ?assertMatch(
+        {error, input_invalid, _},
+        aws_auth_validate_ldap:parse_port(#{<<"port">> => <<"636">>}, #{})
+    ).
+
 %%--------------------------------------------------------------------
 %% Post-connect peer re-check (DNS-rebinding TOCTOU defence)
 %%--------------------------------------------------------------------
@@ -613,18 +691,18 @@ ldap_search_time_limit_seconds_floor_test() ->
     end.
 
 %%--------------------------------------------------------------------
-%% is_private_ip6/1 6to4 unwrapping (issue #154 coverage). is_allowed_server/1
-%% already covers the resolve path; these pin the classifier directly so a
-%% regression in the shared embedded_v4 unwrap is caught without DNS.
+%% is_denied_ip/1 6to4 unwrapping for v6 input (issue #154 coverage).
+%% is_allowed_server/1 already covers the resolve path; these pin the classifier
+%% directly so a regression in the shared embedded_v4 unwrap is caught without DNS.
 %%--------------------------------------------------------------------
 
-ldap_is_private_ip6_6to4_imds_blocked_test() ->
-    %% 2002:a9fe:a9fe:: wraps 169.254.169.254 (IMDS) -> private.
-    ?assert(aws_auth_validate_ldap:is_private_ip6({16#2002, 16#a9fe, 16#a9fe, 0, 0, 0, 0, 0})).
+ldap_is_denied_ip_6to4_imds_blocked_test() ->
+    %% 2002:a9fe:a9fe:: wraps 169.254.169.254 (IMDS) -> denied.
+    ?assert(aws_auth_validate_ldap:is_denied_ip({16#2002, 16#a9fe, 16#a9fe, 0, 0, 0, 0, 0})).
 
-ldap_is_private_ip6_6to4_public_allowed_test() ->
-    %% 2002:0808:0808:: wraps 8.8.8.8 (public) -> not private.
-    ?assertNot(aws_auth_validate_ldap:is_private_ip6({16#2002, 16#0808, 16#0808, 0, 0, 0, 0, 0})).
+ldap_is_denied_ip_6to4_public_allowed_test() ->
+    %% 2002:0808:0808:: wraps 8.8.8.8 (public) -> not denied.
+    ?assertNot(aws_auth_validate_ldap:is_denied_ip({16#2002, 16#0808, 16#0808, 0, 0, 0, 0, 0})).
 
 ldap_config_conflict_test() ->
     Body = base_body(#{<<"use_ssl">> => true, <<"use_starttls">> => true}),

@@ -183,9 +183,9 @@ hostname_check_mode_wildcard_test() ->
     ).
 
 %%--------------------------------------------------------------------
-%% aws_auth_validate_net: embedded_v4/1 shared unwrapper. The LDAP SSRF
-%% classifier (is_private_ip6/1) shares this helper, so its decoding must cover
-%% every v4-carrying v6 notation and leave native v6 (::, ::1) unwrapped.
+%% aws_auth_validate_net: embedded_v4/1 shared unwrapper. classify_ip/2 (shared
+%% by all three backends) uses this helper, so its decoding must cover every
+%% v4-carrying v6 notation and leave native v6 (::, ::1) unwrapped.
 %%--------------------------------------------------------------------
 
 embedded_v4_ipv4_mapped_test() ->
