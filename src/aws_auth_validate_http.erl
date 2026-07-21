@@ -129,7 +129,8 @@
     <<"verify">>,
     <<"depth">>,
     <<"versions">>,
-    <<"sni">>
+    <<"sni">>,
+    <<"hostname_verification">>
 ]).
 %% Fixed, hardcoded reason strings (R4): no URL, host, or raw error echoed.
 -define(REASON_BAD_PATHS, <<"at least user_path must be a non-empty URL string">>).
@@ -140,12 +141,15 @@
 -define(REASON_BAD_SSL_OPTIONS, <<"ssl_options must be an object">>).
 -define(REASON_UNKNOWN_SSL_OPTION, <<
     "ssl_options contains an unknown key; allowed keys are cacertfile_arn, "
-    "certfile_arn, keyfile_arn, verify, depth, versions, sni"
+    "certfile_arn, keyfile_arn, verify, depth, versions, sni, hostname_verification"
 >>).
 -define(REASON_BAD_SSL_VERIFY, <<"ssl_options.verify must be verify_peer or verify_none">>).
 -define(REASON_BAD_SSL_DEPTH, <<"ssl_options.depth must be a non-negative integer">>).
 -define(REASON_BAD_SSL_VERSIONS, <<"ssl_options.versions must be a list of known TLS versions">>).
 -define(REASON_BAD_SSL_SNI, <<"ssl_options.sni must be a string">>).
+-define(REASON_BAD_SSL_HOSTNAME_VERIFICATION,
+    <<"ssl_options.hostname_verification must be wildcard or none">>
+).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
 -define(REASON_BAD_SSL_CERT_ARN, <<"ssl_options.certfile_arn must be a non-empty string">>).
 -define(REASON_BAD_SSL_KEY_ARN, <<"ssl_options.keyfile_arn must be a non-empty string">>).
@@ -223,6 +227,7 @@ ssl_opts() ->
             bad_ssl_depth => ?REASON_BAD_SSL_DEPTH,
             bad_ssl_versions => ?REASON_BAD_SSL_VERSIONS,
             bad_ssl_sni => ?REASON_BAD_SSL_SNI,
+            bad_ssl_hostname_verification => ?REASON_BAD_SSL_HOSTNAME_VERIFICATION,
             bad_ssl_cacert_arn => ?REASON_BAD_SSL_CACERT_ARN,
             bad_ssl_cert_arn => ?REASON_BAD_SSL_CERT_ARN,
             bad_ssl_key_arn => ?REASON_BAD_SSL_KEY_ARN
@@ -769,7 +774,12 @@ build_client_ssl_opts(#{ssl_options := Map} = Params) ->
                     %% Whether the caller set verify explicitly governs the
                     %% no-trust-anchor policy (fail vs silent default).
                     VerifyExplicit = maps:is_key(<<"verify">>, Map),
-                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit)
+                    %% Mirror rabbit_auth_backend_http: the RFC 6125 https match
+                    %% fun is applied ONLY when ssl_hostname_verification =
+                    %% wildcard; unset is strict OTP matching. Defaulting to
+                    %% wildcard here would pass a cert the live broker rejects.
+                    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
+                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
             end
     end.
 

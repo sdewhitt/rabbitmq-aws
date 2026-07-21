@@ -1099,17 +1099,9 @@ build_tls_opts(false, _SslOpts) ->
 build_tls_opts(true, SslOpts) ->
     Translated = build_ssl_opts(SslOpts),
     VerifyExplicit = maps:is_key(<<"verify">>, SslOpts),
-    HostnameCheck = hostname_check_mode(SslOpts),
+    %% Shared with http/oauth: unset/`none' = strict, `wildcard' opts in.
+    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(SslOpts),
     aws_auth_validate_ssl:apply_verify_default(Translated, VerifyExplicit, HostnameCheck).
-
-%% Map the modeled hostname_verification input to the shared helper's mode.
-%% Unset (or the broker's `none') means strict OTP matching -- the broker
-%% default; `wildcard' opts into the RFC 6125 https match fun.
-hostname_check_mode(SslOpts) ->
-    case maps:get(<<"hostname_verification">>, SslOpts, undefined) of
-        <<"wildcard">> -> wildcard;
-        _ -> strict
-    end.
 
 %%--------------------------------------------------------------------
 

@@ -160,6 +160,29 @@ apply_verify_default_3_strict_explicit_no_anchor_still_fails_test_() ->
         end}.
 
 %%--------------------------------------------------------------------
+%% aws_auth_validate_ssl: hostname_check_mode/1. Shared by http/oauth/ldap to
+%% resolve the modeled `hostname_verification' ssl_options input into the /3
+%% mode. Unset (or the broker's `none') = strict; only `wildcard' opts into the
+%% RFC 6125 https match fun -- mirroring the broker's strict-by-default gating
+%% across all three backends.
+%%--------------------------------------------------------------------
+
+hostname_check_mode_unset_is_strict_test() ->
+    ?assertEqual(strict, aws_auth_validate_ssl:hostname_check_mode(#{})).
+
+hostname_check_mode_none_is_strict_test() ->
+    ?assertEqual(
+        strict,
+        aws_auth_validate_ssl:hostname_check_mode(#{<<"hostname_verification">> => <<"none">>})
+    ).
+
+hostname_check_mode_wildcard_test() ->
+    ?assertEqual(
+        wildcard,
+        aws_auth_validate_ssl:hostname_check_mode(#{<<"hostname_verification">> => <<"wildcard">>})
+    ).
+
+%%--------------------------------------------------------------------
 %% aws_auth_validate_net: embedded_v4/1 shared unwrapper. The LDAP SSRF
 %% classifier (is_private_ip6/1) shares this helper, so its decoding must cover
 %% every v4-carrying v6 notation and leave native v6 (::, ::1) unwrapped.

@@ -53,6 +53,7 @@ var AWS_AUTH_VALIDATE_METHODS = ['ldap', 'http', 'oauth', 'tls'];
 var AWS_AUTH_VALIDATE_CATEGORY = {
     success:            {cls: 'status-green',  text: 'Validation succeeded (204).'},
     input_invalid:      {cls: 'status-red',    text: 'Input invalid: the request failed pure validation before any connection.'},
+    body_too_large:     {cls: 'status-red',    text: 'Request body too large: reduce the config size and retry.'},
     connection_failed:  {cls: 'status-red',    text: 'Connection failed: the target could not be reached.'},
     tls_failed:         {cls: 'status-red',    text: 'TLS failed: handshake or certificate verification did not succeed.'},
     query_invalid:      {cls: 'status-red',    text: 'Query invalid: an authorization query could not be parsed.'},
@@ -338,11 +339,18 @@ var AWS_AUTH_VALIDATE_CONF = {
             'auth_http.resource_path':                          {path: ['resource_path'], type: 'string', ex: 'https://auth.example.com/auth/resource'},
             'auth_http.topic_path':                             {path: ['topic_path'], type: 'string', ex: 'https://auth.example.com/auth/topic'},
             'auth_http.http_method':                            {path: ['http_method'], type: 'string', ex: 'post'},
-            // The four ssl_options entries below are identical in shape to the
-            // oauth ssl_options entries; keep the two hand-synced on any change
-            // (only the auth_http/auth_oauth2 conf-key prefix differs).
+            // The ssl_options entries below match the oauth ssl_options entries
+            // key-for-key; keep the two hand-synced on any change. Only the
+            // conf-key PREFIX differs: http uses auth_http.ssl_options.*, while
+            // oauth uses auth_oauth2.ssl_options.* EXCEPT hostname_verification,
+            // which the broker spells auth_oauth2.https.hostname_verification.
             'auth_http.ssl_options.verify':                     {path: ['ssl_options', 'verify'], type: 'string', ex: 'verify_peer'},
             'auth_http.ssl_options.sni':                        {path: ['ssl_options', 'sni'], type: 'string', ex: 'auth.example.com'},
+            // Mirrors the broker's auth_http.ssl_options.hostname_verification
+            // (wildcard|none); unset means strict OTP matching. Modeled so the
+            // validator matches the broker's hostname check rather than always
+            // using the lenient wildcard fun.
+            'auth_http.ssl_options.hostname_verification':      {path: ['ssl_options', 'hostname_verification'], type: 'string', ex: 'wildcard'},
             'aws.arns.auth_http.ssl_options.cacertfile':        {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'},
             'aws.arns.auth_http.ssl_options.certfile':          {path: ['ssl_options', 'certfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/client-cert.pem'},
             'aws.arns.auth_http.ssl_options.keyfile':           {path: ['ssl_options', 'keyfile_arn'], type: 'string', ex: 'arn:aws:secretsmanager:us-west-2:111122223333:secret:RabbitMqClientKey'}
@@ -360,6 +368,10 @@ var AWS_AUTH_VALIDATE_CONF = {
             'auth_oauth2.scope_pattern_syntax':                 {path: ['scope_pattern_syntax'], type: 'string', ex: 'wildcard'},
             'auth_oauth2.ssl_options.verify':                   {path: ['ssl_options', 'verify'], type: 'string', ex: 'verify_peer'},
             'auth_oauth2.ssl_options.sni':                      {path: ['ssl_options', 'sni'], type: 'string', ex: 'idp.example.com'},
+            // The broker spells this one auth_oauth2.https.hostname_verification
+            // (NOT under ssl_options), but it maps to the same request field
+            // (wildcard|none); unset means strict OTP matching.
+            'auth_oauth2.https.hostname_verification':          {path: ['ssl_options', 'hostname_verification'], type: 'string', ex: 'wildcard'},
             'aws.arns.auth_oauth2.ssl_options.cacertfile':      {path: ['ssl_options', 'cacertfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/ca-cert.pem'},
             'aws.arns.auth_oauth2.ssl_options.certfile':        {path: ['ssl_options', 'certfile_arn'], type: 'string', ex: 'arn:aws:s3:::my-bucket/client-cert.pem'},
             'aws.arns.auth_oauth2.ssl_options.keyfile':         {path: ['ssl_options', 'keyfile_arn'], type: 'string', ex: 'arn:aws:secretsmanager:us-west-2:111122223333:secret:RabbitMqClientKey'}

@@ -1177,6 +1177,48 @@ reason_contains(_Other, _Substr) ->
     false.
 
 %%--------------------------------------------------------------------
+%% hostname_verification (broker parity): the oauth backend must default to
+%% STRICT matching and only add the RFC 6125 https match fun when
+%% ssl_options.hostname_verification = wildcard -- mirroring oauth2_client, which
+%% reads hostname_verification (default none = strict). build_client_ssl_opts/1
+%% is called directly (no network); an OS trust anchor is mocked.
+%%--------------------------------------------------------------------
+
+oauth_hostname_verification_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(public_key, [unstick, passthrough]),
+            meck:expect(public_key, cacerts_get, fun() -> [<<"der">>] end),
+            ok
+        end,
+        fun(_) -> meck:unload(public_key) end, fun(_) ->
+            Build = fun(Ssl) ->
+                aws_auth_validate_oauth:build_client_ssl_opts(#{
+                    ssl_options => Ssl, aws_state => none
+                })
+            end,
+            {ok, Unset} = Build(#{<<"verify">> => <<"verify_peer">>}),
+            {ok, Wild} = Build(#{
+                <<"verify">> => <<"verify_peer">>,
+                <<"hostname_verification">> => <<"wildcard">>
+            }),
+            {ok, NoneMode} = Build(#{
+                <<"verify">> => <<"verify_peer">>,
+                <<"hostname_verification">> => <<"none">>
+            }),
+            [
+                ?_assertNot(lists:keymember(customize_hostname_check, 1, Unset)),
+                ?_assertNot(lists:keymember(customize_hostname_check, 1, NoneMode)),
+                ?_assert(lists:keymember(customize_hostname_check, 1, Wild))
+            ]
+        end}.
+
+%% An unknown hostname_verification value is rejected in the pure phase.
+oauth_hostname_verification_bad_value_test() ->
+    Body = (jwks_body())#{<<"ssl_options">> => #{<<"hostname_verification">> => <<"bogus">>}},
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:parse_input(Body)).
+
+%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
