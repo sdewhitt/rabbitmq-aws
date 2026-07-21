@@ -47,6 +47,7 @@
     translate_ssl_opts/2,
     apply_verify_default/2,
     apply_verify_default/3,
+    hostname_check_mode/1,
     ensure_trust_anchor/1,
     trust_source/1,
     os_cacerts/0,
@@ -66,6 +67,10 @@
 
 %% Accepted values for `verify' and `versions', shared by all backends.
 -define(SSL_VERIFY_VALUES, [<<"verify_peer">>, <<"verify_none">>]).
+%% Accepted values for `hostname_verification'. Mirrors the broker's
+%% ssl_hostname_verification / oauth hostname_verification enum; unset means
+%% strict OTP matching (the broker default for all three backends).
+-define(SSL_HOSTNAME_VERIFICATION_VALUES, [<<"wildcard">>, <<"none">>]).
 -define(SSL_VERSION_VALUES, [
     <<"tlsv1.3">>,
     <<"tlsv1.2">>,
@@ -244,6 +249,11 @@ valid_ssl_value(<<"fail_if_no_peer_cert">>, V, _Opts) when is_boolean(V) ->
     ok;
 valid_ssl_value(<<"fail_if_no_peer_cert">>, _V, Opts) ->
     {error, input_invalid, reason(bad_ssl_fail_if_no_peer_cert, Opts)};
+valid_ssl_value(<<"hostname_verification">>, V, Opts) ->
+    case lists:member(V, ?SSL_HOSTNAME_VERIFICATION_VALUES) of
+        true -> ok;
+        false -> {error, input_invalid, reason(bad_ssl_hostname_verification, Opts)}
+    end;
 valid_ssl_value(<<"cacertfile_arn">>, V, Opts) ->
     nonempty_or(V, bad_ssl_cacert_arn, Opts);
 valid_ssl_value(<<"certfile_arn">>, V, Opts) ->
@@ -378,12 +388,20 @@ translate_ssl_opts(Map, SniKey) ->
 %% verify falls back to verify_none; an explicit verify_none is untouched; and
 %% when verify is absent we default to verify_peer only if an anchor exists.
 %%
-%% The /2 form applies the RFC 6125 https hostname-match fun on every verify_peer
-%% path (see ensure_hostname_check/1). This is correct for the http/oauth
-%% backends: their IdP endpoints commonly present single-label wildcard certs
-%% (e.g. Cognito's `foo.auth.<region>.amazoncognito.com' against
-%% `*.auth.<region>.amazoncognito.com') that every mainstream HTTPS client
-%% accepts, so omitting the fun would report tls_failed for valid endpoints.
+%% The /2 form is a thin wrapper that defaults the hostname-check mode to
+%% `wildcard'. It is retained only for callers/tests that want the lenient RFC
+%% 6125 https match fun explicitly; production backends all call the /3 form with
+%% a mode computed from the modeled `hostname_verification' input, because the
+%% broker defaults to STRICT matching for ALL THREE backends and only opts into
+%% the wildcard fun when configured:
+%%   * http:  rabbit_auth_backend_http applies it only on ssl_hostname_verification
+%%            = wildcard; unset is strict.
+%%   * oauth: oauth2_client reads hostname_verification (default none = strict).
+%%   * ldap:  rabbit_auth_backend_ldap applies it only on
+%%            auth_ldap.ssl_options.hostname_verification = wildcard.
+%% Defaulting to wildcard therefore diverges too-lenient: a wildcard/mismatched
+%% server cert the live broker rejects at handshake would pass the validator
+%% green. See maybe_hostname_check/2 and the /3 form below.
 apply_verify_default(Opts, VerifyExplicit) ->
     apply_verify_default(Opts, VerifyExplicit, wildcard).
 
@@ -429,6 +447,17 @@ maybe_hostname_check(Opts, wildcard) ->
     ensure_hostname_check(Opts);
 maybe_hostname_check(Opts, strict) ->
     Opts.
+
+%% Map the modeled `hostname_verification' ssl_options input to the /3 hostname
+%% -check mode. Unset (or the broker's `none') means strict OTP matching -- the
+%% broker default for all three backends; `wildcard' opts into the RFC 6125 https
+%% match fun. Shared so http/oauth/ldap resolve the mode identically.
+-spec hostname_check_mode(map()) -> wildcard | strict.
+hostname_check_mode(SslOpts) when is_map(SslOpts) ->
+    case maps:get(<<"hostname_verification">>, SslOpts, undefined) of
+        <<"wildcard">> -> wildcard;
+        _ -> strict
+    end.
 
 %% Add the https-scheme hostname-match fun so wildcard certs verify the way a
 %% browser/curl/openssl would (RFC 6125). Applied only on verify_peer paths, and
