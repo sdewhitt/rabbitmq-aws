@@ -3,12 +3,13 @@
 %% vim:ft=erlang:
 %% -*- mode: erlang; -*-
 
-%% Shared SSRF / DNS-rebinding network guard for the http and oauth validation
-%% backends. The ldap backend shares the address classifier (classify_ip/2) and
-%% URL parser (parse_url/2) here, but passes its OWN stricter denylist -- it
-%% denies ALL private/RFC1918/CGNAT ranges, not just broker infra -- and adds a
-%% post-connect peer re-check for eldap's re-resolve. See aws_auth_validate_ldap's
-%% is_denied_ip/1.
+%% Shared SSRF / DNS-rebinding network guard for the http, oauth, and ldap
+%% validation backends. The ldap backend shares the address classifier
+%% (classify_ip/2), URL parser (parse_url/2), and resolve_all/1 (DNS
+%% resolution to ALL A+AAAA addresses) here, but passes its OWN stricter
+%% denylist -- it denies ALL private/RFC1918/CGNAT ranges, not just broker
+%% infra -- and adds a post-connect peer re-check for eldap's re-resolve. See
+%% aws_auth_validate_ldap's is_denied_ip/1.
 %%
 %% The validator issues outbound requests to customer-supplied URLs from the
 %% broker's network position -- a textbook SSRF / confused-deputy surface.
@@ -40,6 +41,7 @@
     classify_address/2,
     classify_ip/2,
     embedded_v4/1,
+    resolve_all/1,
     resolve_and_pin/2,
     pin_url/2,
     parse_url/2,
@@ -282,6 +284,9 @@ resolve_hostname_and_pin(Url, Host, Policy) ->
     end.
 
 %% Resolve a hostname to all IPv4 + IPv6 addresses (best-effort per family).
+%% Used by resolve_and_pin/2 (http/oauth) and by the LDAP backend's pre-connect
+%% SSRF check (check_server_ip/1) -- both must resolve ALL addresses so a single
+%% benign A record cannot mask a denied one behind the same hostname.
 resolve_all(Host) ->
     V4 =
         case inet:getaddrs(Host, inet) of

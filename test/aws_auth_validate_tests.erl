@@ -383,6 +383,75 @@ server_flag_relaxes_loopback_only_test_() ->
         ]}.
 
 %%--------------------------------------------------------------------
+%% all_addresses_allowed/1 -- pure resolved-address SSRF check
+%%--------------------------------------------------------------------
+%% Tests the pure function that takes already-resolved IP tuples and returns
+%% whether all are allowed. No inet mocking needed -- operates on tuples only.
+
+%% An empty list (resolution failure) must fail closed.
+all_addresses_allowed_empty_denies_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:all_addresses_allowed([])).
+
+%% A list containing only allowed (public) addresses passes.
+all_addresses_allowed_all_public_test() ->
+    ?assertEqual(
+        true,
+        aws_auth_validate_ldap:all_addresses_allowed([{8, 8, 8, 8}, {1, 1, 1, 1}])
+    ).
+
+%% A mixed list (one allowed + one denied) must deny (any-denied = deny).
+all_addresses_allowed_mixed_denies_test() ->
+    ?assertEqual(
+        false,
+        aws_auth_validate_ldap:all_addresses_allowed([{8, 8, 8, 8}, {10, 0, 0, 1}])
+    ).
+
+%% A single denied v4 literal must deny.
+all_addresses_allowed_single_denied_v4_test() ->
+    ?assertEqual(false, aws_auth_validate_ldap:all_addresses_allowed([{127, 0, 0, 1}])).
+
+%% A single allowed v4 literal must allow.
+all_addresses_allowed_single_allowed_v4_test() ->
+    ?assertEqual(true, aws_auth_validate_ldap:all_addresses_allowed([{8, 8, 4, 4}])).
+
+%% A v6-embedded-v4 denied address (::ffff:127.0.0.1) must deny -- the shared
+%% classify_ip/2 unwraps v4-mapped v6 before checking.
+all_addresses_allowed_v6_embedded_v4_denies_test() ->
+    ?assertEqual(
+        false,
+        aws_auth_validate_ldap:all_addresses_allowed([{0, 0, 0, 0, 0, 16#ffff, 16#7f00, 1}])
+    ).
+
+%% A public v6 address alone is allowed.
+all_addresses_allowed_single_public_v6_test() ->
+    ?assertEqual(
+        true,
+        aws_auth_validate_ldap:all_addresses_allowed([{16#2606, 16#4700, 0, 0, 0, 0, 0, 1}])
+    ).
+
+%% The loopback-only relaxation flag applies: under the flag, a list of only
+%% loopback addresses is allowed.
+all_addresses_allowed_loopback_flag_test_() ->
+    {setup,
+        fun() ->
+            application:set_env(aws, auth_validation_allow_private_networks, true)
+        end,
+        fun(_) ->
+            application:unset_env(aws, auth_validation_allow_private_networks)
+        end,
+        [
+            ?_assertEqual(
+                true,
+                aws_auth_validate_ldap:all_addresses_allowed([{127, 0, 0, 1}])
+            ),
+            %% IMDS stays denied even with the flag.
+            ?_assertEqual(
+                false,
+                aws_auth_validate_ldap:all_addresses_allowed([{169, 254, 169, 254}])
+            )
+        ]}.
+
+%%--------------------------------------------------------------------
 %% Port default (broker parity)
 %%--------------------------------------------------------------------
 

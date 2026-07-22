@@ -51,6 +51,7 @@
 %% peer_allowed/1 is the post-connect SSRF re-check on a peername result;
 %% is_denied_ip/1 is the SSRF address classifier for v4 and v6 (delegating to the
 %% shared aws_auth_validate_net:classify_ip/2 with LDAP's denylist);
+%% all_addresses_allowed/1 is the pure resolved-address SSRF check (no inet);
 %% search_time_limit_seconds/0 is the post-bind search timeLimit. All are
 %% otherwise internal.
 -export([
@@ -59,6 +60,7 @@
     is_allowed_server/1,
     peer_allowed/1,
     is_denied_ip/1,
+    all_addresses_allowed/1,
     parse_port/2,
     search_time_limit_seconds/0
 ]).
@@ -538,19 +540,25 @@ parse_query_map([{Name, Value} | Rest], Acc, Parsed) ->
 
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
-%% Server address validation: resolve the hostname and reject addresses in
-%% private, loopback, link-local, or metadata IP ranges. This prevents SSRF
-%% via the validation endpoint while still allowing legitimate LDAP servers.
+%% Server address validation: resolve the hostname to ALL addresses and reject
+%% if ANY resolves to a private, loopback, link-local, or metadata IP range.
+%% This prevents SSRF via the validation endpoint while still allowing
+%% legitimate LDAP servers.
 %%
 %% This is the FIRST of two SSRF checks (defence in depth). It resolves Server
-%% and rejects a blocked IP before any connection is attempted, so a malformed
-%% or obviously-internal target never opens a socket. On its own it is subject
-%% to a DNS-rebinding TOCTOU -- eldap:open/2 re-resolves the hostname, so the
-%% peer it connects to could differ from the IP vetted here. That window is
-%% closed by the SECOND check, verify_connected_peer/1, which re-validates the
-%% actual connected socket's peer (see do_ldap_bind/1). We keep this pre-connect
-%% check too: it rejects bad input cheaply (no socket, clearer input_invalid
-%% category) and avoids dialing out for the common case.
+%% to ALL A and AAAA records (via aws_auth_validate_net:resolve_all/1 -- the
+%% same resolve-all semantics used by the http/oauth backends) and rejects the
+%% whole server if ANY resolved address is blocked. A single benign A record
+%% can no longer mask a denied address behind the same hostname. Literal IP
+%% strings are classified directly without DNS.
+%%
+%% On its own this pre-connect check is subject to a DNS-rebinding TOCTOU --
+%% eldap:open/2 re-resolves the hostname, so the peer it connects to could
+%% differ from the IPs vetted here. That window is closed by the SECOND check,
+%% verify_connected_peer/1, which re-validates the actual connected socket's
+%% peer (see do_ldap_bind/1). We keep this pre-connect check too: it rejects
+%% bad input cheaply (no socket, clearer input_invalid category) and avoids
+%% dialing out for the common case.
 %%
 %% The test-only auth_validation_allow_private_networks flag relaxes ONLY
 %% loopback (see is_denied_ip/1), not the whole denylist -- it must not grant the
@@ -563,16 +571,28 @@ is_allowed_server(Server) ->
     check_server_ip(Server).
 
 check_server_ip(Server) ->
-    case inet:getaddr(Server, inet) of
+    case inet:parse_address(Server) of
         {ok, IP} ->
+            %% Server is a literal IP string -- classify directly, no DNS.
             not is_denied_ip(IP);
         {error, _} ->
-            %% Also try IPv6
-            case inet:getaddr(Server, inet6) of
-                {ok, IP6} -> not is_denied_ip(IP6);
-                {error, _} -> false
-            end
+            %% Server is a hostname -- resolve ALL A+AAAA records and deny if
+            %% ANY resolved address is in a blocked range (same resolve-all
+            %% semantics as aws_auth_validate_net:resolve_and_pin/2).
+            Addrs = aws_auth_validate_net:resolve_all(Server),
+            all_addresses_allowed(Addrs)
     end.
+
+%% Pure helper: given a list of already-resolved IP tuples, return true only if
+%% ALL are allowed (none denied) AND the list is non-empty. An empty list (DNS
+%% resolution failure) fails closed (returns false). This function does not call
+%% inet -- it operates on already-resolved addresses and is testable without
+%% mocking the DNS layer.
+-spec all_addresses_allowed([tuple()]) -> boolean().
+all_addresses_allowed([]) ->
+    false;
+all_addresses_allowed(Addrs) when is_list(Addrs) ->
+    not lists:any(fun is_denied_ip/1, Addrs).
 
 %% Classify a v4 or v6 address against LDAP's range policy via the shared
 %% aws_auth_validate_net:classify_ip/2 (which dispatches on tuple shape), passing
