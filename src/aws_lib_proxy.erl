@@ -24,6 +24,8 @@
 %%   - fd00:ec2::254 (IPv6 IMDS)
 -module(aws_lib_proxy).
 
+-include_lib("kernel/include/logger.hrl").
+
 -export([
     resolve_proxy/2,
     parse_no_proxy/1,
@@ -103,15 +105,38 @@ redact_proxy_url(Url) when is_list(Url) ->
 %% Internal -- link-local bypass
 %%--------------------------------------------------------------------
 
-%% Hard-coded IMDS/link-local bypass. These addresses are never proxied,
-%% regardless of any configuration. This mirrors the ranges denied by
-%% aws_auth_validate_net.erl's infra denylist.
+%% Hard-coded bypass for addresses that must never be proxied. Covers:
+%%   - 169.254.0.0/16 (link-local, includes IMDS 169.254.169.254 and ECS 169.254.170.2)
+%%   - 127.0.0.0/8 (loopback)
+%%   - fd00:ec2::254 (IPv6 IMDS)
+%%   - fe80::/10 (IPv6 link-local)
+%%   - ::1 (IPv6 loopback)
+%%   - IPv4-mapped/compatible/NAT64 IPv6 encodings of the above (via embedded_v4)
+%%
+%% This matches the infra ranges denied by aws_auth_validate_net:classify_ip/2.
 is_link_local(Host) ->
     case inet:parse_address(Host) of
         {ok, {169, 254, _, _}} ->
             true;
+        {ok, {127, _, _, _}} ->
+            true;
         {ok, {16#fd00, 16#ec2, 0, 0, 0, 0, 0, 16#254}} ->
             true;
+        {ok, {0, 0, 0, 0, 0, 0, 0, 1}} ->
+            %% ::1 IPv6 loopback
+            true;
+        {ok, {W1, _, _, _, _, _, _, _}} when
+            W1 >= 16#fe80, W1 =< 16#febf
+        ->
+            %% fe80::/10 IPv6 link-local
+            true;
+        {ok, {_, _, _, _, _, _, _, _} = V6} ->
+            %% Check IPv4-mapped/compatible/NAT64 encodings
+            case aws_auth_validate_net:embedded_v4(V6) of
+                {ok, {169, 254, _, _}} -> true;
+                {ok, {127, _, _, _}} -> true;
+                _ -> false
+            end;
         _ ->
             false
     end.
@@ -162,6 +187,11 @@ get_app_env_proxy() ->
                         end,
                     {ok, ProxyHost, ProxyPort, Auth};
                 _ ->
+                    ?LOG_WARNING(
+                        "aws.proxy.https_host is configured but "
+                        "aws.proxy.https_port is missing or invalid -- "
+                        "proxy configuration ignored"
+                    ),
                     none
             end;
         _ ->
@@ -282,8 +312,18 @@ parse_cidr(IpStr, PrefixStr) ->
     end.
 
 parse_host_port_entry(Entry) ->
-    %% Check for host:port pattern. Split on the LAST colon to avoid confusing
-    %% IPv6 literal colons (though bracketed IPv6 is uncommon in NO_PROXY).
+    %% If the entry is a valid IP address (v4 or v6), treat it as an exact match.
+    %% This must come BEFORE the colon split to avoid misinterpreting IPv6
+    %% addresses (e.g., "::1", "fe80::1") as host:port pairs.
+    case inet:parse_address(Entry) of
+        {ok, _IP} ->
+            {true, {exact_or_suffix, string:lowercase(Entry)}};
+        {error, _} ->
+            parse_host_port_split(Entry)
+    end.
+
+parse_host_port_split(Entry) ->
+    %% Check for host:port pattern. Split on the LAST colon.
     case string:find(Entry, ":", trailing) of
         nomatch ->
             %% No colon -- bare hostname, matches exactly and subdomains

@@ -374,3 +374,63 @@ resolve_proxy_no_config_test() ->
     os:unsetenv("HTTPS_PROXY"),
     os:unsetenv("https_proxy"),
     ?assertEqual(direct, aws_lib_proxy:resolve_proxy("s3.amazonaws.com", 443)).
+
+%%--------------------------------------------------------------------
+%% Extended link-local bypass: loopback, fe80, IPv4-mapped IPv6
+%%--------------------------------------------------------------------
+
+loopback_v4_always_direct_test() ->
+    application:set_env(aws, proxy_https_host, "proxy.internal"),
+    application:set_env(aws, proxy_https_port, 3128),
+    try
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("127.0.0.1", 80)),
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("127.255.255.255", 80))
+    after
+        application:unset_env(aws, proxy_https_host),
+        application:unset_env(aws, proxy_https_port)
+    end.
+
+loopback_v6_always_direct_test() ->
+    application:set_env(aws, proxy_https_host, "proxy.internal"),
+    application:set_env(aws, proxy_https_port, 3128),
+    try
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("::1", 80))
+    after
+        application:unset_env(aws, proxy_https_host),
+        application:unset_env(aws, proxy_https_port)
+    end.
+
+fe80_link_local_always_direct_test() ->
+    application:set_env(aws, proxy_https_host, "proxy.internal"),
+    application:set_env(aws, proxy_https_port, 3128),
+    try
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("fe80::1", 80)),
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("febf::1", 80))
+    after
+        application:unset_env(aws, proxy_https_host),
+        application:unset_env(aws, proxy_https_port)
+    end.
+
+ipv4_mapped_v6_link_local_always_direct_test() ->
+    %% ::ffff:169.254.169.254 is IPv4-mapped IPv6 for IMDS
+    application:set_env(aws, proxy_https_host, "proxy.internal"),
+    application:set_env(aws, proxy_https_port, 3128),
+    try
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("::ffff:169.254.169.254", 80)),
+        ?assertEqual(direct, aws_lib_proxy:resolve_proxy("::ffff:127.0.0.1", 80))
+    after
+        application:unset_env(aws, proxy_https_host),
+        application:unset_env(aws, proxy_https_port)
+    end.
+
+%%--------------------------------------------------------------------
+%% NO_PROXY: bare IPv6 addresses are not misinterpreted as host:port
+%%--------------------------------------------------------------------
+
+no_proxy_bare_ipv6_test() ->
+    NoProxy = aws_lib_proxy:parse_no_proxy("::1"),
+    ?assert(aws_lib_proxy:host_bypasses_proxy("::1", NoProxy)).
+
+no_proxy_bare_ipv6_fe80_test() ->
+    NoProxy = aws_lib_proxy:parse_no_proxy("fe80::1"),
+    ?assert(aws_lib_proxy:host_bypasses_proxy("fe80::1", NoProxy)).
