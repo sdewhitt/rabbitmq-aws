@@ -231,6 +231,10 @@ open_connection(Service, Options, State0) ->
     Port = 443,
     %% The legacy two-step API always targets the real AWS endpoint over TLS; it
     %% does not honour the endpoint-url override (see endpoint/4).
+    %% Proxy is intentionally NOT applied here: this API is unused internally and
+    %% callers that hold the connection open across multiple requests should manage
+    %% proxy configuration themselves. The primary request paths (gun_request/5 and
+    %% perform_request_reuse/8) use gun_open_opts_with_proxy/4.
     case aws_lib_httpc:open(Host, Port, gun_open_opts(tls, Options)) of
         {ok, Conn} ->
             {ok, {Conn, Service}, State1};
@@ -948,7 +952,11 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
                     Host = aws_lib_uri:host(Uri),
                     Port = aws_lib_uri:port(Uri),
                     Target = aws_lib_uri:target(Uri),
-                    OpenOpts = (gun_open_opts(aws_lib_uri:transport(Uri), Options1))#{retry => 0},
+                    OpenOpts = (gun_open_opts_with_proxy(
+                        aws_lib_uri:transport(Uri), Options1, Host, Port
+                    ))#{
+                        retry => 0
+                    },
                     case ensure_open(ConnSlot0, Host, Port, OpenOpts) of
                         {ok, Conn1} ->
                             Timeout = proplists:get_value(
@@ -1073,7 +1081,9 @@ gun_request(Method, URI, Headers, Body, Options) ->
             Port = aws_lib_uri:port(Uri),
             %% target/1 carries the query: Path is the Gun request line.
             Path = aws_lib_uri:target(Uri),
-            OpenOpts = gun_open_opts(aws_lib_uri:transport(Uri), Options),
+            OpenOpts = gun_open_opts_with_proxy(
+                aws_lib_uri:transport(Uri), Options, Host, Port
+            ),
             Response = aws_lib_httpc:request(
                 Host, Port, Method, Path, Headers, Body, OpenOpts
             ),
@@ -1105,6 +1115,18 @@ gun_open_opts(Transport, Options) when Transport =:= tls; Transport =:= tcp ->
         connect_timeout => proplists:get_value(connect_timeout, Options, infinity),
         timeout => proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT)
     }.
+
+%% Extend gun_open_opts with proxy configuration resolved for the target
+%% Host:Port. When a proxy is configured for this target, the `proxy' key is
+%% added to the opts map so aws_lib_httpc:open/3 uses HTTP CONNECT tunneling.
+gun_open_opts_with_proxy(Transport, Options, Host, Port) ->
+    BaseOpts = gun_open_opts(Transport, Options),
+    case aws_lib_proxy:resolve_proxy(Host, Port) of
+        {proxy, ProxyHost, ProxyPort, ProxyAuth} ->
+            BaseOpts#{proxy => {ProxyHost, ProxyPort, ProxyAuth}};
+        direct ->
+            BaseOpts
+    end.
 
 create_uri(Host, Path) when is_list(Path) ->
     "https://" ++ Host ++ Path;

@@ -166,6 +166,38 @@
     [{datatype, atom}]}.
 
 %%--------------------------------------------------------------------------------------------------
+%% HTTP proxy configuration
+%%
+%% The proxy is used for AWS API (HTTPS) traffic via HTTP CONNECT tunneling.
+%% TLS is negotiated inside the tunnel against the ORIGIN, not the proxy.
+%% IMDS/link-local addresses (169.254.0.0/16, fd00:ec2::254) always bypass the
+%% proxy regardless of these settings.
+
+%% @doc Proxy hostname for HTTPS targets. When set together with
+%% aws.proxy.https_port, all AWS API requests tunnel through this proxy
+%% via HTTP CONNECT. Overrides the HTTPS_PROXY environment variable.
+{mapping, "aws.proxy.https_host", "aws.proxy_https_host",
+    [{datatype, string}]}.
+
+%% @doc Proxy port for HTTPS targets. Required when aws.proxy.https_host is set.
+{mapping, "aws.proxy.https_port", "aws.proxy_https_port",
+    [{datatype, integer}]}.
+
+%% @doc Optional proxy authentication username.
+{mapping, "aws.proxy.https_username", "aws.proxy_https_username",
+    [{datatype, string}]}.
+
+%% @doc Optional proxy authentication password.
+{mapping, "aws.proxy.https_password", "aws.proxy_https_password",
+    [{datatype, string}]}.
+
+%% @doc Comma-separated list of hosts/CIDRs that bypass the proxy (NO_PROXY
+%% semantics). Overrides the NO_PROXY environment variable. Examples:
+%%   .internal.example.com,10.0.0.0/8,*.local
+{mapping, "aws.proxy.no_proxy", "aws.proxy_no_proxy",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
 %% misc
 %%
 %% @doc Custom headers for AWS STS calls. Header name should be the exact case-sensitive headername

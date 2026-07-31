@@ -679,6 +679,12 @@ with_metadata_connection(Fun) ->
 
 %% Open options shared by the EC2 metadata-service sites: plain TCP/HTTP to the
 %% link-local IMDS host, with the short IMDS connect timeout.
+%%
+%% Proxy is intentionally NOT included here. IMDS (169.254.169.254) is a
+%% link-local address that must always be reached directly -- never through a
+%% proxy. aws_lib_proxy:resolve_proxy/2 hard-codes the link-local bypass, but
+%% even if that module were misconfigured the metadata path stays safe because
+%% the `proxy' key is simply absent from these opts.
 metadata_open_opts() ->
     #{transport => tcp, protocols => [http], connect_timeout => 5000}.
 

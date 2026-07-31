@@ -42,7 +42,16 @@
     %% _}}) rather than blocking on a background reconnect.
     retry => non_neg_integer(),
     %% Request (await/await_body) timeout, consulted only by request/7.
-    timeout => timeout()
+    timeout => timeout(),
+    %% HTTP CONNECT proxy configuration. When present, the connection is opened
+    %% to the proxy host over TCP, then an HTTP CONNECT tunnel is established
+    %% to the origin with TLS negotiated inside the tunnel (SNI/verify against
+    %% the ORIGIN, never the proxy). A configured proxy that fails is a HARD
+    %% error -- never silently falls back to direct connection.
+    %% ProxyAuth is {Username, Password} | undefined.
+    proxy =>
+        {string(), inet:port_number(), {string(), string()} | undefined}
+        | undefined
 }.
 
 %% The response tuple this module produces, consumed by
@@ -56,13 +65,30 @@
     | {error, term()}.
 
 -spec open(Host :: string(), Port :: inet:port_number(), Opts :: open_opts()) ->
-    {ok, conn()} | {error, {gun_open_failed | gun_connection_failed, term()}}.
-%% @doc Open a Gun connection and wait for it to come up. The transport,
-%% protocols, and connect timeout are taken from Opts; an open failure is
-%% reported as {gun_open_failed, _} and an await_up failure as
-%% {gun_connection_failed, _}, with the socket closed in the latter case.
+    {ok, conn()}
+    | {error, {
+        gun_open_failed | gun_connection_failed | proxy_connect_failed | proxy_unreachable, term()
+    }}.
+%% @doc Open a Gun connection and wait for it to come up. When `proxy' is
+%% present in Opts, the connection is opened to the proxy over TCP and an HTTP
+%% CONNECT tunnel is established to the origin Host:Port with TLS inside the
+%% tunnel (SNI and certificate verification target the ORIGIN, never the proxy).
+%% A configured proxy that fails is a HARD error -- we never silently fall back
+%% to a direct connection.
 %% @end
 open(Host, Port, Opts) ->
+    case maps:get(proxy, Opts, undefined) of
+        undefined ->
+            open_direct(Host, Port, Opts);
+        {ProxyHost, ProxyPort, ProxyAuth} ->
+            open_via_proxy(Host, Port, ProxyHost, ProxyPort, ProxyAuth, Opts)
+    end.
+
+%%--------------------------------------------------------------------
+%% Direct connection (no proxy)
+%%--------------------------------------------------------------------
+
+open_direct(Host, Port, Opts) ->
     ConnectTimeout = maps:get(connect_timeout, Opts, infinity),
     GunOpts0 = #{
         transport => maps:get(transport, Opts, tcp),
@@ -87,6 +113,125 @@ open(Host, Port, Opts) ->
             end;
         {error, Reason} ->
             {error, {gun_open_failed, Reason}}
+    end.
+
+%%--------------------------------------------------------------------
+%% HTTP CONNECT proxy tunneling
+%%--------------------------------------------------------------------
+
+%% Open a TCP connection to the proxy, then issue HTTP CONNECT to tunnel to
+%% the origin. TLS is negotiated inside the tunnel with SNI and certificate
+%% verification against the ORIGIN hostname -- never the proxy. The proxy sees
+%% only the CONNECT request and opaque bytes thereafter.
+open_via_proxy(OriginHost, OriginPort, ProxyHost, ProxyPort, ProxyAuth, Opts) ->
+    ConnectTimeout = maps:get(connect_timeout, Opts, infinity),
+    %% Step 1: Open a plain TCP connection to the proxy. The proxy speaks HTTP
+    %% so we connect with transport => tcp, protocols => [http].
+    ProxyGunOpts0 = #{
+        transport => tcp,
+        protocols => [http],
+        connect_timeout => ConnectTimeout
+    },
+    ProxyGunOpts =
+        case maps:find(retry, Opts) of
+            {ok, Retry} -> ProxyGunOpts0#{retry => Retry};
+            error -> ProxyGunOpts0
+        end,
+    case gun:open(ProxyHost, ProxyPort, ProxyGunOpts) of
+        {ok, ConnPid} ->
+            case gun:await_up(ConnPid, ConnectTimeout) of
+                {ok, _Protocol} ->
+                    %% Step 2: Issue HTTP CONNECT through the proxy to the origin.
+                    %% TLS opts for the tunnel MUST verify the ORIGIN certificate.
+                    TlsOpts = origin_tls_opts(OriginHost),
+                    ConnectDest = #{
+                        host => OriginHost,
+                        port => OriginPort,
+                        transport => tls,
+                        tls_opts => TlsOpts,
+                        protocols => maps:get(protocols, Opts, [http])
+                    },
+                    Headers = proxy_auth_headers(ProxyAuth),
+                    StreamRef = gun:connect(ConnPid, ConnectDest, Headers),
+                    %% Step 3: Await the tunnel establishment.
+                    await_tunnel_up(ConnPid, StreamRef, ConnectTimeout);
+                {error, Reason} ->
+                    gun:close(ConnPid),
+                    {error, {proxy_unreachable, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {proxy_unreachable, Reason}}
+    end.
+
+%% TLS options for the tunnel to the origin. SNI is set to the origin hostname,
+%% verify is verify_peer with the system CA bundle. Never verify_none.
+origin_tls_opts(OriginHost) ->
+    SniHost =
+        case is_list(OriginHost) of
+            true -> OriginHost;
+            false -> binary_to_list(OriginHost)
+        end,
+    [
+        {verify, verify_peer},
+        {depth, 10},
+        {server_name_indication, SniHost},
+        {customize_hostname_check, [
+            {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+        ]}
+        | cacerts_opts()
+    ].
+
+%% Return the CA certificate options. OTP 25+ supports `cacerts` from the
+%% OS trust store via public_key:cacerts_get/0. If that call fails
+%% (should not happen on OTP 25+), the resulting empty list means the TLS
+%% handshake will reject -- fail-closed, never verify_none.
+cacerts_opts() ->
+    try
+        Certs = public_key:cacerts_get(),
+        [{cacerts, Certs}]
+    catch
+        _:_ ->
+            %% Fail-closed: TLS handshake will reject without a CA store.
+            []
+    end.
+
+%% Build Proxy-Authorization header for HTTP Basic auth if credentials are
+%% provided. The header value is never included in error tuples.
+proxy_auth_headers(undefined) ->
+    [];
+proxy_auth_headers({Username, Password}) ->
+    Encoded = base64:encode_to_string(Username ++ ":" ++ Password),
+    [{<<"proxy-authorization">>, iolist_to_binary(["Basic ", Encoded])}].
+
+%% Await gun_tunnel_up or an error/unexpected response from the proxy. Per
+%% RFC 7231 Section 4.3.6, only 2xx indicates a successful CONNECT; any other
+%% status (3xx, 4xx, 5xx) is treated as a hard failure.
+await_tunnel_up(ConnPid, StreamRef, Timeout) ->
+    MRef = monitor(process, ConnPid),
+    Result = do_await_tunnel(ConnPid, StreamRef, Timeout, MRef),
+    demonitor(MRef, [flush]),
+    Result.
+
+do_await_tunnel(ConnPid, StreamRef, Timeout, MRef) ->
+    receive
+        {gun_tunnel_up, ConnPid, StreamRef, _Protocol} ->
+            {ok, ConnPid};
+        {gun_response, ConnPid, StreamRef, _IsFin, Status, _Headers} ->
+            %% Any HTTP response other than the implicit 2xx that triggers
+            %% gun_tunnel_up is a CONNECT rejection (3xx, 4xx, 5xx).
+            gun:close(ConnPid),
+            {error, {proxy_connect_failed, Status}};
+        {gun_error, ConnPid, StreamRef, Reason} ->
+            gun:close(ConnPid),
+            {error, {proxy_connect_failed, Reason}};
+        {gun_error, ConnPid, Reason} ->
+            gun:close(ConnPid),
+            {error, {proxy_connect_failed, Reason}};
+        {'DOWN', MRef, process, ConnPid, Reason} ->
+            {error, {proxy_connect_failed, Reason}}
+    after Timeout ->
+        gun:close(ConnPid),
+        {error, {proxy_connect_failed, timeout}}
     end.
 
 -spec request(
